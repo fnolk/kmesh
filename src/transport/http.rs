@@ -247,7 +247,7 @@ fn map_websocket_handshake_error(error: tokio_tungstenite::tungstenite::Error) -
     }
 }
 
-fn validate_proxy_url(proxy_url: &str) -> Result<reqwest::Url, TransportError> {
+pub(crate) fn validate_proxy_url(proxy_url: &str) -> Result<reqwest::Url, TransportError> {
     let proxy_url = reqwest::Url::parse(proxy_url)
         .map_err(|error| TransportError::Configuration(format!("invalid proxy URL: {error}")))?;
     if !matches!(proxy_url.scheme(), "http" | "https") {

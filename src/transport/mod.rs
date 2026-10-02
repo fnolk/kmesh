@@ -1,21 +1,18 @@
-//! Direct UDP/QUIC and WSS relay transports.
+//! Iroh QUIC transport for SSH streams and HTTPS control-plane connections.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("kmesh transport supports Linux and macOS only");
 
 mod http;
-mod quic;
-mod relay;
-mod stun;
-mod udp;
+mod iroh;
 
 use std::io;
 
 pub use http::{BoxedIo, WsStream, connect_wss, http_client};
-pub use quic::{QuicAcceptor, QuicByteStream, QuicConfig};
-pub use relay::RelayByteStream;
-pub use stun::serve_stun;
-pub use udp::{LocalCandidate, ProbeResult, StunMappingObservation, UdpAttempt};
+pub use iroh::{
+    IROH_SSH_ALPN, IrohByteStream, IrohEndpointOptions, IrohPathKind, IrohSelectedPath,
+    accept_peer, connect_peer, create_endpoint,
+};
 
 /// A transport error with an explicit security and network classification.
 #[derive(Debug, thiserror::Error)]
@@ -28,12 +25,12 @@ pub enum TransportError {
     Network(#[source] io::Error),
     #[error("{0} timed out")]
     Timeout(&'static str),
+    #[error("Iroh endpoint is closed")]
+    EndpointClosed,
     #[error("TLS configuration or handshake failed: {0}")]
     Tls(String),
-    #[error("QUIC failed: {0}")]
-    Quic(String),
-    #[error("STUN failed: {0}")]
-    Stun(String),
+    #[error("Iroh transport failed: {0}")]
+    Iroh(String),
     #[error("WebSocket failed: {0}")]
     WebSocket(String),
     #[error("invalid transport configuration: {0}")]

@@ -4,25 +4,23 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub profile: String,
     pub server_url: String,
     pub data_dir: PathBuf,
     pub tls: TlsConfig,
     pub ssh: SshConfig,
-    pub stun: StunConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             profile: "default".to_owned(),
-            server_url: "https://localhost:443".to_owned(),
+            server_url: "https://localhost:9443".to_owned(),
             data_dir: default_data_dir(),
             tls: TlsConfig::default(),
             ssh: SshConfig::default(),
-            stun: StunConfig::default(),
         }
     }
 }
@@ -54,24 +52,6 @@ impl Default for SshConfig {
         Self {
             address: SocketAddr::from(([127, 0, 0, 1], 22)),
             connect_timeout_secs: 10,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StunConfig {
-    pub servers: Vec<String>,
-    pub udp_bind_address: SocketAddr,
-    pub probe_timeout_millis: u64,
-}
-
-impl Default for StunConfig {
-    fn default() -> Self {
-        Self {
-            servers: Vec::new(),
-            udp_bind_address: SocketAddr::from(([0, 0, 0, 0], 0)),
-            probe_timeout_millis: 2_000,
         }
     }
 }
