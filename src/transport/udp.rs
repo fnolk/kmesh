@@ -36,6 +36,14 @@ pub struct ProbeResult {
     pub peer_addr: SocketAddr,
 }
 
+#[derive(Debug)]
+pub struct StunMappingObservation {
+    pub local_socket: SocketAddr,
+    pub destination: SocketAddr,
+    pub outcome: Result<SocketAddr, TransportError>,
+    pub rtt: Duration,
+}
+
 impl UdpAttempt {
     pub async fn bind(config: StunConfig) -> Result<Self, TransportError> {
         if config.probe_timeout_millis == 0 {
@@ -52,15 +60,46 @@ impl UdpAttempt {
     pub async fn gather(&mut self) -> Result<Vec<SocketAddr>, TransportError> {
         let local = self.socket.local_addr().map_err(TransportError::Network)?;
         let mut candidates = local_candidates(local)?;
-        for server in resolve_servers(&self.config).await? {
-            if !same_address_family(local, server.ip()) {
-                continue;
+        let servers = resolve_servers(&self.config).await?;
+        for server in servers {
+            if same_address_family(local, server.ip()) {
+                candidates.push(self.observe_stun_mapping(local, server).await.outcome?);
             }
-            candidates.push(gather_mapping(&self.socket, server).await?);
         }
         candidates.sort_unstable();
         candidates.dedup();
         Ok(candidates)
+    }
+
+    /// Measure STUN mappings to several destinations on this attempt's UDP socket.
+    pub async fn observe_stun_mappings(
+        &mut self,
+        destinations: &[SocketAddr],
+    ) -> Result<Vec<StunMappingObservation>, TransportError> {
+        let local_socket = self.socket.local_addr().map_err(TransportError::Network)?;
+        let mut observations = Vec::with_capacity(destinations.len());
+        for destination in destinations {
+            if !same_address_family(local_socket, destination.ip()) {
+                continue;
+            }
+            observations.push(self.observe_stun_mapping(local_socket, *destination).await);
+        }
+        Ok(observations)
+    }
+
+    async fn observe_stun_mapping(
+        &self,
+        local_socket: SocketAddr,
+        destination: SocketAddr,
+    ) -> StunMappingObservation {
+        let started = Instant::now();
+        let outcome = gather_mapping(&self.socket, destination).await;
+        StunMappingObservation {
+            local_socket,
+            destination,
+            outcome,
+            rtt: started.elapsed(),
+        }
     }
 
     /// Perform an authenticated, bounded UDP connectivity probe over this attempt's socket.
