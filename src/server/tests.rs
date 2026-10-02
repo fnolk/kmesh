@@ -225,7 +225,7 @@ fn nat_plan_does_not_interpolate_unstable_or_cross_ip_observations() {
         local_candidates: vec![],
         stun_mappings: [
             ("192.0.2.11:3478", Some("192.0.2.19:4164")),
-            ("192.0.2.13:3478", Some("198.51.100.2:4148")),
+            ("192.0.2.13:3478", Some("192.0.2.19:4148")),
             ("192.0.2.11:3478", Some("192.0.2.19:4163")),
         ]
         .map(|(server, mapped)| StunMapping {
@@ -240,8 +240,30 @@ fn nat_plan_does_not_interpolate_unstable_or_cross_ip_observations() {
         plan.client_remote_candidates,
         vec![
             "192.0.2.19:4164".parse().unwrap(),
-            "198.51.100.2:4148".parse().unwrap(),
+            "192.0.2.19:4148".parse().unwrap(),
             "192.0.2.19:4163".parse().unwrap(),
+        ]
+    );
+
+    let stable_a_cross_ip_b = NatObservation {
+        local_candidates: vec![],
+        stun_mappings: [
+            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
+            ("192.0.2.13:3478", Some("198.51.100.2:4148")),
+            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
+        ]
+        .map(|(server, mapped)| StunMapping {
+            server: server.parse().expect("STUN server address"),
+            mapped: mapped.map(|address| address.parse().expect("mapped address")),
+        })
+        .into(),
+    };
+    let plan = control::build_nat_plan(&client, &stable_a_cross_ip_b);
+    assert_eq!(
+        plan.client_remote_candidates,
+        vec![
+            "192.0.2.19:4164".parse().unwrap(),
+            "198.51.100.2:4148".parse().unwrap(),
         ]
     );
 }
