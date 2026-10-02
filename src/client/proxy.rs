@@ -166,7 +166,7 @@ async fn next_offer(
                 }
                 bail!("server could not prepare SSH access: {message}");
             }
-            message => tracing::debug!(?message, "ignoring control message before offer"),
+            _ => tracing::debug!("ignoring unexpected control message before offer"),
         }
     }
 }
@@ -348,7 +348,7 @@ async fn select_relay(
             } if received == session_id => {
                 bail!("server rejected relay selection ({code}): {message}");
             }
-            message => tracing::debug!(?message, "waiting for relay selection"),
+            _ => tracing::debug!("waiting for relay selection"),
         }
     }
     relay(context, control, access_token, session_id).await
