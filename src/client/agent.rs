@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
 use sha2::Digest;
@@ -49,6 +49,15 @@ const MAX_HANDSHAKE_FRAME: usize = 8192;
 struct PendingIdentity {
     certificate_pem: String,
     private_key_pem: String,
+}
+
+struct TunnelOffer {
+    session_id: Uuid,
+    target_id: Uuid,
+    ticket: String,
+    client_public_key: String,
+    probe_token: [u8; 32],
+    target_certificate_der: Vec<u8>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -157,11 +166,13 @@ async fn control_session(
     .await
     .context("agent control connection timed out")??;
     let (mut writer, mut reader) = ws.split();
-    for session_id in std::mem::take(
-        &mut *completed_sessions
+    let completed = {
+        let mut completed = completed_sessions
             .lock()
-            .expect("completed session lock poisoned"),
-    ) {
+            .expect("completed session lock poisoned");
+        std::mem::take(&mut *completed)
+    };
+    for session_id in completed {
         let message = serde_json::to_string(&ControlMessage::Cancel {
             session_id,
             reason: "session_finished_while_control_was_offline".to_owned(),
@@ -225,10 +236,10 @@ async fn control_session(
                         return Err(anyhow!(AgentAuthenticationFailure(format!("server rejected agent control: {message}"))));
                     }
                     message => {
-                        if let Some(session_id) = message_session_id(&message) {
-                            if let Some(sender) = sessions.get(&session_id) {
-                                sender.send(message).await.context("route agent session message")?;
-                            }
+                        if let Some(session_id) = message_session_id(&message)
+                            && let Some(sender) = sessions.get(&session_id)
+                        {
+                            sender.send(message).await.context("route agent session message")?;
                         }
                     }
                 }
@@ -276,25 +287,22 @@ async fn handle_offer(
         context.api.issuer(),
     )
     .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
-    verify_ticket_binding(
-        &claims,
-        session_id,
-        target_id,
-        &client_public_key,
-        &target_certificate_der,
-    )?;
     let probe_token = decode_probe_token(&probe_token)
         .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
+    let offer = TunnelOffer {
+        session_id,
+        target_id,
+        ticket,
+        client_public_key,
+        probe_token,
+        target_certificate_der,
+    };
+    verify_ticket_binding(&claims, &offer)?;
     let deadline = Instant::now() + DIRECT_BUDGET;
     let direct = direct_accept(
         context,
         credentials,
-        session_id,
-        &ticket,
-        &claims,
-        &client_public_key,
-        &target_certificate_der,
-        probe_token,
+        &offer,
         deadline,
         &mut inbound,
         &outbound,
@@ -304,25 +312,25 @@ async fn handle_offer(
         Ok(stream) => Box::new(stream),
         Err(error) if is_authentication_error(&error) => return Err(error),
         Err(error) if is_relay_selected(&error) => {
-            relay_stream(context, credentials, session_id, &mut inbound).await?
+            relay_stream(context, credentials, offer.session_id, &mut inbound).await?
         }
         Err(error) => {
-            tracing::debug!(session = %session_id, error = %error, "direct path did not become available");
-            await_relay_selection(session_id, &mut inbound).await?;
-            relay_stream(context, credentials, session_id, &mut inbound).await?
+            tracing::debug!(session = %offer.session_id, error = %error, "direct path did not become available");
+            await_relay_selection(offer.session_id, &mut inbound).await?;
+            relay_stream(context, credentials, offer.session_id, &mut inbound).await?
         }
     };
     let result = copy_ssh(context, &mut stream).await;
     if outbound
         .send(ControlMessage::Cancel {
-            session_id,
+            session_id: offer.session_id,
             reason: "session_finished".to_owned(),
         })
         .await
         .is_err()
     {
-        remember_completed(&completed_sessions, session_id);
-        tracing::debug!(session = %session_id, "control is offline; will report session completion after reconnect");
+        remember_completed(&completed_sessions, offer.session_id);
+        tracing::debug!(session = %offer.session_id, "control is offline; will report session completion after reconnect");
     }
     result
 }
@@ -350,12 +358,7 @@ async fn relay_stream(
 async fn direct_accept(
     context: &ClientContext,
     credentials: &AgentCredentials,
-    session_id: Uuid,
-    ticket: &str,
-    claims: &TunnelTicketClaims,
-    client_public_key: &str,
-    target_certificate_der: &[u8],
-    probe_token: [u8; 32],
+    offer: &TunnelOffer,
     deadline: Instant,
     inbound: &mut mpsc::Receiver<ControlMessage>,
     outbound: &mpsc::Sender<ControlMessage>,
@@ -374,15 +377,20 @@ async fn direct_accept(
     send_control(
         outbound,
         ControlMessage::Candidates {
-            session_id,
+            session_id: offer.session_id,
             candidates,
         },
     )
     .await?;
-    let remote = receive_candidates(session_id, inbound, deadline).await?;
+    let remote = receive_candidates(offer.session_id, inbound, deadline).await?;
     let probe_result = timeout_at(
         deadline,
-        attempt.probe(session_id, probe_token, &remote, remaining(deadline)?),
+        attempt.probe(
+            offer.session_id,
+            offer.probe_token,
+            &remote,
+            remaining(deadline)?,
+        ),
     )
     .await
     .context("UDP probe timed out")??;
@@ -390,7 +398,7 @@ async fn direct_accept(
     send_control(
         outbound,
         ControlMessage::ProbeSeen {
-            session_id,
+            session_id: offer.session_id,
             peer: PeerRole::Target,
             candidate: peer,
         },
@@ -402,17 +410,20 @@ async fn direct_accept(
         &credentials.private_key_pem,
         QuicConfig::default(),
     )?;
-    send_control(outbound, ControlMessage::QuicReady { session_id }).await?;
-    let mut stream = accept_with_relay(&acceptor, session_id, inbound, deadline).await?;
+    send_control(
+        outbound,
+        ControlMessage::QuicReady {
+            session_id: offer.session_id,
+        },
+    )
+    .await?;
+    let mut stream = accept_with_relay(&acceptor, offer.session_id, inbound, deadline).await?;
     timeout_at(
         deadline,
         authenticate_quic(
             &mut stream,
-            ticket,
-            claims,
-            client_public_key,
+            offer,
             credentials,
-            target_certificate_der,
             context.api.issuer(),
             remaining(deadline)?,
         ),
@@ -422,14 +433,14 @@ async fn direct_accept(
     send_control(
         outbound,
         ControlMessage::Activate {
-            session_id,
+            session_id: offer.session_id,
             path: SelectedPath::Quic,
         },
     )
     .await?;
     timeout_at(
         deadline,
-        wait_activated(session_id, SelectedPath::Quic, inbound),
+        wait_activated(offer.session_id, SelectedPath::Quic, inbound),
     )
     .await
     .context("server path activation timed out")??;
@@ -478,11 +489,8 @@ async fn accept_with_relay(
 
 async fn authenticate_quic(
     stream: &mut QuicByteStream,
-    ticket: &str,
-    claims: &TunnelTicketClaims,
-    client_public_key: &str,
+    offer: &TunnelOffer,
     credentials: &AgentCredentials,
-    certificate_der: &[u8],
     expected_issuer: &str,
     budget: Duration,
 ) -> Result<()> {
@@ -499,7 +507,7 @@ async fn authenticate_quic(
     .await?;
     let auth: DirectAuthentication = timeout_read_frame(stream, budget).await?;
     ensure_agent_auth(
-        auth.ticket == ticket,
+        auth.ticket == offer.ticket,
         "QUIC proof carries a different ticket",
     )?;
     let verified = decode_tunnel_ticket(
@@ -508,15 +516,9 @@ async fn authenticate_quic(
         expected_issuer,
     )
     .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
-    verify_ticket_binding(
-        &verified,
-        claims.session_id,
-        credentials.target_id,
-        client_public_key,
-        certificate_der,
-    )?;
+    verify_ticket_binding(&verified, offer)?;
     let public_key_bytes = URL_SAFE_NO_PAD
-        .decode(client_public_key)
+        .decode(&offer.client_public_key)
         .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
     let public_key_array: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
         anyhow!(AgentAuthenticationFailure(
@@ -531,7 +533,7 @@ async fn authenticate_quic(
     let signature = Signature::from_slice(&signature_bytes)
         .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
     public_key
-        .verify(&quic_auth_message(ticket, &nonce), &signature)
+        .verify_strict(&quic_auth_message(&offer.ticket, &nonce), &signature)
         .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))
 }
 
@@ -539,23 +541,20 @@ pub(crate) fn quic_auth_message(ticket: &str, nonce: &str) -> Vec<u8> {
     format!("kmesh-quic-auth\0{ticket}\0{nonce}").into_bytes()
 }
 
-fn verify_ticket_binding(
-    claims: &TunnelTicketClaims,
-    session_id: Uuid,
-    target_id: Uuid,
-    client_public_key: &str,
-    certificate_der: &[u8],
-) -> Result<()> {
+fn verify_ticket_binding(claims: &TunnelTicketClaims, offer: &TunnelOffer) -> Result<()> {
     ensure_agent_auth(
-        claims.session_id == session_id,
+        claims.session_id == offer.session_id,
         "ticket session ID mismatch",
     )?;
-    ensure_agent_auth(claims.target_id == target_id, "ticket target ID mismatch")?;
     ensure_agent_auth(
-        claims.client_public_key == client_public_key,
+        claims.target_id == offer.target_id,
+        "ticket target ID mismatch",
+    )?;
+    ensure_agent_auth(
+        claims.client_public_key == offer.client_public_key,
         "ticket client key mismatch",
     )?;
-    let fingerprint = certificate_fingerprint(certificate_der);
+    let fingerprint = certificate_fingerprint(&offer.target_certificate_der);
     ensure_agent_auth(
         claims.target_certificate_fingerprint == fingerprint,
         "ticket target certificate fingerprint mismatch",

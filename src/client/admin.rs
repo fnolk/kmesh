@@ -63,10 +63,10 @@ async fn repl(context: &ClientContext) -> Result<()> {
                 argv.extend(words);
                 match AdminLine::try_parse_from(argv) {
                     Ok(parsed) => {
-                        if let Some(command) = parsed.command {
-                            if let Err(error) = execute(context, command, parsed.json).await {
-                                eprintln!("{}", format_error(&error));
-                            }
+                        if let Some(command) = parsed.command
+                            && let Err(error) = execute(context, command, parsed.json).await
+                        {
+                            eprintln!("{}", format_error(&error));
                         }
                     }
                     Err(error) => eprintln!("{}", error.render().to_string().trim()),
@@ -363,6 +363,3 @@ impl Completer for AdminHelper {
         ))
     }
 }
-
-#[allow(dead_code)]
-fn _assert_admin_command_type(_: AdminCommand) {}

@@ -129,7 +129,7 @@ fn sign_sshsig(key_path: &Path, challenge: &[u8]) -> Result<String> {
         .arg("kmesh-login")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("run ssh-keygen to sign the login challenge")?;
     child
@@ -142,7 +142,11 @@ fn sign_sshsig(key_path: &Path, challenge: &[u8]) -> Result<String> {
         .wait_with_output()
         .context("wait for ssh-keygen signature")?;
     if !output.status.success() {
-        bail!("ssh-keygen could not sign the login challenge");
+        let reason = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "ssh-keygen could not sign the login challenge: {}",
+            reason.trim()
+        );
     }
     String::from_utf8(output.stdout).context("ssh-keygen returned a non-UTF-8 SSHSIG signature")
 }

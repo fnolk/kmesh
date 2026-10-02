@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use clap::Parser;
 use kmesh::{client::ssh_config, config::Config, protocol::TargetView};
 use uuid::Uuid;
 
@@ -21,6 +22,21 @@ fn cli_help_and_global_data_directory_parse_after_subcommand() {
     let server_help = String::from_utf8(server_help.stdout).unwrap();
     assert!(server_help.contains("--data-dir <DATA_DIR>"));
     assert!(server_help.starts_with("Usage:"));
+}
+
+#[test]
+fn agent_enrollment_accepts_url_safe_tokens_starting_with_a_dash() {
+    let target_id = Uuid::new_v4().to_string();
+    let args = [
+        "kmesh",
+        "agent",
+        "enroll",
+        "--target-id",
+        &target_id,
+        "--enrollment-code",
+        "-one-time-token",
+    ];
+    assert!(kmesh::client::Cli::try_parse_from(args).is_ok());
 }
 
 #[test]

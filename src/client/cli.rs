@@ -91,7 +91,7 @@ pub enum AgentCommand {
 pub struct AgentEnrollArgs {
     #[arg(long)]
     pub target_id: Uuid,
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub enrollment_code: String,
 }
 
