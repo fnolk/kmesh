@@ -264,6 +264,30 @@ pub struct RelayConnectQuery {
     pub peer: PeerRole,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalCandidate {
+    pub address: SocketAddr,
+    pub prefix_len: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StunMapping {
+    pub server: SocketAddr,
+    pub mapped: Option<SocketAddr>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NatObservation {
+    pub local_candidates: Vec<LocalCandidate>,
+    pub stun_mappings: Vec<StunMapping>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NatPlan {
+    pub client_remote_candidates: Vec<SocketAddr>,
+    pub target_remote_candidates: Vec<SocketAddr>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectedPath {
@@ -290,7 +314,11 @@ pub enum ControlMessage {
     },
     Candidates {
         session_id: Uuid,
-        candidates: Vec<SocketAddr>,
+        observation: NatObservation,
+    },
+    NatPlan {
+        session_id: Uuid,
+        plan: NatPlan,
     },
     ProbeSeen {
         session_id: Uuid,

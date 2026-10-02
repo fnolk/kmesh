@@ -19,13 +19,13 @@ This document freezes the first implementation boundary between the server, tran
 
 ## Control WebSocket
 
-`ControlMessage` is shared by `/v1/connect` and `/v1/agent/control`. Client opens carry only session/target identity and the ephemeral key. Server forwards an `Offer` to the target, then routes candidate exchange, probe observations, QUIC readiness, relay selection, activation, cancellation, and errors. The server rechecks access when activating a path. No control message carries an SSH host or port. Relay WebSockets use `RelayConnectQuery { session_id, peer }` on the authenticated `/v1/relay` handshake with the user or target bearer credential in the `Authorization` header.
+`ControlMessage` is shared by `/v1/connect` and `/v1/agent/control`. Client opens carry only session/target identity and the ephemeral key. Server forwards an `Offer` to the target, collects both `Candidates { observation }` messages, and returns a bounded `NatPlan` to both peers. `NatObservation` carries local interface candidates with prefix lengths and ordered STUN destination/mapped-address samples; an absent mapping is serialized as `null`, and repeated A-B-A destinations remain in order. `NatPlan` contains the candidate addresses each peer probes, capped by the server at eight per direction. The remaining messages carry probe observations, QUIC readiness, relay selection, activation, cancellation, and errors. The server rechecks access when activating a path. No control message carries an SSH host or port. Relay WebSockets use `RelayConnectQuery { session_id, peer }` on the authenticated `/v1/relay` handshake with the user or target bearer credential in the `Authorization` header.
 
 The selected data path is reported with `Activated.path` (`quic` or `relay`). QUIC and relay each carry one bidirectional byte stream for one SSH `ProxyCommand` process. Relay WebSocket pairing binds the session at the authenticated control/relay URL; relay data frames do not repeat session IDs.
 
 ## Transport API
 
-- `UdpAttempt::bind`, `gather`, and `probe` prepare an attempt; `into_quic_client` and `into_quic_server` transfer its bound UDP socket to Quinn.
+- `UdpAttempt::bind`, `gather_observations`, `observe_stun_mappings`, and `probe` prepare an attempt; the observation APIs preserve the same bound UDP socket and STUN destination order, while `into_quic_client` and `into_quic_server` transfer that socket to Quinn.
 - `QuicByteStream` and `RelayByteStream` implement `AsyncRead + AsyncWrite`. `QuicAcceptor::accept` yields a `QuicByteStream` for each incoming SSH stream.
 - Transport sends and consumes the fixed `KMS1` QUIC stream preface internally before exposing the byte stream; client and agent begin with `QuicChallenge` / `DirectAuthentication` after stream creation.
 - `connect_wss` returns the raw WebSocket used by control and relay clients. `RelayByteStream::from_ws` wraps relay data WebSockets.
