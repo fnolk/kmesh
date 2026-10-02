@@ -36,6 +36,12 @@ pub struct ProbeResult {
     pub peer_addr: SocketAddr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalCandidate {
+    pub address: SocketAddr,
+    pub prefix_len: u8,
+}
+
 #[derive(Debug)]
 pub struct StunMappingObservation {
     pub local_socket: SocketAddr,
@@ -59,16 +65,31 @@ impl UdpAttempt {
 
     pub async fn gather(&mut self) -> Result<Vec<SocketAddr>, TransportError> {
         let local = self.socket.local_addr().map_err(TransportError::Network)?;
-        let mut candidates = local_candidates(local)?;
+        let local_candidates = local_candidates(local)?;
+        let mut candidates = local_candidates
+            .iter()
+            .map(|candidate| candidate.address)
+            .collect::<Vec<_>>();
         let servers = resolve_servers(&self.config).await?;
         for server in servers {
             if same_address_family(local, server.ip()) {
                 candidates.push(self.observe_stun_mapping(local, server).await.outcome?);
             }
         }
-        candidates.sort_unstable();
-        candidates.dedup();
+        let mut seen = HashSet::new();
+        candidates.retain(|candidate| seen.insert(*candidate));
         Ok(candidates)
+    }
+
+    /// Gather interface candidates and ordered STUN mappings on this attempt's socket.
+    pub async fn gather_observations(
+        &mut self,
+        destinations: &[SocketAddr],
+    ) -> Result<(Vec<LocalCandidate>, Vec<StunMappingObservation>), TransportError> {
+        let local_socket = self.socket.local_addr().map_err(TransportError::Network)?;
+        let local_candidates = local_candidates(local_socket)?;
+        let mappings = self.observe_stun_mappings(destinations).await?;
+        Ok((local_candidates, mappings))
     }
 
     /// Measure STUN mappings to several destinations on this attempt's UDP socket.
@@ -122,11 +143,12 @@ impl UdpAttempt {
         }
 
         let local = self.socket.local_addr().map_err(TransportError::Network)?;
-        let remotes = remote_candidates
-            .iter()
-            .copied()
-            .filter(|remote| same_address_family(local, remote.ip()))
-            .collect::<HashSet<_>>();
+        let mut remotes = Vec::new();
+        for remote in remote_candidates {
+            if same_address_family(local, remote.ip()) && !remotes.contains(remote) {
+                remotes.push(*remote);
+            }
+        }
         if remotes.is_empty() {
             return Err(TransportError::Configuration(
                 "remote candidates have no address family in common with the local socket"
@@ -209,20 +231,41 @@ impl UdpAttempt {
     }
 }
 
-fn local_candidates(local: SocketAddr) -> Result<Vec<SocketAddr>, TransportError> {
+fn local_candidates(local: SocketAddr) -> Result<Vec<LocalCandidate>, TransportError> {
     let port = local.port();
     let mut candidates = Vec::new();
-    if !local.ip().is_unspecified() {
-        candidates.push(local);
-    }
+    let mut seen = HashSet::new();
     let interfaces = if_addrs::get_if_addrs().map_err(TransportError::Network)?;
+    if !local.ip().is_unspecified() {
+        let interface = interfaces
+            .iter()
+            .find(|interface| interface.ip() == local.ip())
+            .expect("a bound interface address is listed by if-addrs");
+        let candidate = LocalCandidate {
+            address: local,
+            prefix_len: interface_prefix_len(&interface.addr),
+        };
+        seen.insert(candidate.address);
+        candidates.push(candidate);
+    }
     for interface in interfaces {
         let ip = interface.ip();
-        if !ip.is_unspecified() && same_address_family(local, ip) {
-            candidates.push(SocketAddr::new(ip, port));
+        let address = SocketAddr::new(ip, port);
+        if !ip.is_unspecified() && same_address_family(local, ip) && seen.insert(address) {
+            candidates.push(LocalCandidate {
+                address,
+                prefix_len: interface_prefix_len(&interface.addr),
+            });
         }
     }
     Ok(candidates)
+}
+
+fn interface_prefix_len(address: &if_addrs::IfAddr) -> u8 {
+    match address {
+        if_addrs::IfAddr::V4(address) => address.prefixlen,
+        if_addrs::IfAddr::V6(address) => address.prefixlen,
+    }
 }
 
 fn encode_probe(

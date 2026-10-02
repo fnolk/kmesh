@@ -15,7 +15,7 @@ pub use http::{BoxedIo, WsStream, connect_wss, http_client};
 pub use quic::{QuicAcceptor, QuicByteStream, QuicConfig};
 pub use relay::RelayByteStream;
 pub use stun::serve_stun;
-pub use udp::{ProbeResult, StunMappingObservation, UdpAttempt};
+pub use udp::{LocalCandidate, ProbeResult, StunMappingObservation, UdpAttempt};
 
 /// A transport error with an explicit security and network classification.
 #[derive(Debug, thiserror::Error)]

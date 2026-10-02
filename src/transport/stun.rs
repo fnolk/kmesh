@@ -24,8 +24,6 @@ pub async fn resolve_servers(config: &StunConfig) -> Result<Vec<SocketAddr>, Tra
         })?;
         servers.extend(resolved);
     }
-    servers.sort_unstable();
-    servers.dedup();
     Ok(servers)
 }
 
@@ -173,6 +171,27 @@ pub fn same_address_family(local: SocketAddr, address: IpAddr) -> bool {
 mod tests {
     use super::*;
     use rtc_stun::message::BINDING_REQUEST;
+
+    #[tokio::test]
+    async fn resolve_servers_preserves_destination_order_and_repeats() {
+        let config = StunConfig {
+            servers: vec![
+                "127.0.0.1:3478".to_owned(),
+                "127.0.0.1:3479".to_owned(),
+                "127.0.0.1:3478".to_owned(),
+            ],
+            udp_bind_address: "0.0.0.0:0".parse().unwrap(),
+            probe_timeout_millis: 2_000,
+        };
+        assert_eq!(
+            resolve_servers(&config).await.unwrap(),
+            [
+                "127.0.0.1:3478".parse().unwrap(),
+                "127.0.0.1:3479".parse().unwrap(),
+                "127.0.0.1:3478".parse().unwrap(),
+            ]
+        );
+    }
 
     #[test]
     fn stun_authority_accepts_supported_forms() {

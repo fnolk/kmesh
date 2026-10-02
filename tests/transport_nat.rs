@@ -30,9 +30,9 @@ async fn stun_mapping_observations_preserve_destination_order_on_one_socket() {
     })
     .await
     .unwrap();
-    let observations = timeout(
+    let (local_candidates, observations) = timeout(
         Duration::from_secs(2),
-        attempt.observe_stun_mappings(&[server_a, server_b, server_a]),
+        attempt.gather_observations(&[server_a, server_b, server_a]),
     )
     .await
     .unwrap()
@@ -48,6 +48,11 @@ async fn stun_mapping_observations_preserve_destination_order_on_one_socket() {
     );
     let local_socket = observations[0].local_socket;
     assert_eq!(local_socket.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert!(
+        local_candidates
+            .iter()
+            .any(|candidate| { candidate.address == local_socket && candidate.prefix_len == 8 })
+    );
     assert!(
         observations
             .iter()
