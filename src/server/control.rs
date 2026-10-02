@@ -747,7 +747,8 @@ fn remote_candidates(local: &NatObservation, remote: &NatObservation) -> Vec<std
     }
 
     if candidates.len() < MAX_NAT_PLAN_CANDIDATES {
-        for candidate in bounded_port_samples(&remote.stun_mappings) {
+        let remaining = MAX_NAT_PLAN_CANDIDATES - candidates.len();
+        for candidate in bounded_port_samples(&remote.stun_mappings, remaining) {
             push_candidate(&mut candidates, candidate);
             if candidates.len() == MAX_NAT_PLAN_CANDIDATES {
                 break;
@@ -763,7 +764,7 @@ fn push_candidate(candidates: &mut Vec<std::net::SocketAddr>, candidate: std::ne
     }
 }
 
-fn bounded_port_samples(mappings: &[StunMapping]) -> Vec<std::net::SocketAddr> {
+fn bounded_port_samples(mappings: &[StunMapping], limit: usize) -> Vec<std::net::SocketAddr> {
     if mappings.len() != 3
         || mappings[0].server == mappings[1].server
         || mappings[0].server != mappings[2].server
@@ -785,7 +786,7 @@ fn bounded_port_samples(mappings: &[StunMapping]) -> Vec<std::net::SocketAddr> {
     if span <= 1 {
         return Vec::new();
     }
-    let sample_count = ((span - 1) as usize).min(MAX_NAT_PLAN_CANDIDATES - 2);
+    let sample_count = ((span - 1) as usize).min(limit);
     let denominator = (sample_count + 1) as u32;
     (1..=sample_count)
         .map(|index| {
