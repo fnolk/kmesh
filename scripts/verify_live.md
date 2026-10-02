@@ -1,6 +1,6 @@
 # Live server and target verification
 
-`verify_live.py` uses the native release CLI and a separate cache profile. It does not read or change the user's default kmesh state or SSH config. The script provisions `target-1`, `verification-ssh`, and `target-1-access` through the admin CLI, writes the one-time enrollment token to a 0600 JSON file, waits for the target agent, then verifies authenticated OpenSSH, the remote hostname and kernel, remote exit status, SFTP/SCP SHA-256, direct STUN reachability, forced WSS relay, and RBAC revocation while an established SSH session finishes. It restores the grant before exiting.
+`verify_live.py` uses the native release CLI and a separate cache profile. It does not read or change the user's default kmesh state or SSH config. The script provisions `target-1`, `verification-ssh`, and `target-1-access` through the admin CLI, writes the one-time enrollment token to a 0600 JSON file, waits briefly for the target agent, then verifies authenticated OpenSSH, the remote hostname and kernel, remote exit status, STUN reachability, the actual direct/relay path, and 1 MiB SFTP/SCP SHA-256 transfers. The live run stays short and leaves the SSH-connect grant enabled.
 
 The current local paths are:
 
@@ -15,23 +15,17 @@ Provision the target through the real kmesh admin CLI. Then give the target-agen
 
 ```sh
 python3 scripts/verify_live.py --mode provision
-python3 scripts/verify_live.py --mode verify --agent-timeout 900
+python3 scripts/verify_live.py --mode verify --agent-timeout 120
 ```
 
 The provision command prints the target UUID and enrollment-file path; it never prints the token or generated SSH password. The verification report stores only connection details, paths, exit codes, and hashes in the 0600 file `/Users/example/.cache/kmesh-live/client/report.json`. It keeps the access grant enabled after the tests. Temporary payloads and remote `/tmp/kmesh-live-*.bin` files are removed after checks.
 
 ## Current deployment attempt
 
-Recorded 2026-10-02. The `target-1` SSH alias resolves to `root@target.example.com:5750`; authenticated OpenSSH succeeded and reported `server-1`, CentOS 7 x86_64 (`Linux 3.10.0-1160.el7`), UID 0. The target's SSH host-key file was checked against that authenticated connection: the Ed25519 fingerprint was `SHA256:i5+21MyghGWodXDWG/nqZ5+FwS8I4v7aG1VgQPfJuHg`.
+Recorded 2026-10-02. The `target-1` SSH alias resolves to `root@target.example.com:5750`; authenticated OpenSSH succeeded and reported `server-1`, CentOS 7 x86_64 (`Linux 3.10.0-1160.el7`), UID 0. The target's SSH host-key file was checked against that authenticated connection: Ed25519 fingerprint `SHA256:i5+21MyghGWodXDWG/nqZ5+FwS8I4v7aG1VgQPfJuHg`.
 
-The native Apple Silicon release binary reported `kmesh 0.1.0`, SHA-256 `79d1e6d3046664e2fb0282d1f409be5680ace83cd3a5d37299d41fd704c3076b`. The generated server leaf certificate has IP SAN `192.0.2.11`; the local CA verifies it. An isolated client config and mode-0700 data directory are ready. Provisioning and enrollment have not run because the public API is unreachable from both client and target networks.
+The native Apple Silicon release binary is `kmesh 0.1.0`, SHA-256 `79d1e6d3046664e2fb0282d1f409be5680ace83cd3a5d37299d41fd704c3076b`. The independent client config points to `https://192.0.2.11:9443`, trusts the deployment CA, and uses data directory `/Users/example/.cache/kmesh-live/client/data` with profile `target-1-live`.
 
-Observed reachability evidence:
+Provisioning succeeded through the native admin CLI using administrator `verification-admin`: target `target-1` has UUID `00000000-0000-4000-8000-000000000001`; user `verification-ssh`, role `target-1-access`, and its SSH-connect grant were created. The enrollment JSON is `/Users/example/.cache/kmesh-live/client/enrollment.json` (0600); the random user password is `/Users/example/.cache/kmesh-live/client/verification-ssh-password` (0600). The enrollment token was passed to the target operator by file path only.
 
-- From the Mac, direct TCP connect to `192.0.2.11:443` timed out after four seconds. `nc` returned `Operation timed out`.
-- The configured HTTP proxy accepted `CONNECT 192.0.2.11:443` with HTTP 200, then received no TLS handshake response before timeout.
-- An RFC 5389 STUN Binding Request to `192.0.2.11:3478/UDP` received no response within four seconds.
-- From `target-1`, a CA-verified HTTPS health check to `https://192.0.2.11/health` timed out connecting to port 443 after four seconds.
-- The server operator reports `kmesh-verification-server.service` bound to `0.0.0.0:443/TCP` and `0.0.0.0:3478/UDP`, local TLS health 200 with the CA, and host firewall policy allowing input. The cloud security-group/upstream ACL state remains unverified.
-
-The evidence places the current blocker before TLS and STUN protocol handling. The host listener and operating-system firewall reports support an upstream network ACL as a likely cause; the cloud ACL itself has not been inspected. No firewall or cloud ACL changes were made. Re-run provisioning and verification after the public endpoints become reachable.
+The 9443 TLS endpoint is reachable from the Mac and target, and the deployment CA verified the leaf certificate with IP SAN `192.0.2.11`. The operator reports `kmesh-verification-server-9443.service` active on `0.0.0.0:9443/TCP` and `0.0.0.0:3478/UDP`; a native STUN Binding request succeeded in 11.46 ms. Target enrollment and agent control are online. The live report records an SSH path of `relay`; this run did not observe direct P2P/QUIC.

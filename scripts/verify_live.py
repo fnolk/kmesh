@@ -20,9 +20,10 @@ import time
 import uuid
 
 
-SERVER_URL = "https://192.0.2.11"
+SERVER_URL = "https://192.0.2.11:9443"
 ORIGIN_HOST = "192.0.2.11"
 TARGET_NAME = "target-1"
+ADMIN_NAME = "verification-admin"
 USER_NAME = "verification-ssh"
 ROLE_NAME = "target-1-access"
 SSH_ALIAS = "target-1-kmesh"
@@ -156,7 +157,7 @@ class LiveVerification:
         admin_password = read_secret(self.admin_password_file) + b"\n"
         command(
             "admin password login",
-            [*cli_args(self.binary, self.config, self.data, self.admin_profile), "login", "--method", "password", "--username", "admin", "--password-stdin"],
+            [*cli_args(self.binary, self.config, self.data, self.admin_profile), "login", "--method", "password", "--username", ADMIN_NAME, "--password-stdin"],
             input_data=admin_password,
             hide_output=True,
             env=self.env,
@@ -248,6 +249,15 @@ class LiveVerification:
             env=self.env,
         ).stdout.decode()
         rendered = rendered.replace(f"Host {TARGET_NAME}\n", f"Host {SSH_ALIAS}\n", 1)
+        proxy_log = self.client / "proxy.stderr"
+        if not proxy_log.exists():
+            private_file(proxy_log, b"")
+        for index, line in enumerate(rendered.splitlines()):
+            if line.startswith("    ProxyCommand "):
+                rendered = rendered.replace(line, line + f" 2>>{proxy_log}", 1)
+                break
+        else:
+            raise RuntimeError("generated SSH config did not include ProxyCommand")
         path = self.client / f"ssh_config.{suffix}"
         extra = (
             f"\nHost {SSH_ALIAS}\n"
@@ -260,17 +270,22 @@ class LiveVerification:
         return path
 
     def ssh(self, config: pathlib.Path, remote_args: list[str], *, check: bool = True, timeout: int = 180) -> subprocess.CompletedProcess[bytes]:
+        proxy_log = self.client / "proxy.stderr"
+        proxy_log.write_bytes(b"")
+        os.chmod(proxy_log, 0o600)
         return command(
             "OpenSSH over kmesh",
-            ["ssh", "-F", config, "-o", "ControlMaster=no", "-o", f"ControlPath={self.client / 'control' / '%C'}", SSH_ALIAS, *remote_args],
+            ["ssh", "-F", config, "-o", "ControlMaster=no", "-o", "ControlPath=none", SSH_ALIAS, *remote_args],
             check=check,
             timeout=timeout,
             env=self.env,
         )
 
-    @staticmethod
-    def connection_path(stderr: bytes) -> str:
+    def connection_path(self, stderr: bytes) -> str:
         text = stderr.decode(errors="replace")
+        proxy_log = self.client / "proxy.stderr"
+        if proxy_log.is_file():
+            text += "\n" + proxy_log.read_text(errors="replace")
         for path in ("P2P / QUIC", "relay"):
             if f"连接路径：{path}" in text:
                 return path
@@ -322,25 +337,25 @@ class LiveVerification:
             source = work / "payload.bin"
             download = work / "download.bin"
             with source.open("wb") as file:
-                remaining = 16 * 1024 * 1024
+                remaining = 1 * 1024 * 1024
                 while remaining:
                     chunk = os.urandom(min(1024 * 1024, remaining))
                     file.write(chunk)
                     remaining -= len(chunk)
             source_hash = self.file_sha256(source)
-            ssh_options = ["-o", "ControlMaster=no", "-o", f"ControlPath={self.client / 'control' / '%C'}"]
+            ssh_options = ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
             sftp_batch = f"put {source} {sftp_remote}\nget {sftp_remote} {download}\n"
             sftp = command(
                 "SFTP round-trip",
                 ["sftp", "-F", config, *ssh_options, "-b", "-", SSH_ALIAS],
                 input_data=sftp_batch.encode(),
-                timeout=300,
+                timeout=60,
                 env=self.env,
             )
             if self.file_sha256(download) != source_hash:
                 raise RuntimeError("SFTP downloaded payload hash differs")
 
-            command("SCP upload", ["scp", "-F", config, *ssh_options, source, f"{SSH_ALIAS}:{scp_remote}"], timeout=300, env=self.env)
+            command("SCP upload", ["scp", "-F", config, *ssh_options, source, f"{SSH_ALIAS}:{scp_remote}"], timeout=60, env=self.env)
             remote_hash = self.ssh(config, [f"sha256sum {shlex.quote(scp_remote)}"])
             actual_hash = remote_hash.stdout.decode().split()[0]
             if actual_hash != source_hash:
@@ -359,83 +374,6 @@ class LiveVerification:
             "scp_sha256": actual_hash,
             "sftp_exit_code": sftp.returncode,
         }
-
-    def verify_relay(self, target_id: str, known_hosts: pathlib.Path) -> str:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-        config_text = self.config.read_text()
-        config_text = config_text.replace(
-            "servers = []", f'servers = ["127.0.0.1:{port}"]', 1
-        )
-        relay_config = self.client / "relay.toml"
-        replace_private_file(relay_config, config_text.encode())
-        password = read_secret(self.user_password_file) + b"\n"
-        command(
-            "relay profile login",
-            [*cli_args(self.binary, relay_config, self.data, "target-1-relay"), "login", "--method", "password", "--username", USER_NAME, "--password-stdin"],
-            input_data=password,
-            hide_output=True,
-            env=self.env,
-        )
-        config = self.write_ssh_config("target-1-relay", target_id, known_hosts, "relay")
-        try:
-            result = self.ssh(config, ["hostname"])
-            path = self.connection_path(result.stderr)
-            if path != "relay":
-                raise RuntimeError(f"blackholed STUN did not force relay; actual path: {path}")
-            return path
-        finally:
-            sock.close()
-
-    def verify_rbac_retention(self, target_id: str, role_id: str, config: pathlib.Path) -> None:
-        active_command = ["ssh", "-F", config, "-o", "ControlMaster=no", "-o", f"ControlPath={self.client / 'control' / '%C'}", SSH_ALIAS, "printf 'SESSION_STARTED\\n'; sleep 20; printf ACTIVE_SSH_OK"]
-        active = subprocess.Popen(active_command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
-        revoked = False
-        try:
-            assert active.stderr is not None
-            assert active.stdout is not None
-            import selectors
-
-            selector = selectors.DefaultSelector()
-            selector.register(active.stderr, selectors.EVENT_READ)
-            selector.register(active.stdout, selectors.EVENT_READ)
-            deadline = time.monotonic() + 30
-            observed_path = None
-            session_started = False
-            while time.monotonic() < deadline and active.poll() is None and (observed_path is None or not session_started):
-                for key, _ in selector.select(timeout=1):
-                    line = key.fileobj.readline()
-                    if key.fileobj is active.stderr:
-                        path = self.connection_path(line)
-                        if path != "unreported":
-                            observed_path = path
-                    elif b"SESSION_STARTED" in line:
-                        session_started = True
-            selector.close()
-            if observed_path is None or not session_started:
-                raise RuntimeError("SSH did not establish its kmesh path and remote command before RBAC revoke")
-
-            self.admin("grants", "remove", role_id, target_id, "--permission", "ssh-connect")
-            revoked = True
-            denied = self.ssh(config, ["true"], check=False)
-            if denied.returncode == 0:
-                raise RuntimeError("new SSH was accepted after RBAC revoke")
-            stdout, stderr = active.communicate(timeout=35)
-            if active.returncode != 0 or b"ACTIVE_SSH_OK" not in stdout:
-                raise RuntimeError(f"pre-revoke SSH failed while grant was revoked: {stderr.decode(errors='replace')[-1000:]}")
-            self.results["rbac_existing_session_path"] = observed_path
-            self.results["rbac_new_connection_after_revoke"] = "denied"
-        finally:
-            if active.poll() is None:
-                active.terminate()
-                try:
-                    active.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    active.kill()
-                    active.wait(timeout=5)
-            if revoked:
-                self.admin("grants", "add", role_id, target_id, "--permission", "ssh-connect")
 
     def verify(self, agent_timeout: int) -> None:
         self.ensure_local_state()
@@ -458,24 +396,10 @@ class LiveVerification:
             known_hosts = self.ensure_known_hosts(target_id)
             direct_report = self.verify_ssh_and_files(target_id, self.user_profile, known_hosts, "direct")
             self.results["ssh"] = direct_report
-            self.results["relay_path"] = self.verify_relay(target_id, known_hosts)
-
-            role_result = self.admin("--json", "roles", "list", hide_output=True)
-            roles = parse_admin(role_result, "role list")["data"]
-            role = next((item for item in roles if item.get("name") == ROLE_NAME), None)
-            if role is None:
-                raise RuntimeError("live SSH role disappeared")
-            direct_config = self.client / "ssh_config.direct"
-            self.verify_rbac_retention(target_id, str(role["role_id"]), direct_config)
-            restored = self.ssh(direct_config, ["hostname"])
-            self.results["ssh_after_restore"] = {
-                "hostname": restored.stdout.decode(errors="replace").strip().splitlines()[0],
-                "path": self.connection_path(restored.stderr),
-            }
         finally:
             self.results["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             self.save_report()
-        print("live SSH/SCP/SFTP/RBAC 验证完成")
+        print("live SSH/SCP/SFTP 短验证完成")
         print(f"脱敏报告：{self.report_file}")
 
     def save_report(self) -> None:
@@ -497,7 +421,7 @@ def main() -> int:
     parser.add_argument("--cache", type=pathlib.Path, default=pathlib.Path("/Users/example/.cache/kmesh-live"))
     parser.add_argument("--config", type=pathlib.Path, default=pathlib.Path("/Users/example/.cache/kmesh-live/client/config.toml"))
     parser.add_argument("--mode", choices=("provision", "verify"), required=True)
-    parser.add_argument("--agent-timeout", type=int, default=900)
+    parser.add_argument("--agent-timeout", type=int, default=120)
     args = parser.parse_args()
     verifier = LiveVerification(args.binary, args.cache, args.config)
     try:

@@ -1,37 +1,21 @@
 # Public server and `target-1` integration report
 
-Recorded 2026-10-02 against the deployment at `https://192.0.2.11` and the target SSH alias `target-1` (`root@target.example.com:5750`). The current state is ready for a retry after the public network path is restored.
+Recorded 2026-10-02 against `https://192.0.2.11:9443` and target alias `target-1` (`root@target.example.com:5750`). The native CLI provisioned the target and user, the target agent enrolled, and the short live SSH/SFTP/SCP checks completed.
 
-## Local client preparation
+## Local client and credentials
 
-The Apple Silicon release CLI is `/Users/example/GitHub/kmesh/target/aarch64-apple-darwin/release/kmesh`; it reports version `0.1.0`, SHA-256 `79d1e6d3046664e2fb0282d1f409be5680ace83cd3a5d37299d41fd704c3076b`. The independent config is `/Users/example/.cache/kmesh-live/client/config.toml` (0600), with data directory `/Users/example/.cache/kmesh-live/client/data` (0700) and profile `target-1-live`. It trusts the deployment CA and uses the public server IP as TLS server name. The default kmesh profile and SSH config were not changed.
+The Apple Silicon release CLI is `kmesh 0.1.0`, SHA-256 `79d1e6d3046664e2fb0282d1f409be5680ace83cd3a5d37299d41fd704c3076b`. The independent config is `/Users/example/.cache/kmesh-live/client/config.toml` (0600), data directory `/Users/example/.cache/kmesh-live/client/data` (0700), profile `target-1-live`. It trusts the deployment CA and uses the IP SAN `192.0.2.11`. The default kmesh profile and SSH config were not changed.
 
-The deployment CA verifies the leaf certificate, whose SAN includes `IP Address:192.0.2.11`. The target host-key list at `/Users/example/.cache/kmesh-live/target/ssh-host-keys.pub` matches an authenticated `ssh target-1` connection. The observed Ed25519 fingerprint is `SHA256:i5+21MyghGWodXDWG/nqZ5+FwS8I4v7aG1VgQPfJuHg`. That authenticated SSH reported hostname `server-1`, CentOS 7 x86_64 (`Linux 3.10.0-1160.el7`), and UID 0. No private key was read or uploaded.
+The target host-key list matched an authenticated `ssh target-1` connection. Its Ed25519 fingerprint is `SHA256:i5+21MyghGWodXDWG/nqZ5+FwS8I4v7aG1VgQPfJuHg`. That SSH reported `server-1`, CentOS 7 x86_64 (`Linux 3.10.0-1160.el7`), UID 0. No private key was read or uploaded.
 
-## Network evidence and current blocker
+The real CLI used administrator `verification-admin` and created target `target-1` with UUID `00000000-0000-4000-8000-000000000001`, user `verification-ssh`, role `target-1-access`, and an SSH-connect grant. A first login using username `admin` returned 401; the corrected username succeeded. The enrollment token is stored in `/Users/example/.cache/kmesh-live/client/enrollment.json` (0600) and was given to the target operator by file path only. The random SSH password is stored in `/Users/example/.cache/kmesh-live/client/verification-ssh-password` (0600).
 
-The native `kmesh login` CLI was invoked with the administrator password read from its 0600 file through stdin. It exited 1 before creating a user, target, role, or enrollment token. Its sensitive output was withheld. Independent connection checks provide the transport evidence:
+## Live result
 
-- Mac to `192.0.2.11:443/TCP`: four-second connect timeout; `nc` also returned `Operation timed out`.
-- Mac through its configured HTTP proxy: CONNECT returned HTTP 200, then the TLS ClientHello received no response before timeout.
-- Mac to `192.0.2.11:3478/UDP`: an RFC 5389 Binding Request received no response within four seconds.
-- `target-1` to `https://192.0.2.11/health`: CA-verified curl timed out connecting to port 443 after four seconds.
-- The server operator reports `kmesh-verification-server.service` listening on `0.0.0.0:443/TCP` and `0.0.0.0:3478/UDP`, local TLS health 200 with the CA, and host firewall input policy allowing traffic. Cloud security-group or upstream ACL state remains unverified.
+The server unit `kmesh-verification-server-9443.service` is active on `0.0.0.0:9443/TCP`; STUN listens on `0.0.0.0:3478/UDP`. The CA-verified health endpoint returned HTTP 200. A native STUN Binding request returned a valid response. The target agent enrolled and its transient service became active.
 
-Both client and target networks fail before HTTP/TLS or STUN responses. An upstream ACL is the likely cause given the reported server listener and host firewall state; the cloud ACL has not been inspected. No firewall or cloud security-group changes were made. The target agent has not been enrolled or started because the client could not create an enrollment token.
+The short SSH command returned hostname `server-1` and kernel `Linux 3.10.0-1160.el7.x86_64 x86_64`. The remote exit-code check returned 23 as expected. The actual transport path was `relay`; this run did not observe direct P2P/QUIC. A 1 MiB SFTP round-trip and SCP upload returned matching SHA-256 values:
 
-## Retry procedure
+`23dfb4d79fe26db203a23d8cd479ab39ef1d3e40727848b1f39b8a8ac12d1977`
 
-The real-CLI provisioning and verification steps are captured in [`verify_live.md`](verify_live.md). Once both endpoints can reach the public server, run:
-
-```sh
-python3 scripts/verify_live.py --mode provision
-```
-
-It creates target `target-1`, user `verification-ssh`, role `target-1-access`, and the SSH-connect grant using the admin CLI. It stores the one-time token in `/Users/example/.cache/kmesh-live/client/enrollment.json` (0600) and the random SSH password in `/Users/example/.cache/kmesh-live/client/verification-ssh-password` (0600). The target-agent operator can read only the enrollment file path to enroll. After the agent reports online, run:
-
-```sh
-python3 scripts/verify_live.py --mode verify --agent-timeout 900
-```
-
-Verification covers direct/relay path reporting, authenticated SSH hostname/kernel and exit status, 16 MiB SFTP/SCP hash checks, forced relay, revoking permission for new connections while an established session finishes, and restoring the grant. The report is written to `/Users/example/.cache/kmesh-live/client/report.json` (0600) without passwords or tokens.
+The sanitized result is `/Users/example/.cache/kmesh-live/client/report.json` (0600). This live run stayed within the requested short SSH and 1 MiB file-transfer scope; it did not run a long session, large transfer, or live RBAC revocation test.
