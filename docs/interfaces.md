@@ -9,7 +9,7 @@ This document freezes the first implementation boundary between the server, tran
 ## HTTP JSON types
 
 - Login: `PasswordLoginRequest`, `PublicKeyChallengeRequest`, `PublicKeyChallenge`, `PublicKeyLoginRequest`, and `RefreshRequest`; success returns `LoginTokens`.
-- `GET /v1/me` returns `MeView { user, roles }`. Target listing returns `TargetView`, whose `target_id` is the stable authorization identity and whose `name` is display-only.
+- `GET /v1/me` returns `MeView { user, roles }`. Target listing returns `TargetView { target_id, name, enabled, online }`; the stable ID controls authorization, the name is display-only, and enabled/online report distinct management and connection states.
 - Admin operations are sent as `AdminRequest` to `POST /v1/admin`. `AdminOperation` is tagged by `operation` with payload in `data`; list operations return typed `Users`, `Roles`, `Keys`, `UserRoles`, `Grants`, and `Targets`, while target creation/enrollment issue returns a one-time enrollment token.
 - Agent enrollment sends `target_id`, its one-time enrollment token, and locally generated certificate DER. The agent generates the certificate for the selected stable target ID and retains its private key; the response returns `target_id`, `agent_token`, and `ticket_public_key_pem` obtained over the authenticated server TLS connection. `AgentCredentials` persists those values with the local certificate and private key.
 - `TunnelTicketClaims` binds session, user, login session, target, client ephemeral public key, target certificate fingerprint, issuer, audience, issue time, and expiry. Offers include the 32-byte base64 probe token, target certificate DER, and ticket verification key PEM.

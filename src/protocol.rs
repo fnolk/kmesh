@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub const QUIC_STREAM_MAGIC: [u8; 4] = *b"KMS1";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoginTokens {
     pub access_token: String,
@@ -46,6 +48,7 @@ pub struct RefreshRequest {
 pub struct TargetView {
     pub target_id: Uuid,
     pub name: String,
+    pub enabled: bool,
     pub online: bool,
 }
 
