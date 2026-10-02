@@ -153,3 +153,7 @@ sudo systemctl enable --now "kmesh-agent@${TARGET_ID}.service"
 ```
 
 The Unix integration script [`scripts/e2e.sh`](scripts/e2e.sh) exercises direct QUIC, relay fallback, verified SSH host keys, remote exit codes, SCP/SFTP, ControlMaster reuse, RBAC revocation, concurrent token refresh, and SSHD disconnect propagation against a temporary `sshd` and local kmesh server. It requires `sshd`, OpenSSH tools, `openssl`, `curl`, Python 3, and Rust. Long idle-session and 1 GiB throughput runs require separate duration and capacity testing.
+
+For a provisioned public server and target, [`scripts/verify_live.md`](scripts/verify_live.md) documents the isolated live profile and [`scripts/verify_live.py`](scripts/verify_live.py) runs CLI-based SSH/SCP/SFTP/RBAC checks.
+
+For a provisioned public server and target, [`scripts/verify_live.md`](scripts/verify_live.md) documents the isolated live-verification profile and [`scripts/verify_live.py`](scripts/verify_live.py) runs the CLI-based SSH/SCP/SFTP/RBAC checks.
