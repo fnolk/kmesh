@@ -1555,6 +1555,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "fs2",
  "futures-util",
+ "hmac 0.13.0",
  "if-addrs",
  "jsonwebtoken",
  "quinn",

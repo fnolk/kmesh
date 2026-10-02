@@ -69,7 +69,7 @@ pub struct StunConfig {
 impl Default for StunConfig {
     fn default() -> Self {
         Self {
-            servers: vec!["stun.l.google.com:19302".to_owned()],
+            servers: Vec::new(),
             udp_bind_address: SocketAddr::from(([0, 0, 0, 0], 0)),
             probe_timeout_millis: 2_000,
         }
@@ -78,6 +78,6 @@ impl Default for StunConfig {
 
 fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .expect("resolve the operating system's per-user data directory")
         .join("kmesh")
 }
