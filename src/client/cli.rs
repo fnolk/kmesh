@@ -45,10 +45,25 @@ pub enum Command {
     SshConfig {
         target: String,
     },
+    Diagnose {
+        #[command(subcommand)]
+        command: DiagnoseCommand,
+    },
     Proxy {
         target_id: Uuid,
     },
     Admin(AdminArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DiagnoseCommand {
+    Nat(NatDiagnoseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NatDiagnoseArgs {
+    #[arg(long = "stun", required = true)]
+    pub stun_servers: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

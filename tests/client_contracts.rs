@@ -54,6 +54,22 @@ fn admin_key_registration_takes_a_public_key_file() {
 }
 
 #[test]
+fn nat_diagnose_accepts_an_explicit_a_b_a_stun_sequence() {
+    let args = [
+        "kmesh",
+        "diagnose",
+        "nat",
+        "--stun",
+        "192.0.2.11:3478",
+        "--stun",
+        "stun.cloudflare.com:3478",
+        "--stun",
+        "192.0.2.11:3478",
+    ];
+    assert!(kmesh::client::Cli::try_parse_from(args).is_ok());
+}
+
+#[test]
 fn ssh_config_uses_stable_alias_and_shell_safe_proxy_arguments() {
     let target_id = Uuid::new_v4();
     let target = TargetView {
