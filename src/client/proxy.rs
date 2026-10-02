@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -26,7 +26,7 @@ use super::{
     ClientContext,
     agent::quic_auth_message,
     api::{Api, WsStream},
-    auth,
+    auth, nat,
 };
 
 const DIRECT_BUDGET: Duration = Duration::from_secs(2);
@@ -210,31 +210,44 @@ async fn direct_attempt(
             "offer client key differs from this connection".to_owned(),
         ))));
     }
-    let mut stun = context.config.stun.clone();
-    if stun.servers.is_empty() {
-        stun.servers
-            .push(stun_endpoint(&context.config.server_url).map_err(DirectFailure::Fatal)?);
-    }
-    let mut attempt = timeout_at(deadline, UdpAttempt::bind(stun))
+    let stun = context.config.stun.clone();
+    let destinations = timeout_at(
+        deadline,
+        nat::resolve_stun_destinations(&stun, &context.config.server_url),
+    )
+    .await
+    .map_err(|_| DirectFailure::Network("STUN endpoint resolution timed out".to_owned()))?
+    .map_err(DirectFailure::Fatal)?;
+    let mut bind_config = stun;
+    bind_config.servers.clear();
+    let mut attempt = timeout_at(deadline, UdpAttempt::bind(bind_config))
         .await
         .map_err(|_| DirectFailure::Network("UDP bind timed out".to_owned()))?
         .map_err(classify_transport)?;
-    let candidates = timeout_at(deadline, attempt.gather())
-        .await
-        .map_err(|_| DirectFailure::Network("STUN gather timed out".to_owned()))?
-        .map_err(classify_transport)?;
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client STUN gather complete");
+    let (local_candidates, mappings) =
+        timeout_at(deadline, attempt.gather_observations(&destinations))
+            .await
+            .map_err(|_| DirectFailure::Network("STUN gather timed out".to_owned()))?
+            .map_err(classify_transport)?;
+    let observation = nat::to_nat_observation(local_candidates, mappings);
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), observation = ?observation, "client NAT observations gathered");
     Api::send_control(
         control,
         &ControlMessage::Candidates {
             session_id,
-            candidates,
+            observation,
         },
     )
     .await
     .map_err(DirectFailure::Fatal)?;
-    let remote = receive_candidates(control, session_id, deadline).await?;
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client peer candidates received");
+    let plan = receive_nat_plan(control, session_id, deadline).await?;
+    let remote = plan.client_remote_candidates;
+    if remote.is_empty() {
+        return Err(DirectFailure::Network(
+            "server NAT plan contains no target candidates".to_owned(),
+        ));
+    }
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), client_remote_candidates = ?remote, "client received bounded NAT plan");
     let probe_result = timeout_at(
         deadline,
         attempt.probe(
@@ -370,17 +383,17 @@ async fn relay(
     copy_stdio(&mut stream).await
 }
 
-async fn receive_candidates(
+async fn receive_nat_plan(
     control: &mut WsStream,
     session_id: Uuid,
     deadline: Instant,
-) -> std::result::Result<Vec<SocketAddr>, DirectFailure> {
+) -> std::result::Result<crate::protocol::NatPlan, DirectFailure> {
     loop {
         match receive_control_until(control, deadline).await? {
-            ControlMessage::Candidates {
+            ControlMessage::NatPlan {
                 session_id: received,
-                candidates,
-            } if received == session_id => return Ok(candidates),
+                plan,
+            } if received == session_id => return Ok(plan),
             ControlMessage::SelectRelay {
                 session_id: received,
             } if received == session_id => return Err(DirectFailure::RelaySelected),
@@ -656,16 +669,6 @@ fn fingerprint(certificate_der: &[u8]) -> String {
         "sha256:{}",
         URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(certificate_der))
     )
-}
-
-fn stun_endpoint(server_url: &str) -> Result<String> {
-    let url = reqwest::Url::parse(server_url).context("parse server URL for STUN endpoint")?;
-    let host = url.host_str().context("server URL has no host")?;
-    if host.starts_with('[') || !host.contains(':') {
-        Ok(format!("{host}:3478"))
-    } else {
-        Ok(format!("[{host}]:3478"))
-    }
 }
 
 fn remaining(deadline: Instant) -> Result<Duration> {

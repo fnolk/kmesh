@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fs,
     io::Cursor,
-    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -37,6 +36,7 @@ use crate::{
 use super::{
     AsyncReadWrite, ClientContext,
     api::{Api, ApiFailure},
+    nat,
     profile::{self, write_json_atomic},
 };
 
@@ -388,28 +388,39 @@ async fn direct_accept(
     outbound: &mpsc::Sender<ControlMessage>,
 ) -> Result<QuicByteStream> {
     let started = Instant::now();
-    let mut stun = context.config.stun.clone();
-    if stun.servers.is_empty() {
-        stun.servers
-            .push(stun_endpoint(&context.config.server_url)?);
-    }
-    let mut attempt = timeout_at(deadline, UdpAttempt::bind(stun))
+    let stun = context.config.stun.clone();
+    let destinations = timeout_at(
+        deadline,
+        nat::resolve_stun_destinations(&stun, &context.config.server_url),
+    )
+    .await
+    .context("STUN endpoint resolution timed out")??;
+    let mut bind_config = stun;
+    bind_config.servers.clear();
+    let mut attempt = timeout_at(deadline, UdpAttempt::bind(bind_config))
         .await
         .context("direct UDP bind timed out")??;
-    let candidates = timeout_at(deadline, attempt.gather())
-        .await
-        .context("STUN gather timed out")??;
-    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "target STUN gather complete");
+    let (local_candidates, mappings) =
+        timeout_at(deadline, attempt.gather_observations(&destinations))
+            .await
+            .context("STUN gather timed out")??;
+    let observation = nat::to_nat_observation(local_candidates, mappings);
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), observation = ?observation, "target NAT observations gathered");
     send_control(
         outbound,
         ControlMessage::Candidates {
             session_id: offer.session_id,
-            candidates,
+            observation,
         },
     )
     .await?;
-    let remote = receive_candidates(offer.session_id, inbound, deadline).await?;
-    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "target peer candidates received");
+    let plan = receive_nat_plan(offer.session_id, inbound, deadline).await?;
+    let remote = plan.target_remote_candidates;
+    anyhow::ensure!(
+        !remote.is_empty(),
+        "server NAT plan contains no client candidates"
+    );
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), target_remote_candidates = ?remote, "target received bounded NAT plan");
     let probe_result = timeout_at(
         deadline,
         attempt.probe(
@@ -483,17 +494,17 @@ async fn direct_accept(
     Ok(stream)
 }
 
-async fn receive_candidates(
+async fn receive_nat_plan(
     session_id: Uuid,
     inbound: &mut mpsc::Receiver<ControlMessage>,
     deadline: Instant,
-) -> Result<Vec<SocketAddr>> {
+) -> Result<crate::protocol::NatPlan> {
     loop {
         match receive_until(inbound, deadline).await? {
-            ControlMessage::Candidates {
+            ControlMessage::NatPlan {
                 session_id: received,
-                candidates,
-            } if received == session_id => return Ok(candidates),
+                plan,
+            } if received == session_id => return Ok(plan),
             ControlMessage::SelectRelay {
                 session_id: received,
             } if received == session_id => return Err(RelaySelected.into()),
@@ -736,6 +747,7 @@ fn message_session_id(message: &ControlMessage) -> Option<Uuid> {
         ControlMessage::Open { session_id, .. }
         | ControlMessage::Offer { session_id, .. }
         | ControlMessage::Candidates { session_id, .. }
+        | ControlMessage::NatPlan { session_id, .. }
         | ControlMessage::ProbeSeen { session_id, .. }
         | ControlMessage::QuicReady { session_id }
         | ControlMessage::SelectRelay { session_id }
@@ -753,16 +765,6 @@ fn decode_probe_token(token: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow!("UDP probe token must contain 32 bytes"))
-}
-
-fn stun_endpoint(server_url: &str) -> Result<String> {
-    let url = reqwest::Url::parse(server_url).context("parse server URL for STUN endpoint")?;
-    let host = url.host_str().context("server URL has no host")?;
-    if host.starts_with('[') || !host.contains(':') {
-        Ok(format!("{host}:3478"))
-    } else {
-        Ok(format!("[{host}]:3478"))
-    }
 }
 
 fn remaining(deadline: Instant) -> Result<Duration> {

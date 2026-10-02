@@ -3,7 +3,11 @@ use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use anyhow::{Context, Result, bail, ensure};
 use tokio::{net::lookup_host, time::timeout};
 
-use crate::{config::StunConfig, transport::UdpAttempt};
+use crate::{
+    config::StunConfig,
+    protocol::{LocalCandidate, NatObservation, StunMapping},
+    transport::{LocalCandidate as TransportLocalCandidate, StunMappingObservation, UdpAttempt},
+};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 const STUN_TIMEOUT: Duration = Duration::from_millis(750);
@@ -16,9 +20,10 @@ pub async fn diagnose(config: &StunConfig, servers: &[String]) -> Result<()> {
 
     let mut config = config.clone();
     config.servers.clear();
+    let ipv4 = config.udp_bind_address.is_ipv4();
     let mut attempt = UdpAttempt::bind(config).await?;
     let local_candidates = attempt.gather().await?;
-    let destinations = resolve_destinations(servers).await?;
+    let destinations = resolve_destinations(servers, ipv4).await?;
     ensure!(
         destinations[0] != destinations[1],
         "A and B must resolve to different UDP destinations"
@@ -101,7 +106,50 @@ pub async fn diagnose(config: &StunConfig, servers: &[String]) -> Result<()> {
     }
 }
 
-async fn resolve_destinations(servers: &[String]) -> Result<Vec<SocketAddr>> {
+pub(super) async fn resolve_stun_destinations(
+    config: &StunConfig,
+    server_url: &str,
+) -> Result<Vec<SocketAddr>> {
+    let servers = if config.servers.is_empty() {
+        vec![default_stun_endpoint(server_url)?]
+    } else {
+        config.servers.clone()
+    };
+    resolve_destinations(&servers, config.udp_bind_address.is_ipv4()).await
+}
+
+pub(super) fn to_nat_observation(
+    local_candidates: Vec<TransportLocalCandidate>,
+    mappings: Vec<StunMappingObservation>,
+) -> NatObservation {
+    for mapping in &mappings {
+        tracing::debug!(
+            socket = %mapping.local_socket,
+            destination = %mapping.destination,
+            outcome = ?mapping.outcome,
+            rtt_ms = mapping.rtt.as_millis(),
+            "same-socket STUN mapping observation"
+        );
+    }
+    NatObservation {
+        local_candidates: local_candidates
+            .into_iter()
+            .map(|candidate| LocalCandidate {
+                address: candidate.address,
+                prefix_len: candidate.prefix_len,
+            })
+            .collect(),
+        stun_mappings: mappings
+            .into_iter()
+            .map(|mapping| StunMapping {
+                server: mapping.destination,
+                mapped: mapping.outcome.ok(),
+            })
+            .collect(),
+    }
+}
+
+async fn resolve_destinations(servers: &[String], ipv4: bool) -> Result<Vec<SocketAddr>> {
     let mut resolved = HashMap::<&str, SocketAddr>::new();
     let mut destinations = Vec::with_capacity(servers.len());
     for server in servers {
@@ -112,12 +160,22 @@ async fn resolve_destinations(servers: &[String]) -> Result<Vec<SocketAddr>> {
         let destination = timeout(DNS_TIMEOUT, lookup_host(server))
             .await
             .with_context(|| format!("resolve STUN server {server} timed out"))??
-            .find(SocketAddr::is_ipv4)
-            .with_context(|| format!("STUN server {server} has no IPv4 address"))?;
+            .find(|address| address.is_ipv4() == ipv4)
+            .with_context(|| format!("STUN server {server} has no matching IP family"))?;
         resolved.insert(server, destination);
         destinations.push(destination);
     }
     Ok(destinations)
+}
+
+fn default_stun_endpoint(server_url: &str) -> Result<String> {
+    let url = reqwest::Url::parse(server_url).context("parse server URL for STUN endpoint")?;
+    let host = url.host_str().context("server URL has no host")?;
+    if host.starts_with('[') || !host.contains(':') {
+        Ok(format!("{host}:3478"))
+    } else {
+        Ok(format!("[{host}]:3478"))
+    }
 }
 
 fn format_candidates(candidates: &[SocketAddr]) -> String {
