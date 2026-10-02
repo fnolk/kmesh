@@ -1586,6 +1586,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "hmac 0.13.0",
+ "httparse",
  "if-addrs",
  "jsonwebtoken",
  "quinn",
