@@ -90,12 +90,13 @@ where
     let host = uri
         .host()
         .ok_or_else(|| TransportError::Configuration("WSS URL has no host".to_owned()))?;
+    let socket_host = unbracket_host(host);
     let port = uri.port_u16().unwrap_or(443);
     let authority = format_authority(host, port);
     let mut stream: BoxedIo = if let Some(proxy) = &tls.proxy {
         connect_proxy_tunnel(proxy, &authority, tls).await?
     } else {
-        let socket = TcpStream::connect((host, port))
+        let socket = TcpStream::connect((socket_host, port))
             .await
             .map_err(TransportError::Network)?;
         socket.set_nodelay(true).map_err(TransportError::Network)?;
@@ -108,7 +109,7 @@ where
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
-    let server_name = tls.server_name.as_deref().unwrap_or(host);
+    let server_name = tls.server_name.as_deref().unwrap_or(socket_host);
     let server_name = ServerName::try_from(server_name.to_owned()).map_err(|error| {
         TransportError::Configuration(format!("invalid TLS server name: {error}"))
     })?;
@@ -148,10 +149,11 @@ async fn connect_proxy_tunnel(
     let host = proxy_url
         .host_str()
         .ok_or_else(|| TransportError::Configuration("proxy URL has no host".to_owned()))?;
+    let socket_host = unbracket_host(host);
     let port = proxy_url
         .port_or_known_default()
         .ok_or_else(|| TransportError::Configuration("proxy URL has no port".to_owned()))?;
-    let socket = TcpStream::connect((host, port))
+    let socket = TcpStream::connect((socket_host, port))
         .await
         .map_err(TransportError::Network)?;
     socket.set_nodelay(true).map_err(TransportError::Network)?;
@@ -161,7 +163,7 @@ async fn connect_proxy_tunnel(
                 .with_root_certificates(build_root_store(&tls.ca_certificates)?)
                 .with_no_client_auth(),
         );
-        let proxy_name = ServerName::try_from(host.to_owned()).map_err(|error| {
+        let proxy_name = ServerName::try_from(socket_host.to_owned()).map_err(|error| {
             TransportError::Configuration(format!("invalid proxy TLS server name: {error}"))
         })?;
         Box::new(
@@ -361,4 +363,10 @@ fn format_authority(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+fn unbracket_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
 }

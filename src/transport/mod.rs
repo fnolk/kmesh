@@ -1,5 +1,8 @@
 //! Direct UDP/QUIC and WSS relay transports.
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("kmesh transport supports Linux and macOS only");
+
 mod http;
 mod quic;
 mod relay;
