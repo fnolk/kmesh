@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::identity::{self, TUNNEL_TICKET_AUDIENCE};
 use crate::protocol::{
-    AgentEnrollmentRequest, AgentEnrollmentResponse, ControlMessage, PeerRole, SelectedPath,
-    TunnelTicketClaims,
+    AgentEnrollmentRequest, AgentEnrollmentResponse, ControlMessage, LocalCandidate,
+    NatObservation, NatPlan, PeerRole, SelectedPath, StunMapping, TunnelTicketClaims,
 };
 
 use super::auth::{AuthenticatedUser, authenticate, bearer_token};
@@ -28,6 +28,9 @@ use super::{ServerState, hash_secret, new_secret};
 
 const DIRECT_TICKET_TTL_SECS: i64 = 60;
 const PENDING_TUNNEL_TTL_SECS: u64 = 65;
+const MAX_NAT_LOCAL_CANDIDATES: usize = 128;
+const MAX_NAT_STUN_MAPPINGS: usize = 16;
+const MAX_NAT_PLAN_CANDIDATES: usize = 8;
 
 #[derive(Clone)]
 pub struct OnlineAgent {
@@ -47,6 +50,9 @@ pub(crate) struct TunnelState {
     pub phase: TunnelPhase,
     pub client_quic_ready: bool,
     pub target_quic_ready: bool,
+    client_nat_observation: Option<NatObservation>,
+    target_nat_observation: Option<NatObservation>,
+    nat_plan_sent: bool,
 }
 
 pub(crate) struct TunnelRuntime {
@@ -299,18 +305,35 @@ async fn handle_client_message(
         }
         ControlMessage::Candidates {
             session_id,
-            candidates,
-        } if valid_candidates(&candidates) => {
-            route_client_message(
+            observation,
+        } => {
+            if !valid_nat_observation(&observation) {
+                send_error(
+                    client_sender,
+                    Some(session_id),
+                    "invalid_candidates",
+                    "NAT observation is invalid".to_owned(),
+                )
+                .await;
+                return;
+            }
+            if let Err(error) = submit_nat_observation(
                 state,
-                user,
                 session_id,
-                ControlMessage::Candidates {
-                    session_id,
-                    candidates,
-                },
+                Endpoint::Client(user),
+                Some(client_sender),
+                observation,
             )
-            .await;
+            .await
+            {
+                send_error(
+                    client_sender,
+                    Some(session_id),
+                    "invalid_candidates",
+                    error.to_owned(),
+                )
+                .await;
+            }
         }
         ControlMessage::ProbeSeen {
             session_id,
@@ -365,19 +388,42 @@ async fn handle_agent_message(
     match message {
         ControlMessage::Candidates {
             session_id,
-            candidates,
-        } if valid_candidates(&candidates) => {
-            route_agent_message(
+            observation,
+        } => {
+            if !valid_nat_observation(&observation) {
+                send_agent_error(
+                    state,
+                    target_id,
+                    connection_id,
+                    Some(session_id),
+                    "invalid_candidates",
+                    "NAT observation is invalid",
+                )
+                .await;
+                return;
+            }
+            if let Err(error) = submit_nat_observation(
                 state,
-                target_id,
-                connection_id,
                 session_id,
-                ControlMessage::Candidates {
-                    session_id,
-                    candidates,
+                Endpoint::Target {
+                    target_id,
+                    connection_id,
                 },
+                None,
+                observation,
             )
-            .await;
+            .await
+            {
+                send_agent_error(
+                    state,
+                    target_id,
+                    connection_id,
+                    Some(session_id),
+                    "invalid_candidates",
+                    error,
+                )
+                .await;
+            }
         }
         ControlMessage::ProbeSeen {
             session_id,
@@ -583,6 +629,199 @@ async fn authorized_for_target(
     .fetch_one(&mut **tx)
     .await?;
     Ok(allowed != 0)
+}
+
+pub(super) async fn submit_nat_observation(
+    state: &ServerState,
+    session_id: Uuid,
+    endpoint: Endpoint,
+    client_sender: Option<&mpsc::Sender<ControlMessage>>,
+    observation: NatObservation,
+) -> Result<(), &'static str> {
+    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let endpoint_matches = match endpoint {
+        Endpoint::Client(user) => {
+            runtime.user_id == user.user_id
+                && runtime.auth_session_id == user.session_id
+                && client_sender.is_some_and(|sender| runtime.client_sender.same_channel(sender))
+        }
+        Endpoint::Target {
+            target_id,
+            connection_id,
+        } => runtime.target_id == target_id && runtime.target_connection_id == connection_id,
+    };
+    if !endpoint_matches {
+        return Ok(());
+    }
+
+    let plan = {
+        let mut tunnel_state = runtime.state.lock().await;
+        if tunnel_state.phase != TunnelPhase::Pending {
+            return Ok(());
+        }
+        let observation_slot = match endpoint {
+            Endpoint::Client(_) => &mut tunnel_state.client_nat_observation,
+            Endpoint::Target { .. } => &mut tunnel_state.target_nat_observation,
+        };
+        if observation_slot.is_some() {
+            return Err("NAT observation was already submitted");
+        }
+        *observation_slot = Some(observation);
+        let plan = if tunnel_state.nat_plan_sent {
+            None
+        } else {
+            tunnel_state
+                .client_nat_observation
+                .as_ref()
+                .zip(tunnel_state.target_nat_observation.as_ref())
+                .map(|(client, target)| build_nat_plan(client, target))
+        };
+        if plan.is_some() {
+            tunnel_state.nat_plan_sent = true;
+        }
+        plan
+    };
+
+    if let Some(plan) = plan {
+        let message = ControlMessage::NatPlan { session_id, plan };
+        if runtime.client_sender.send(message.clone()).await.is_err()
+            || runtime.target_sender.send(message).await.is_err()
+        {
+            close_tunnel(
+                state,
+                &runtime,
+                "control connection closed while sending NAT plan",
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn valid_nat_observation(observation: &NatObservation) -> bool {
+    observation.local_candidates.len() <= MAX_NAT_LOCAL_CANDIDATES
+        && observation.stun_mappings.len() <= MAX_NAT_STUN_MAPPINGS
+        && (!observation.local_candidates.is_empty() || !observation.stun_mappings.is_empty())
+        && observation.local_candidates.iter().all(|candidate| {
+            valid_candidate(candidate.address)
+                && match candidate.address.ip() {
+                    std::net::IpAddr::V4(_) => candidate.prefix_len <= 32,
+                    std::net::IpAddr::V6(_) => candidate.prefix_len <= 128,
+                }
+        })
+        && observation.stun_mappings.iter().all(|mapping| {
+            valid_candidate(mapping.server)
+                && mapping
+                    .mapped
+                    .is_none_or(|candidate| valid_candidate(candidate))
+        })
+}
+
+pub(super) fn build_nat_plan(client: &NatObservation, target: &NatObservation) -> NatPlan {
+    NatPlan {
+        client_remote_candidates: remote_candidates(client, target),
+        target_remote_candidates: remote_candidates(target, client),
+    }
+}
+
+fn remote_candidates(local: &NatObservation, remote: &NatObservation) -> Vec<std::net::SocketAddr> {
+    let mut candidates = Vec::with_capacity(MAX_NAT_PLAN_CANDIDATES);
+    for mapping in &remote.stun_mappings {
+        if let Some(mapped) = mapping.mapped {
+            push_candidate(&mut candidates, mapped);
+        }
+    }
+
+    for peer in &remote.local_candidates {
+        if usable_lan_candidate(peer.address)
+            && local
+                .local_candidates
+                .iter()
+                .any(|local| usable_lan_candidate(local.address) && prefixes_overlap(local, peer))
+        {
+            push_candidate(&mut candidates, peer.address);
+        }
+    }
+
+    if candidates.len() < MAX_NAT_PLAN_CANDIDATES {
+        for candidate in bounded_port_samples(&remote.stun_mappings) {
+            push_candidate(&mut candidates, candidate);
+            if candidates.len() == MAX_NAT_PLAN_CANDIDATES {
+                break;
+            }
+        }
+    }
+    candidates
+}
+
+fn push_candidate(candidates: &mut Vec<std::net::SocketAddr>, candidate: std::net::SocketAddr) {
+    if candidates.len() < MAX_NAT_PLAN_CANDIDATES && !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn bounded_port_samples(mappings: &[StunMapping]) -> Vec<std::net::SocketAddr> {
+    if mappings.len() != 3
+        || mappings[0].server == mappings[1].server
+        || mappings[0].server != mappings[2].server
+    {
+        return Vec::new();
+    }
+    let (Some(first), Some(middle), Some(last)) =
+        (mappings[0].mapped, mappings[1].mapped, mappings[2].mapped)
+    else {
+        return Vec::new();
+    };
+    if first != last || first.ip() != middle.ip() {
+        return Vec::new();
+    }
+
+    let low = u32::from(first.port().min(middle.port()));
+    let high = u32::from(first.port().max(middle.port()));
+    let span = high - low;
+    if span <= 1 {
+        return Vec::new();
+    }
+    let sample_count = ((span - 1) as usize).min(MAX_NAT_PLAN_CANDIDATES - 2);
+    let denominator = (sample_count + 1) as u32;
+    (1..=sample_count)
+        .map(|index| {
+            let index = index as u32;
+            let offset = (span * index + denominator / 2) / denominator;
+            std::net::SocketAddr::new(first.ip(), (low + offset) as u16)
+        })
+        .collect()
+}
+
+fn usable_lan_candidate(address: std::net::SocketAddr) -> bool {
+    if !valid_candidate(address) || address.ip().is_loopback() {
+        return false;
+    }
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => !ip.octets().starts_with(&[169, 254]),
+        std::net::IpAddr::V6(ip) => ip.segments()[0] & 0xffc0 != 0xfe80,
+    }
+}
+
+fn prefixes_overlap(left: &LocalCandidate, right: &LocalCandidate) -> bool {
+    let prefix_len = left.prefix_len.min(right.prefix_len);
+    if prefix_len == 0 {
+        return false;
+    }
+    match (left.address.ip(), right.address.ip()) {
+        (std::net::IpAddr::V4(left), std::net::IpAddr::V4(right)) => {
+            let mask = u32::MAX << (32 - prefix_len);
+            u32::from(left) & mask == u32::from(right) & mask
+        }
+        (std::net::IpAddr::V6(left), std::net::IpAddr::V6(right)) => {
+            let mask = u128::MAX << (128 - u32::from(prefix_len));
+            u128::from(left) & mask == u128::from(right) & mask
+        }
+        _ => false,
+    }
 }
 
 async fn route_client_message(
@@ -993,10 +1232,6 @@ async fn send_agent_error(
     }
 }
 
-fn valid_candidates(candidates: &[std::net::SocketAddr]) -> bool {
-    candidates.len() <= 128 && candidates.iter().copied().all(valid_candidate)
-}
-
 fn valid_candidate(candidate: std::net::SocketAddr) -> bool {
     if candidate.port() == 0 || candidate.ip().is_unspecified() || candidate.ip().is_multicast() {
         return false;
@@ -1043,6 +1278,9 @@ impl TunnelRuntime {
                 phase: TunnelPhase::Pending,
                 client_quic_ready: false,
                 target_quic_ready: false,
+                client_nat_observation: None,
+                target_nat_observation: None,
+                nat_plan_sent: false,
             }),
             phase_tx,
             relay_slots: Mutex::new(super::relay::RelaySlots::default()),

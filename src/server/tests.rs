@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 use crate::identity;
 use crate::protocol::{
-    AdminOperation, AdminResponse, AgentEnrollmentRequest, LoginTokens, PasswordLoginRequest,
-    PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest, SelectedPath,
-    TargetPermission,
+    AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, LocalCandidate,
+    LoginTokens, NatObservation, PasswordLoginRequest, PublicKeyChallengeRequest,
+    PublicKeyLoginRequest, RefreshRequest, SelectedPath, StunMapping, TargetPermission,
 };
 
 use super::control::{self, OnlineAgent, TunnelPhase};
@@ -109,6 +109,261 @@ async fn login_password(state: &ServerState) -> LoginTokens {
     .await
     .expect("password login")
     .0
+}
+
+#[test]
+fn nat_plan_samples_only_the_measured_stable_same_ip_interval() {
+    let client = NatObservation {
+        local_candidates: vec![LocalCandidate {
+            address: "10.0.0.6:51304"
+                .parse()
+                .expect("client local address"),
+            prefix_len: 24,
+        }],
+        stun_mappings: [
+            ("192.0.2.11:3478", Some("192.0.2.12:11326")),
+            ("192.0.2.13:3478", Some("192.0.2.12:11326")),
+            ("192.0.2.11:3478", Some("192.0.2.12:11326")),
+        ]
+        .map(|(server, mapped)| StunMapping {
+            server: server.parse().expect("STUN server address"),
+            mapped: mapped.map(|address| address.parse().expect("mapped address")),
+        })
+        .into(),
+    };
+    let target = NatObservation {
+        local_candidates: vec![LocalCandidate {
+            address: "10.0.0.4:43709"
+                .parse()
+                .expect("target local address"),
+            prefix_len: 23,
+        }],
+        stun_mappings: [
+            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
+            ("192.0.2.13:3478", Some("192.0.2.19:4148")),
+            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
+        ]
+        .map(|(server, mapped)| StunMapping {
+            server: server.parse().expect("STUN server address"),
+            mapped: mapped.map(|address| address.parse().expect("mapped address")),
+        })
+        .into(),
+    };
+
+    let plan = control::build_nat_plan(&client, &target);
+    assert_eq!(plan.client_remote_candidates.len(), 8);
+    assert_eq!(
+        &plan.client_remote_candidates[..2],
+        &[
+            "192.0.2.19:4164".parse().expect("A mapping"),
+            "192.0.2.19:4148".parse().expect("B mapping"),
+        ]
+    );
+    assert!(plan.client_remote_candidates.iter().all(|candidate| {
+        candidate.ip() == "192.0.2.19".parse::<IpAddr>().expect("public IP")
+            && (4148..=4164).contains(&candidate.port())
+    }));
+    assert_eq!(
+        plan.target_remote_candidates,
+        vec!["192.0.2.12:11326".parse().expect("client mapping")]
+    );
+    assert_eq!(
+        plan.client_remote_candidates
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        plan.client_remote_candidates.len(),
+        "candidate order is stable and entries are unique"
+    );
+}
+
+#[test]
+fn nat_plan_adds_lan_candidates_only_for_overlapping_prefixes() {
+    let client = NatObservation {
+        local_candidates: vec![LocalCandidate {
+            address: "10.0.0.3:5000".parse().expect("client local address"),
+            prefix_len: 24,
+        }],
+        stun_mappings: vec![],
+    };
+    let target = NatObservation {
+        local_candidates: vec![LocalCandidate {
+            address: "10.0.0.4:5001".parse().expect("target local address"),
+            prefix_len: 23,
+        }],
+        stun_mappings: vec![],
+    };
+    let plan = control::build_nat_plan(&client, &target);
+    assert_eq!(
+        plan.client_remote_candidates,
+        vec!["10.0.0.4:5001".parse().unwrap()]
+    );
+    assert_eq!(
+        plan.target_remote_candidates,
+        vec!["10.0.0.3:5000".parse().unwrap()]
+    );
+
+    let non_overlapping_client = NatObservation {
+        local_candidates: vec![LocalCandidate {
+            address: "10.0.0.6:5000".parse().expect("client local address"),
+            prefix_len: 24,
+        }],
+        stun_mappings: vec![],
+    };
+    let plan = control::build_nat_plan(&non_overlapping_client, &target);
+    assert!(plan.client_remote_candidates.is_empty());
+    assert!(plan.target_remote_candidates.is_empty());
+}
+
+#[test]
+fn nat_plan_does_not_interpolate_unstable_or_cross_ip_observations() {
+    let client = NatObservation {
+        local_candidates: vec![],
+        stun_mappings: vec![],
+    };
+    let target = NatObservation {
+        local_candidates: vec![],
+        stun_mappings: [
+            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
+            ("192.0.2.13:3478", Some("198.51.100.2:4148")),
+            ("192.0.2.11:3478", Some("192.0.2.19:4163")),
+        ]
+        .map(|(server, mapped)| StunMapping {
+            server: server.parse().expect("STUN server address"),
+            mapped: mapped.map(|address| address.parse().expect("mapped address")),
+        })
+        .into(),
+    };
+
+    let plan = control::build_nat_plan(&client, &target);
+    assert_eq!(
+        plan.client_remote_candidates,
+        vec![
+            "192.0.2.19:4164".parse().unwrap(),
+            "198.51.100.2:4148".parse().unwrap(),
+            "192.0.2.19:4163".parse().unwrap(),
+        ]
+    );
+}
+
+#[test]
+fn nat_observation_validation_bounds_network_input() {
+    assert!(control::valid_nat_observation(&NatObservation {
+        local_candidates: vec![LocalCandidate {
+            address: "10.0.0.2:1234".parse().unwrap(),
+            prefix_len: 24,
+        }],
+        stun_mappings: vec![],
+    }));
+    assert!(!control::valid_nat_observation(&NatObservation {
+        local_candidates: vec![LocalCandidate {
+            address: "10.0.0.2:1234".parse().unwrap(),
+            prefix_len: 33,
+        }],
+        stun_mappings: vec![],
+    }));
+    assert!(!control::valid_nat_observation(&NatObservation {
+        local_candidates: vec![],
+        stun_mappings: vec![],
+    }));
+}
+
+#[tokio::test]
+async fn control_sends_nat_plan_only_after_both_endpoints_report() {
+    let fixture = fixture().await;
+    let state = &fixture.state;
+    let login = login_password(state).await;
+    let user = auth::authenticate(state, &bearer(&login.access_token))
+        .await
+        .expect("authenticate admin");
+    let (target_id, _) = create_enrolled_target(state, "nat-plan-target").await;
+    grant_target(state, target_id).await;
+    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
+    let (client_sender, mut client_receiver) = mpsc::channel(16);
+    let session_id = Uuid::new_v4();
+    open_test_tunnel(
+        state,
+        user,
+        session_id,
+        target_id,
+        target_connection_id,
+        client_sender.clone(),
+    )
+    .await;
+    let _ = target_receiver.recv().await.expect("target offer");
+    let _ = client_receiver.recv().await.expect("client offer");
+
+    let client_observation = NatObservation {
+        local_candidates: vec![],
+        stun_mappings: vec![StunMapping {
+            server: "192.0.2.11:3478".parse().expect("STUN server address"),
+            mapped: Some("198.51.100.10:5000".parse().expect("client mapped address")),
+        }],
+    };
+    let target_observation = NatObservation {
+        local_candidates: vec![],
+        stun_mappings: vec![StunMapping {
+            server: "192.0.2.11:3478".parse().expect("STUN server address"),
+            mapped: Some("203.0.113.20:6000".parse().expect("target mapped address")),
+        }],
+    };
+    control::submit_nat_observation(
+        state,
+        session_id,
+        control::Endpoint::Client(user),
+        Some(&client_sender),
+        client_observation,
+    )
+    .await
+    .expect("accept client observation");
+    assert!(client_receiver.try_recv().is_err());
+    assert!(target_receiver.try_recv().is_err());
+
+    control::submit_nat_observation(
+        state,
+        session_id,
+        control::Endpoint::Target {
+            target_id,
+            connection_id: target_connection_id,
+        },
+        None,
+        target_observation,
+    )
+    .await
+    .expect("accept target observation");
+
+    let ControlMessage::NatPlan {
+        session_id: client_session,
+        plan: client_plan,
+    } = client_receiver.recv().await.expect("client NAT plan")
+    else {
+        panic!("client receives NAT plan after both reports");
+    };
+    let ControlMessage::NatPlan {
+        session_id: target_session,
+        plan: target_plan,
+    } = target_receiver.recv().await.expect("target NAT plan")
+    else {
+        panic!("target receives NAT plan after both reports");
+    };
+    assert_eq!(client_session, session_id);
+    assert_eq!(target_session, session_id);
+    assert_eq!(
+        client_plan.client_remote_candidates,
+        vec!["203.0.113.20:6000".parse().expect("target candidate")]
+    );
+    assert_eq!(
+        client_plan.target_remote_candidates,
+        vec!["198.51.100.10:5000".parse().expect("client candidate")]
+    );
+    assert_eq!(
+        target_plan.client_remote_candidates,
+        client_plan.client_remote_candidates
+    );
+    assert_eq!(
+        target_plan.target_remote_candidates,
+        client_plan.target_remote_candidates
+    );
 }
 
 async fn admin_role_id(state: &ServerState) -> Uuid {
