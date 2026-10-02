@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -14,10 +13,12 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::protocol::QUIC_STREAM_MAGIC;
 use crate::transport::{TransportError, UdpAttempt, ensure_rustls_provider};
 
 const ALPN_PROTOCOL: &[u8] = b"kmesh-ssh/1";
-const STREAM_PREFACE: &[u8; 4] = b"KMS1";
+type SendStoppedFuture =
+    futures_util::future::BoxFuture<'static, Result<Option<VarInt>, quinn::StoppedError>>;
 
 #[derive(Clone, Debug)]
 pub struct QuicConfig {
@@ -46,11 +47,11 @@ impl QuicAcceptor {
             })?;
         let connection = incoming.await.map_err(map_connection_error)?;
         let (mut send, mut recv) = connection.accept_bi().await.map_err(map_connection_error)?;
-        let mut preface = [0; STREAM_PREFACE.len()];
+        let mut preface = [0; QUIC_STREAM_MAGIC.len()];
         recv.read_exact(&mut preface)
             .await
             .map_err(|error| TransportError::Quic(format!("read QUIC stream preface: {error}")))?;
-        if &preface != STREAM_PREFACE {
+        if preface != QUIC_STREAM_MAGIC {
             send.reset(VarInt::from_u32(1)).map_err(|error| {
                 TransportError::Quic(format!("reset stream with invalid preface: {error}"))
             })?;
@@ -77,8 +78,7 @@ pub struct QuicByteStream {
     recv: RecvStream,
     send_finished: bool,
     send_acknowledged: bool,
-    stopped:
-        Option<Pin<Box<dyn Future<Output = Result<Option<VarInt>, quinn::StoppedError>> + Send>>>,
+    stopped: Option<SendStoppedFuture>,
     receive_finished: bool,
 }
 
@@ -313,7 +313,7 @@ impl UdpAttempt {
             .await
             .map_err(map_connection_error)?;
         let (mut send, recv) = connection.open_bi().await.map_err(map_connection_error)?;
-        send.write_all(STREAM_PREFACE)
+        send.write_all(&QUIC_STREAM_MAGIC)
             .await
             .map_err(|error| TransportError::Quic(format!("write QUIC stream preface: {error}")))?;
         send.flush()

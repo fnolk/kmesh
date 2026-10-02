@@ -28,12 +28,20 @@ async fn relay_pair() -> (RelayByteStream, RelayByteStream) {
 #[tokio::test]
 async fn relay_data_and_both_fin_frames_preserve_tcp_half_close() {
     let (mut client, mut target) = relay_pair().await;
-    client.write_all(b"client request").await.unwrap();
+    let request = (0..256 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    client.write_all(&request).await.unwrap();
     client.shutdown().await.unwrap();
 
     let mut request = Vec::new();
     target.read_to_end(&mut request).await.unwrap();
-    assert_eq!(request, b"client request");
+    assert_eq!(
+        request,
+        (0..256 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>()
+    );
 
     target.write_all(b"target response").await.unwrap();
     target.shutdown().await.unwrap();

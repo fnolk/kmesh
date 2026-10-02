@@ -13,6 +13,7 @@ const DATA_FRAME: u8 = 0;
 const FIN_FRAME: u8 = 1;
 const RESET_FRAME: u8 = 2;
 const MAX_RESET_REASON: usize = 1024;
+const RELAY_DATA_CHUNK: usize = 16 * 1024;
 
 pub struct RelayByteStream {
     websocket: WsStream,
@@ -281,12 +282,13 @@ impl AsyncWrite for RelayByteStream {
         }
         match Pin::new(&mut self.websocket).poll_ready(cx) {
             Poll::Ready(Ok(())) => {
-                let mut frame = Vec::with_capacity(buffer.len() + 1);
+                let written = buffer.len().min(RELAY_DATA_CHUNK);
+                let mut frame = Vec::with_capacity(written + 1);
                 frame.push(DATA_FRAME);
-                frame.extend_from_slice(buffer);
+                frame.extend_from_slice(&buffer[..written]);
                 match Pin::new(&mut self.websocket).start_send(Message::Binary(Bytes::from(frame)))
                 {
-                    Ok(()) => Poll::Ready(Ok(buffer.len())),
+                    Ok(()) => Poll::Ready(Ok(written)),
                     Err(error) => Poll::Ready(Err(io::Error::other(error))),
                 }
             }

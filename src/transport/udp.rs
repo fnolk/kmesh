@@ -108,12 +108,10 @@ impl UdpAttempt {
 
         loop {
             let now = Instant::now();
-            if saw_peer_request && received_ack_from.is_some() {
+            if saw_peer_request && let Some(peer_addr) = received_ack_from {
                 let confirmed = *confirmed_at.get_or_insert(now);
                 if now >= confirmed + PROBE_SETTLE {
-                    return Ok(ProbeResult {
-                        peer_addr: received_ack_from.expect("both probe directions are confirmed"),
-                    });
+                    return Ok(ProbeResult { peer_addr });
                 }
             }
             if confirmed_at.is_none() && now >= deadline {
