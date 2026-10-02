@@ -713,10 +713,7 @@ pub(super) fn valid_nat_observation(observation: &NatObservation) -> bool {
                 }
         })
         && observation.stun_mappings.iter().all(|mapping| {
-            valid_candidate(mapping.server)
-                && mapping
-                    .mapped
-                    .is_none_or(|candidate| valid_candidate(candidate))
+            valid_candidate(mapping.server) && mapping.mapped.is_none_or(valid_candidate)
         })
 }
 
