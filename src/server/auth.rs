@@ -136,6 +136,10 @@ pub(crate) async fn public_key_challenge(
         rand::random(),
     );
     let challenge = URL_SAFE_NO_PAD.encode(signed_payload);
+    sqlx::query("DELETE FROM ssh_login_challenges WHERE expires_at < ?1")
+        .bind(now)
+        .execute(&state.inner.db.pool)
+        .await?;
     sqlx::query(
         "INSERT INTO ssh_login_challenges(id, username, public_key, user_id, key_id, nonce, expires_at, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -191,7 +195,7 @@ pub(crate) async fn public_key_login(
     let challenge: String = row.try_get("nonce").map_err(ApiError::from)?;
     let expires_at: i64 = row.try_get("expires_at").map_err(ApiError::from)?;
     let consumed_at: Option<i64> = row.try_get("consumed_at").map_err(ApiError::from)?;
-    if username != supplied_username || expires_at < unix_time() || consumed_at.is_some() {
+    if username != supplied_username || expires_at <= unix_time() || consumed_at.is_some() {
         return Err(ApiError::unauthorized());
     }
     let signed_payload = URL_SAFE_NO_PAD
@@ -311,7 +315,7 @@ pub(crate) async fn refresh(
     if refresh_revoked_at.is_some()
         || session_revoked_at.is_some()
         || enabled != 1
-        || expires_at < now
+        || expires_at <= now
     {
         tx.commit().await.map_err(ApiError::from)?;
         return Err(ApiError::unauthorized());

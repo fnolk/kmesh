@@ -111,8 +111,6 @@ CREATE TABLE IF NOT EXISTS tunnel_sessions (
     auth_session_id TEXT NOT NULL REFERENCES auth_sessions(id),
     target_id TEXT NOT NULL REFERENCES targets(id),
     client_public_key TEXT NOT NULL,
-    ticket TEXT NOT NULL,
-    probe_token TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'closed')),
     selected_path TEXT CHECK (selected_path IN ('quic', 'relay')),
     created_at INTEGER NOT NULL,

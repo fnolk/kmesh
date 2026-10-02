@@ -147,7 +147,7 @@ impl Database {
         let found = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(SELECT 1 FROM auth_sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.id = ?1 AND s.user_id = ?2 AND s.revoked_at IS NULL \
-               AND s.refresh_expires_at >= ?3 AND u.enabled = 1)",
+               AND s.refresh_expires_at > ?3 AND u.enabled = 1)",
         )
         .bind(session_id.to_string())
         .bind(user_id.to_string())
@@ -197,6 +197,5 @@ pub(crate) fn password_matches(password: &str, encoded_hash: &str) -> bool {
 
 pub(crate) fn row_uuid(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<uuid::Uuid> {
     let value: String = row.try_get(column)?;
-    Ok(uuid::Uuid::parse_str(&value)
-        .with_context(|| format!("invalid database UUID in {column}"))?)
+    uuid::Uuid::parse_str(&value).with_context(|| format!("invalid database UUID in {column}"))
 }

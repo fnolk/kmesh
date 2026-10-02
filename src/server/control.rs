@@ -93,7 +93,7 @@ pub(crate) async fn enroll(
     let deleted_at: Option<i64> = target.try_get("deleted_at")?;
     if enabled != 1
         || deleted_at.is_some()
-        || expires_at.is_none_or(|expiry| expiry < now)
+        || expires_at.is_none_or(|expiry| expiry <= now)
         || stored_hash.as_deref() != Some(token_hash.as_str())
     {
         return Err(ApiError::unauthorized());
@@ -102,7 +102,7 @@ pub(crate) async fn enroll(
         "UPDATE targets SET enrollment_token_hash = NULL, enrollment_expires_at = NULL, \
              agent_token_hash = ?1, agent_certificate_der = ?2, agent_certificate_fingerprint = ?3, \
              enrolled_at = ?4, updated_at = ?4 WHERE id = ?5 AND enrollment_token_hash = ?6 \
-             AND enrollment_expires_at >= ?4 AND enabled = 1",
+             AND enrollment_expires_at > ?4 AND enabled = 1",
     )
     .bind(agent_token_hash)
     .bind(&request.certificate_der)
@@ -300,7 +300,7 @@ async fn handle_client_message(
         ControlMessage::Candidates {
             session_id,
             candidates,
-        } => {
+        } if valid_candidates(&candidates) => {
             route_client_message(
                 state,
                 user,
@@ -316,7 +316,7 @@ async fn handle_client_message(
             session_id,
             peer: PeerRole::Client,
             candidate,
-        } => {
+        } if valid_candidate(candidate) => {
             route_client_message(
                 state,
                 user,
@@ -366,7 +366,7 @@ async fn handle_agent_message(
         ControlMessage::Candidates {
             session_id,
             candidates,
-        } => {
+        } if valid_candidates(&candidates) => {
             route_agent_message(
                 state,
                 target_id,
@@ -383,7 +383,7 @@ async fn handle_agent_message(
             session_id,
             peer: PeerRole::Target,
             candidate,
-        } => {
+        } if valid_candidate(candidate) => {
             route_agent_message(
                 state,
                 target_id,
@@ -518,16 +518,14 @@ pub(super) async fn open_tunnel(
         return Err(ApiError::forbidden());
     }
     sqlx::query(
-        "INSERT INTO tunnel_sessions(id, user_id, auth_session_id, target_id, client_public_key, ticket, probe_token, status, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+        "INSERT INTO tunnel_sessions(id, user_id, auth_session_id, target_id, client_public_key, status, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
     )
     .bind(session_id.to_string())
     .bind(user.user_id.to_string())
     .bind(user.session_id.to_string())
     .bind(target_id.to_string())
     .bind(&client_public_key)
-    .bind(&ticket)
-    .bind(&probe_token)
     .bind(now)
     .execute(&mut *tx)
     .await?;
@@ -709,7 +707,7 @@ pub(super) async fn activate_path(
         }
         _ => false,
     };
-    if !selected || unix_time() > runtime.expires_at {
+    if !selected || unix_time() >= runtime.expires_at {
         drop(tunnel_state);
         send_error(
             &runtime.target_sender,
@@ -992,6 +990,20 @@ async fn send_agent_error(
         .map(|agent| agent.sender.clone());
     if let Some(sender) = sender {
         send_error(&sender, session_id, code, message.to_owned()).await;
+    }
+}
+
+fn valid_candidates(candidates: &[std::net::SocketAddr]) -> bool {
+    candidates.len() <= 128 && candidates.iter().copied().all(valid_candidate)
+}
+
+fn valid_candidate(candidate: std::net::SocketAddr) -> bool {
+    if candidate.port() == 0 || candidate.ip().is_unspecified() || candidate.ip().is_multicast() {
+        return false;
+    }
+    match candidate.ip() {
+        std::net::IpAddr::V4(ip) => !ip.is_broadcast(),
+        std::net::IpAddr::V6(_) => true,
     }
 }
 

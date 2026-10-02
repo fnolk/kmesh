@@ -532,17 +532,17 @@ async fn relay_selection_and_direct_activation_have_one_path_winner() {
         control::select_relay(state, session_id, control::Endpoint::Client(user)),
     );
     let _ = (activate, relay);
-    if let Some(runtime) = state.inner.tunnels.read().await.get(&session_id).cloned() {
-        if runtime.state.lock().await.phase == TunnelPhase::RelaySelected {
-            control::activate_path(
-                state,
-                target_id,
-                target_connection_id,
-                session_id,
-                SelectedPath::Relay,
-            )
-            .await;
-        }
+    if let Some(runtime) = state.inner.tunnels.read().await.get(&session_id).cloned()
+        && runtime.state.lock().await.phase == TunnelPhase::RelaySelected
+    {
+        control::activate_path(
+            state,
+            target_id,
+            target_connection_id,
+            session_id,
+            SelectedPath::Relay,
+        )
+        .await;
     }
     let (status, path): (String, Option<String>) =
         sqlx::query_as("SELECT status, selected_path FROM tunnel_sessions WHERE id = ?1")

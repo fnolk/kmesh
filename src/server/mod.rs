@@ -75,19 +75,23 @@ pub async fn initialize(
 
     let db = Database::open(data_dir.join("server.sqlite3")).await?;
     db.apply_schema().await?;
-    let admin_password_hash = if db.user_count().await? == 0 {
+    let user_count = db.user_count().await?;
+    let key_path = data_dir.join("token-keys.json");
+    if key_path.exists() {
+        set_private_file(&key_path)?;
+    } else if user_count > 0 {
+        bail!("initialized database is missing persistent token keys");
+    } else {
+        let keys = identity::generate_token_key_set().context("generate server token keys")?;
+        write_private_atomically(&key_path, &serde_json::to_vec(&PersistedKeys::from(&keys))?)?;
+    }
+    let admin_password_hash = if user_count == 0 {
         Some(auth::password_hash_limited(admin_password.to_owned()).await?)
     } else {
         None
     };
     db.initialize(issuer, &admin_username, admin_password_hash)
         .await?;
-
-    let key_path = data_dir.join("token-keys.json");
-    if !key_path.exists() {
-        let keys = identity::generate_token_key_set().context("generate server token keys")?;
-        write_private_atomically(&key_path, &serde_json::to_vec(&PersistedKeys::from(&keys))?)?;
-    }
     FileExt::unlock(&lock).context("unlock server initialization")?;
     Ok(())
 }
@@ -109,6 +113,7 @@ pub async fn run(options: ServerOptions) -> Result<()> {
     let key_bytes = std::fs::read(options.data_dir.join("token-keys.json"))
         .context("read persistent server token keys")?;
     let keys = PersistedKeys::from_slice(&key_bytes)?.into_token_keys();
+    validate_token_keys(&keys, &options.issuer)?;
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -205,6 +210,43 @@ impl PersistedKeys {
     }
 }
 
+fn validate_token_keys(keys: &TokenKeySet, issuer: &str) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let claims = crate::protocol::AccessTokenClaims {
+        sub: Uuid::new_v4(),
+        sid: Uuid::new_v4(),
+        iss: issuer.to_owned(),
+        aud: identity::USER_TOKEN_AUDIENCE.to_owned(),
+        iat: now,
+        exp: now + 60,
+    };
+    let token = identity::encode_user_access_token(&claims, &keys.user_access.private_key_pem)
+        .context("validate user token signing key")?;
+    identity::decode_user_access_token(&token, &keys.user_access.public_key_pem, issuer)
+        .context("validate user token key pair")?;
+    let ticket_claims = crate::protocol::TunnelTicketClaims {
+        session_id: Uuid::new_v4(),
+        user_id: claims.sub,
+        login_session_id: claims.sid,
+        target_id: Uuid::new_v4(),
+        client_public_key: String::new(),
+        target_certificate_fingerprint: String::new(),
+        iss: issuer.to_owned(),
+        aud: identity::TUNNEL_TICKET_AUDIENCE.to_owned(),
+        iat: now,
+        exp: now + 60,
+    };
+    let ticket =
+        identity::encode_tunnel_ticket(&ticket_claims, &keys.tunnel_ticket.private_key_pem)
+            .context("validate tunnel ticket signing key")?;
+    identity::decode_tunnel_ticket(&ticket, &keys.tunnel_ticket.public_key_pem, issuer)
+        .context("validate tunnel ticket key pair")?;
+    Ok(())
+}
+
 pub(crate) fn hash_secret(value: &str) -> String {
     hex_digest(Sha256::digest(value.as_bytes()).as_slice())
 }
@@ -244,6 +286,16 @@ fn set_private_dir(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("secure data directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn set_private_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure private file {}", path.display()))?;
     }
     Ok(())
 }

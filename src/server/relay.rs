@@ -138,17 +138,30 @@ async fn bridge_after_activation(
         }
     }
     let _ = state;
-    bridge(client, target).await;
+    let bridge = bridge(client, target);
+    tokio::pin!(bridge);
+    loop {
+        tokio::select! {
+            _ = &mut bridge => return,
+            changed = phase_rx.changed() => {
+                if changed.is_err() || *phase_rx.borrow() == TunnelPhase::Closed {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 async fn bridge(client: WebSocket, target: WebSocket) {
     let (client_sink, client_stream) = client.split();
     let (target_sink, target_stream) = target.split();
-    let mut client_to_target = tokio::spawn(pipe(client_stream, target_sink));
-    let mut target_to_client = tokio::spawn(pipe(target_stream, client_sink));
+    let client_to_target = pipe(client_stream, target_sink);
+    let target_to_client = pipe(target_stream, client_sink);
+    tokio::pin!(client_to_target);
+    tokio::pin!(target_to_client);
     tokio::select! {
-        _ = &mut client_to_target => target_to_client.abort(),
-        _ = &mut target_to_client => client_to_target.abort(),
+        _ = &mut client_to_target => {},
+        _ = &mut target_to_client => {},
     }
 }
 
