@@ -219,6 +219,7 @@ async fn control_session(
                         active_sessions.spawn(async move {
                             if let Err(error) = handle_offer(&context, &credentials, offer, session_rx, outbound_tx.clone(), completed_sessions.clone()).await {
                                 let code = if is_authentication_error(&error) { "authentication" } else { "network" };
+                                tracing::warn!(session = %session_id, error = %error, "target tunnel setup failed");
                                 if outbound_tx.send(ControlMessage::Error {
                                     session_id: Some(session_id),
                                     code: code.to_owned(),
@@ -312,12 +313,26 @@ async fn handle_offer(
         Ok(stream) => Box::new(stream),
         Err(error) if is_authentication_error(&error) => return Err(error),
         Err(error) if is_relay_selected(&error) => {
-            relay_stream(context, credentials, offer.session_id, &mut inbound).await?
+            relay_stream(
+                context,
+                credentials,
+                offer.session_id,
+                &mut inbound,
+                &outbound,
+            )
+            .await?
         }
         Err(error) => {
             tracing::debug!(session = %offer.session_id, error = %error, "direct path did not become available");
             await_relay_selection(offer.session_id, &mut inbound).await?;
-            relay_stream(context, credentials, offer.session_id, &mut inbound).await?
+            relay_stream(
+                context,
+                credentials,
+                offer.session_id,
+                &mut inbound,
+                &outbound,
+            )
+            .await?
         }
     };
     let result = copy_ssh(context, &mut stream).await;
@@ -340,6 +355,7 @@ async fn relay_stream(
     credentials: &AgentCredentials,
     session_id: Uuid,
     inbound: &mut mpsc::Receiver<ControlMessage>,
+    outbound: &mpsc::Sender<ControlMessage>,
 ) -> Result<Box<dyn AsyncReadWrite + Send + Unpin>> {
     let ws = context
         .api
@@ -351,6 +367,14 @@ async fn relay_stream(
             },
         )
         .await?;
+    send_control(
+        outbound,
+        ControlMessage::Activate {
+            session_id,
+            path: SelectedPath::Relay,
+        },
+    )
+    .await?;
     wait_activated(session_id, SelectedPath::Relay, inbound).await?;
     Ok(Box::new(RelayByteStream::from_ws(ws)))
 }
@@ -363,6 +387,7 @@ async fn direct_accept(
     inbound: &mut mpsc::Receiver<ControlMessage>,
     outbound: &mpsc::Sender<ControlMessage>,
 ) -> Result<QuicByteStream> {
+    let started = Instant::now();
     let mut stun = context.config.stun.clone();
     if stun.servers.is_empty() {
         stun.servers
@@ -374,6 +399,7 @@ async fn direct_accept(
     let candidates = timeout_at(deadline, attempt.gather())
         .await
         .context("STUN gather timed out")??;
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "target STUN gather complete");
     send_control(
         outbound,
         ControlMessage::Candidates {
@@ -383,6 +409,7 @@ async fn direct_accept(
     )
     .await?;
     let remote = receive_candidates(offer.session_id, inbound, deadline).await?;
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "target peer candidates received");
     let probe_result = timeout_at(
         deadline,
         attempt.probe(
@@ -395,6 +422,7 @@ async fn direct_accept(
     .await
     .context("UDP probe timed out")??;
     let peer = probe_result.peer_addr;
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "target UDP probe complete");
     send_control(
         outbound,
         ControlMessage::ProbeSeen {
@@ -417,7 +445,10 @@ async fn direct_accept(
         },
     )
     .await?;
-    let mut stream = accept_with_relay(&acceptor, offer.session_id, inbound, deadline).await?;
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "target QUIC acceptor ready");
+    let (mut stream, client_quic_ready) =
+        accept_with_relay(&acceptor, offer.session_id, inbound, deadline).await?;
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "target QUIC stream accepted");
     timeout_at(
         deadline,
         authenticate_quic(
@@ -430,6 +461,11 @@ async fn direct_accept(
     )
     .await
     .context("QUIC authentication timed out")??;
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "target client proof verified");
+    if !client_quic_ready {
+        wait_client_quic_ready(offer.session_id, inbound, deadline).await?;
+    }
+    tracing::debug!(session = %offer.session_id, elapsed_ms = started.elapsed().as_millis(), "client QUIC readiness received");
     send_control(
         outbound,
         ControlMessage::Activate {
@@ -471,18 +507,41 @@ async fn accept_with_relay(
     session_id: Uuid,
     inbound: &mut mpsc::Receiver<ControlMessage>,
     deadline: Instant,
-) -> Result<QuicByteStream> {
+) -> Result<(QuicByteStream, bool)> {
+    let mut client_quic_ready = false;
+    let accepting = acceptor.accept();
+    tokio::pin!(accepting);
     loop {
         tokio::select! {
-            result = timeout_at(deadline, acceptor.accept()) => {
-                return result.context("QUIC accept timed out")?.map_err(anyhow::Error::new);
+            result = timeout_at(deadline, &mut accepting) => {
+                let stream = result.context("QUIC accept timed out")?.map_err(anyhow::Error::new)?;
+                return Ok((stream, client_quic_ready));
             }
             message = receive_until(inbound, deadline) => {
                 match message? {
                     ControlMessage::SelectRelay { session_id: received } if received == session_id => return Err(RelaySelected.into()),
+                    ControlMessage::QuicReady { session_id: received } if received == session_id => client_quic_ready = true,
                     message => route_unexpected(session_id, message)?,
                 }
             }
+        }
+    }
+}
+
+async fn wait_client_quic_ready(
+    session_id: Uuid,
+    inbound: &mut mpsc::Receiver<ControlMessage>,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        match receive_until(inbound, deadline).await? {
+            ControlMessage::QuicReady {
+                session_id: received,
+            } if received == session_id => return Ok(()),
+            ControlMessage::SelectRelay {
+                session_id: received,
+            } if received == session_id => return Err(RelaySelected.into()),
+            message => route_unexpected(session_id, message)?,
         }
     }
 }

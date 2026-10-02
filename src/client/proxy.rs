@@ -204,6 +204,7 @@ async fn direct_attempt(
     ephemeral: &SigningKey,
     deadline: Instant,
 ) -> std::result::Result<QuicByteStream, DirectFailure> {
+    let started = Instant::now();
     if offer.client_public_key != client_public_key {
         return Err(DirectFailure::Fatal(anyhow!(DirectAuthenticationFailure(
             "offer client key differs from this connection".to_owned(),
@@ -222,6 +223,7 @@ async fn direct_attempt(
         .await
         .map_err(|_| DirectFailure::Network("STUN gather timed out".to_owned()))?
         .map_err(classify_transport)?;
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client STUN gather complete");
     Api::send_control(
         control,
         &ControlMessage::Candidates {
@@ -232,6 +234,7 @@ async fn direct_attempt(
     .await
     .map_err(DirectFailure::Fatal)?;
     let remote = receive_candidates(control, session_id, deadline).await?;
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client peer candidates received");
     let probe_result = timeout_at(
         deadline,
         attempt.probe(
@@ -245,6 +248,7 @@ async fn direct_attempt(
     .map_err(|_| DirectFailure::Network("UDP hole-punch probe timed out".to_owned()))?
     .map_err(classify_transport)?;
     let peer = probe_result.peer_addr;
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client UDP probe complete");
     Api::send_control(
         control,
         &ControlMessage::ProbeSeen {
@@ -256,6 +260,7 @@ async fn direct_attempt(
     .await
     .map_err(DirectFailure::Fatal)?;
     wait_quic_ready(control, session_id, deadline).await?;
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "target QUIC acceptor ready");
     let mut stream = timeout_at(
         deadline,
         attempt.into_quic_client(
@@ -269,6 +274,10 @@ async fn direct_attempt(
     .await
     .map_err(|_| DirectFailure::Network("QUIC connect timed out".to_owned()))?
     .map_err(classify_transport)?;
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client QUIC stream established");
+    Api::send_control(control, &ControlMessage::QuicReady { session_id })
+        .await
+        .map_err(DirectFailure::Fatal)?;
 
     let challenge: QuicChallenge = timeout_read_frame(
         &mut stream,
@@ -276,6 +285,7 @@ async fn direct_attempt(
     )
     .await
     .map_err(classify_anyhow)?;
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client QUIC proof sent");
     let nonce = URL_SAFE_NO_PAD
         .decode(&challenge.nonce)
         .context("decode QUIC challenge nonce")
@@ -298,16 +308,8 @@ async fn direct_attempt(
     )
     .await
     .map_err(classify_anyhow)?;
-    Api::send_control(
-        control,
-        &ControlMessage::Activate {
-            session_id,
-            path: SelectedPath::Quic,
-        },
-    )
-    .await
-    .map_err(DirectFailure::Fatal)?;
     wait_activated(control, session_id, SelectedPath::Quic, deadline).await?;
+    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "direct path activated");
     Ok(stream)
 }
 
@@ -514,8 +516,14 @@ where
             .context("write SSH bytes to stdout")?;
         stdout.flush().await.context("flush SSH stdout")
     };
-    tokio::try_join!(to_remote, to_stdout)?;
-    Ok(())
+    tokio::pin!(to_remote, to_stdout);
+    tokio::select! {
+        result = &mut to_remote => {
+            result?;
+            to_stdout.await
+        }
+        result = &mut to_stdout => result,
+    }
 }
 
 async fn timeout_write_frame<W, T>(stream: &mut W, message: &T, duration: Duration) -> Result<()>

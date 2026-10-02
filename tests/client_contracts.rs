@@ -48,10 +48,12 @@ fn ssh_config_uses_stable_alias_and_shell_safe_proxy_arguments() {
         enabled: false,
         online: true,
     };
-    let mut config = Config::default();
-    config.server_url = "https://example.test".to_owned();
-    config.data_dir = "/tmp/kmesh %home".into();
-    config.profile = "%h-profile".to_owned();
+    let config = Config {
+        server_url: "https://example.test".to_owned(),
+        data_dir: "/tmp/kmesh %home".into(),
+        profile: "%h-profile".to_owned(),
+        ..Config::default()
+    };
     let config_path = std::path::Path::new("/tmp/config with %tokens.toml");
 
     let rendered = ssh_config::render(&target, &config, Some(config_path));
