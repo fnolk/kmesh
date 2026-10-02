@@ -191,7 +191,7 @@ pub enum KeyAction {
     },
     Add {
         user_id: Uuid,
-        public_key: String,
+        public_key_file: PathBuf,
         #[arg(long, default_value = "")]
         label: String,
     },

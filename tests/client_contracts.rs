@@ -40,6 +40,20 @@ fn agent_enrollment_accepts_url_safe_tokens_starting_with_a_dash() {
 }
 
 #[test]
+fn admin_key_registration_takes_a_public_key_file() {
+    let user_id = Uuid::new_v4().to_string();
+    let args = [
+        "kmesh",
+        "admin",
+        "keys",
+        "add",
+        &user_id,
+        "~/.ssh/id_ed25519.pub",
+    ];
+    assert!(kmesh::client::Cli::try_parse_from(args).is_ok());
+}
+
+#[test]
 fn ssh_config_uses_stable_alias_and_shell_safe_proxy_arguments() {
     let target_id = Uuid::new_v4();
     let target = TargetView {

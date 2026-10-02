@@ -24,8 +24,13 @@ async fn main() {
             std::process::exit(exit_code);
         }
     };
-    if let Err(error) = kmesh::client::run(cli).await {
-        eprintln!("执行失败：{error:#}");
-        std::process::exit(1);
+    let proxy = matches!(&cli.command, kmesh::client::Command::Proxy { .. });
+    match kmesh::client::run(cli).await {
+        Ok(()) if proxy => std::process::exit(0),
+        Ok(()) => {}
+        Err(error) => {
+            eprintln!("执行失败：{error:#}");
+            std::process::exit(1);
+        }
     }
 }

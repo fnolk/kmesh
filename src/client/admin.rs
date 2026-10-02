@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::fs;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -113,15 +113,13 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
             KeyAction::List { user_id } => AdminOperation::ListKeys { user_id },
             KeyAction::Add {
                 user_id,
-                public_key,
+                public_key_file,
                 label,
             } => AdminOperation::AddUserKey {
                 user_id,
-                public_key: if Path::new(&public_key).is_file() {
-                    fs::read_to_string(&public_key).context("read SSH public key file")?
-                } else {
-                    public_key
-                },
+                public_key: fs::read_to_string(&public_key_file).with_context(|| {
+                    format!("read SSH public key file {}", public_key_file.display())
+                })?,
                 label,
             },
             KeyAction::Remove { key_id } => AdminOperation::RemoveUserKey { key_id },

@@ -504,26 +504,40 @@ where
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let to_remote = async {
-        tokio::io::copy(&mut stdin, &mut writer)
-            .await
-            .context("read SSH bytes from stdin")?;
-        writer.shutdown().await.context("finish SSH input stream")
-    };
-    let to_stdout = async {
-        tokio::io::copy(&mut reader, &mut stdout)
-            .await
-            .context("write SSH bytes to stdout")?;
-        stdout.flush().await.context("flush SSH stdout")
-    };
-    tokio::pin!(to_remote, to_stdout);
-    tokio::select! {
-        result = &mut to_remote => {
-            result?;
-            to_stdout.await
+    let remote_finished = {
+        let to_remote = async {
+            tokio::io::copy(&mut stdin, &mut writer)
+                .await
+                .context("read SSH bytes from stdin")?;
+            writer.shutdown().await.context("finish SSH input stream")
+        };
+        let to_stdout = async {
+            tokio::io::copy(&mut reader, &mut stdout)
+                .await
+                .context("write SSH bytes to stdout")?;
+            stdout.flush().await.context("flush SSH stdout")
+        };
+        tokio::pin!(to_remote, to_stdout);
+        tokio::select! {
+            result = &mut to_remote => {
+                result?;
+                to_stdout.await?;
+                false
+            }
+            result = &mut to_stdout => {
+                result?;
+                true
+            }
         }
-        result = &mut to_stdout => result,
+    };
+    if remote_finished {
+        writer
+            .shutdown()
+            .await
+            .context("finish SSH input after remote EOF")?;
     }
+    tracing::debug!(remote_finished, "SSH stdio data copy complete");
+    Ok(())
 }
 
 async fn timeout_write_frame<W, T>(stream: &mut W, message: &T, duration: Duration) -> Result<()>

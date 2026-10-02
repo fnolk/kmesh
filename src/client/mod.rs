@@ -17,7 +17,7 @@ pub trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + ?Sized> AsyncReadWrite for T {}
 
 pub use api::canonical_origin;
-pub use cli::Cli;
+pub use cli::{Cli, Command};
 
 #[derive(Clone)]
 pub struct ClientContext {
