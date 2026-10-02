@@ -52,6 +52,7 @@ pub(crate) async fn targets(
             Ok(TargetView {
                 target_id: id,
                 name: row.try_get("name")?,
+                enabled: true,
                 online: online.contains_key(&id),
             })
         })
@@ -313,6 +314,7 @@ pub(crate) async fn apply_operation(
                 target: TargetView {
                     target_id,
                     name,
+                    enabled: true,
                     online: false,
                 },
                 enrollment_token,
@@ -490,7 +492,7 @@ async fn list_role_grants(
 
 async fn list_targets(state: &ServerState) -> Result<Vec<TargetView>, ApiError> {
     let rows = sqlx::query(
-        "SELECT id, name FROM targets WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE",
+        "SELECT id, name, enabled FROM targets WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE",
     )
     .fetch_all(&state.inner.db.pool)
     .await?;
@@ -501,6 +503,7 @@ async fn list_targets(state: &ServerState) -> Result<Vec<TargetView>, ApiError> 
             Ok(TargetView {
                 target_id,
                 name: row.try_get("name")?,
+                enabled: row.try_get::<i64, _>("enabled")? == 1,
                 online: online.contains_key(&target_id),
             })
         })

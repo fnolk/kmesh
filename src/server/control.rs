@@ -450,7 +450,7 @@ async fn handle_agent_message(
 }
 
 #[derive(Clone, Copy)]
-enum Endpoint {
+pub(super) enum Endpoint {
     Client(AuthenticatedUser),
     Target {
         target_id: Uuid,
@@ -458,7 +458,7 @@ enum Endpoint {
     },
 }
 
-async fn open_tunnel(
+pub(super) async fn open_tunnel(
     state: &ServerState,
     user: AuthenticatedUser,
     client_sender: &mpsc::Sender<ControlMessage>,
@@ -658,7 +658,7 @@ async fn route_quic_ready(
     let _ = other.send(message).await;
 }
 
-async fn select_relay(state: &ServerState, session_id: Uuid, endpoint: Endpoint) {
+pub(super) async fn select_relay(state: &ServerState, session_id: Uuid, endpoint: Endpoint) {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
     let Some(runtime) = runtime else {
         return;
@@ -687,7 +687,7 @@ async fn select_relay(state: &ServerState, session_id: Uuid, endpoint: Endpoint)
     let _ = runtime.target_sender.send(message).await;
 }
 
-async fn activate_path(
+pub(super) async fn activate_path(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,
@@ -801,7 +801,12 @@ async fn activate_path(
     }
 }
 
-async fn cancel_tunnel(state: &ServerState, session_id: Uuid, endpoint: Endpoint, reason: String) {
+pub(super) async fn cancel_tunnel(
+    state: &ServerState,
+    session_id: Uuid,
+    endpoint: Endpoint,
+    reason: String,
+) {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
     let Some(runtime) = runtime else {
         let _ = close_direct_audit_session(state, session_id, endpoint).await;
@@ -887,7 +892,7 @@ pub(crate) async fn close_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntim
         .remove(&runtime.session_id);
 }
 
-async fn close_pending_user_tunnels(
+pub(super) async fn close_pending_user_tunnels(
     state: &ServerState,
     user_id: Uuid,
     auth_session_id: Uuid,

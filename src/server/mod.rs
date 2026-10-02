@@ -5,6 +5,8 @@ mod db;
 mod error;
 mod http;
 mod relay;
+#[cfg(test)]
+mod tests;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -61,7 +63,6 @@ pub async fn initialize(
     }
     let admin_username = auth::normalize_username(admin_username)?;
     auth::validate_password(admin_password)?;
-    let admin_password_hash = auth::password_hash_limited(admin_password.to_owned()).await?;
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create server data directory {}", data_dir.display()))?;
     set_private_dir(data_dir)?;
@@ -74,6 +75,11 @@ pub async fn initialize(
 
     let db = Database::open(data_dir.join("server.sqlite3")).await?;
     db.apply_schema().await?;
+    let admin_password_hash = if db.user_count().await? == 0 {
+        Some(auth::password_hash_limited(admin_password.to_owned()).await?)
+    } else {
+        None
+    };
     db.initialize(issuer, &admin_username, admin_password_hash)
         .await?;
 

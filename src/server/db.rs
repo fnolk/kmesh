@@ -42,7 +42,7 @@ impl Database {
         &self,
         issuer: &str,
         admin_username: &str,
-        admin_password_hash: String,
+        admin_password_hash: Option<String>,
     ) -> Result<()> {
         let mut tx = self
             .pool
@@ -68,6 +68,8 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
         if user_count == 0 {
+            let admin_password_hash =
+                admin_password_hash.context("initial administrator password hash is required")?;
             let user_id = uuid::Uuid::new_v4();
             let role_id = uuid::Uuid::new_v4();
             let now = unix_time();
@@ -103,6 +105,12 @@ impl Database {
         }
         tx.commit().await.context("commit server initialization")?;
         Ok(())
+    }
+
+    pub async fn user_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn setting(&self, key: &str) -> Result<Option<String>> {
