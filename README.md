@@ -13,7 +13,7 @@ cargo build --locked --release
 install -m 0755 target/release/kmesh /usr/local/bin/kmesh
 ```
 
-The release CI builds Linux x86_64/aarch64 musl and macOS Intel/Apple Silicon targets. kmesh uses Rust TLS libraries and does not enable OpenSSL features.
+The CI workflow is configured to build Linux x86_64/aarch64 musl and macOS Intel/Apple Silicon binaries and upload each target's artifact. It also runs native formatting, Clippy, and test checks. kmesh uses Rust TLS libraries; its Linux dependency graph includes `openssl-probe` for certificate discovery and contains no OpenSSL TLS or `native-tls` package.
 
 ## Start the public server
 

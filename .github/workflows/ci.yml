@@ -9,6 +9,20 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
   build:
     strategy:
       fail-fast: false
@@ -35,15 +49,19 @@ jobs:
       - name: Install musl linker
         if: matrix.install-musl
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
-      - name: Verify the dependency graph has no OpenSSL backend
+      - name: Verify the dependency graph has no OpenSSL TLS packages
         shell: bash
         run: |
-          if cargo tree --locked --target "${{ matrix.target }}" -e features | grep -Ei 'openssl|native-tls'; then
-            echo 'OpenSSL or native-tls entered the dependency graph.'
+          if cargo tree --locked --target "${{ matrix.target }}" --prefix none --format '{p}' \
+            | grep -E '^[[:space:]]*(openssl-sys|openssl|openssl-src|native-tls)[[:space:]]v'; then
+            echo 'An OpenSSL or native-tls package entered the dependency graph.'
             exit 1
           fi
       - name: Build release binary
         run: cargo build --locked --release --target "${{ matrix.target }}"
-      - name: Test on x86_64 Linux musl
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo test --locked --all-targets --target "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmesh-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/kmesh
+          if-no-files-found: error
+          retention-days: 14
