@@ -9,6 +9,7 @@ This document freezes the first implementation boundary between the server, tran
 ## HTTP JSON types
 
 - Login: `PasswordLoginRequest`, `PublicKeyChallengeRequest`, `PublicKeyChallenge`, `PublicKeyLoginRequest`, and `RefreshRequest`; success returns `LoginTokens`.
+- SSHSIG login signs the raw bytes obtained by URL-safe base64 decoding `PublicKeyChallenge.challenge` with the `kmesh-login` namespace. The server payload is `kmesh-login-challenge-v1\0`, followed by a 4-byte big-endian length and `login`, issuer UTF-8, normalized lowercase username UTF-8, raw 16-byte challenge UUID, expiry as signed 64-bit big-endian, then a 4-byte big-endian length and the 32-byte nonce. The client signs these bytes exactly as supplied.
 - `GET /v1/me` returns `MeView { user, roles }`. Target listing returns `TargetView { target_id, name, enabled, online }`; the stable ID controls authorization, the name is display-only, and enabled/online report distinct management and connection states.
 - Admin operations are sent as `AdminRequest` to `POST /v1/admin`. `AdminOperation` is tagged by `operation` with payload in `data`; list operations return typed `Users`, `Roles`, `Keys`, `UserRoles`, `Grants`, and `Targets`, while target creation/enrollment issue returns a one-time enrollment token.
 - Agent enrollment sends `target_id`, its one-time enrollment token, and locally generated certificate DER. The agent generates the certificate for the selected stable target ID and retains its private key; the response returns `target_id`, `agent_token`, and `ticket_public_key_pem` obtained over the authenticated server TLS connection. `AgentCredentials` persists those values with the local certificate and private key.
@@ -26,6 +27,7 @@ The selected data path is reported with `Activated.path` (`quic` or `relay`). QU
 
 - `UdpAttempt::bind`, `gather`, and `probe` prepare an attempt; `into_quic_client` and `into_quic_server` transfer its bound UDP socket to Quinn.
 - `QuicByteStream` and `RelayByteStream` implement `AsyncRead + AsyncWrite`. `QuicAcceptor::accept` yields a `QuicByteStream` for each incoming SSH stream.
+- Transport sends and consumes the fixed `KMS1` QUIC stream preface internally before exposing the byte stream; client and agent begin with `QuicChallenge` / `DirectAuthentication` after stream creation.
 - `connect_wss` returns the raw WebSocket used by control and relay clients. `RelayByteStream::from_ws` wraps relay data WebSockets.
 - Relay binary frames use `[0] + data` for bytes, `[1]` for FIN, and `[2] + reason` for RESET. A WebSocket close ends the whole relay stream.
 - HTTP and WSS share network settings for HTTP/HTTPS CONNECT, Basic proxy authentication, and custom CA certificates.

@@ -1,0 +1,22 @@
+[Unit]
+Description=kmesh SSH target agent for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kmesh
+Group=kmesh
+StateDirectory=kmesh
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/kmesh --config /etc/kmesh/agent.toml --data-dir /var/lib/kmesh agent run --target-id %i
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/kmesh
+
+[Install]
+WantedBy=multi-user.target
