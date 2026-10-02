@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -75,6 +76,9 @@ pub struct QuicByteStream {
     send: SendStream,
     recv: RecvStream,
     send_finished: bool,
+    send_acknowledged: bool,
+    stopped:
+        Option<Pin<Box<dyn Future<Output = Result<Option<VarInt>, quinn::StoppedError>> + Send>>>,
     receive_finished: bool,
 }
 
@@ -86,6 +90,8 @@ impl QuicByteStream {
             send,
             recv,
             send_finished: false,
+            send_acknowledged: false,
+            stopped: None,
             receive_finished: false,
         }
     }
@@ -100,6 +106,7 @@ impl QuicByteStream {
             .stop(code)
             .map_err(|error| TransportError::Quic(format!("stop QUIC receive stream: {error}")))?;
         self.send_finished = true;
+        self.send_acknowledged = true;
         self.receive_finished = true;
         Ok(())
     }
@@ -159,16 +166,49 @@ impl AsyncWrite for QuicByteStream {
         }
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.send_finished {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.send_acknowledged {
             return Poll::Ready(Ok(()));
         }
-        match self.send.finish() {
-            Ok(()) => {
-                self.send_finished = true;
+        if !self.send_finished {
+            match self.send.finish() {
+                Ok(()) => {
+                    self.send_finished = true;
+                    self.stopped = Some(Box::pin(self.send.stopped()));
+                }
+                Err(_) => {
+                    return Poll::Ready(Err(write_error_to_io(quinn::WriteError::ClosedStream)));
+                }
+            }
+        }
+        let stopped = self
+            .stopped
+            .as_mut()
+            .expect("finished QUIC send stream has a stopped future");
+        match stopped.as_mut().poll(cx) {
+            Poll::Ready(Ok(None)) => {
+                self.send_acknowledged = true;
                 Poll::Ready(Ok(()))
             }
-            Err(_) => Poll::Ready(Err(write_error_to_io(quinn::WriteError::ClosedStream))),
+            Poll::Ready(Ok(Some(code))) => {
+                self.send_acknowledged = true;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("peer stopped QUIC stream: {code}"),
+                )))
+            }
+            Poll::Ready(Err(quinn::StoppedError::ConnectionLost(error))) => {
+                self.send_acknowledged = true;
+                Poll::Ready(Err(connection_error_to_io(error)))
+            }
+            Poll::Ready(Err(quinn::StoppedError::ZeroRttRejected)) => {
+                self.send_acknowledged = true;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "QUIC 0-RTT was rejected",
+                )))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }

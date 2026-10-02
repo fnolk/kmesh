@@ -116,13 +116,13 @@ where
         TlsConnector::from(config)
             .connect(server_name, stream)
             .await
-            .map_err(|error| TransportError::Tls(format!("WSS TLS handshake: {error}")))?,
+            .map_err(|error| classify_tls_error(error, "WSS TLS handshake"))?,
     );
 
     let (websocket, _response) =
         client_async_with_config(request, stream, Some(WebSocketConfig::default()))
             .await
-            .map_err(|error| TransportError::WebSocket(format!("WSS handshake: {error}")))?;
+            .map_err(map_websocket_handshake_error)?;
     Ok(websocket)
 }
 
@@ -168,9 +168,7 @@ async fn connect_proxy_tunnel(
             TlsConnector::from(config)
                 .connect(proxy_name, socket)
                 .await
-                .map_err(|error| {
-                    TransportError::Tls(format!("HTTPS proxy TLS handshake: {error}"))
-                })?,
+                .map_err(|error| classify_tls_error(error, "HTTPS proxy TLS handshake"))?,
         )
     } else {
         Box::new(socket)
@@ -211,6 +209,40 @@ async fn connect_proxy_tunnel(
         )));
     }
     Ok(stream)
+}
+
+fn classify_tls_error(error: io::Error, context: &str) -> TransportError {
+    let certificate_failure = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<rustls::Error>())
+        .is_some_and(|error| {
+            matches!(
+                error,
+                rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented
+            )
+        });
+    if certificate_failure {
+        TransportError::Authentication(format!("{context}: {error}"))
+    } else {
+        TransportError::Tls(format!("{context}: {error}"))
+    }
+}
+
+fn map_websocket_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> TransportError {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response)
+            if matches!(response.status().as_u16(), 401 | 403) =>
+        {
+            TransportError::Authentication(format!(
+                "WSS server rejected credentials with HTTP {}",
+                response.status()
+            ))
+        }
+        tokio_tungstenite::tungstenite::Error::Http(response) => TransportError::ProtocolViolation(
+            format!("WSS handshake returned HTTP {}", response.status()),
+        ),
+        error => TransportError::WebSocket(format!("WSS handshake: {error}")),
+    }
 }
 
 fn validate_proxy_url(proxy_url: &str) -> Result<reqwest::Url, TransportError> {

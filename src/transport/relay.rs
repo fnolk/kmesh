@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
 use futures_util::{Sink, SinkExt, Stream};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::transport::{TransportError, WsStream};
@@ -20,8 +20,8 @@ pub struct RelayByteStream {
     read_finished: bool,
     write_finished: bool,
     terminal_error: Option<(io::ErrorKind, String)>,
-    close_queued: bool,
     close_flushed: bool,
+    transport_shutdown: bool,
 }
 
 impl RelayByteStream {
@@ -32,8 +32,8 @@ impl RelayByteStream {
             read_finished: false,
             write_finished: false,
             terminal_error: None,
-            close_queued: false,
             close_flushed: false,
+            transport_shutdown: false,
         }
     }
 
@@ -56,10 +56,15 @@ impl RelayByteStream {
             .map_err(|error| {
                 TransportError::WebSocket(format!("close reset relay stream: {error}"))
             })?;
+        self.websocket
+            .get_mut()
+            .shutdown()
+            .await
+            .map_err(TransportError::Network)?;
         self.read_finished = true;
         self.write_finished = true;
-        self.close_queued = true;
         self.close_flushed = true;
+        self.transport_shutdown = true;
         self.terminal_error = Some((
             io::ErrorKind::ConnectionReset,
             String::from_utf8_lossy(reason).into_owned(),
@@ -68,30 +73,24 @@ impl RelayByteStream {
     }
 
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.close_flushed {
-            return Poll::Ready(Ok(()));
-        }
-        if !self.close_queued {
-            match Pin::new(&mut self.websocket).poll_ready(cx) {
-                Poll::Ready(Ok(())) => {
-                    if let Err(error) =
-                        Pin::new(&mut self.websocket).start_send(Message::Close(None))
-                    {
-                        return Poll::Ready(Err(io::Error::other(error)));
-                    }
-                    self.close_queued = true;
-                }
+        if !self.close_flushed {
+            match Pin::new(&mut self.websocket).poll_close(cx) {
+                Poll::Ready(Ok(())) => self.close_flushed = true,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),
                 Poll::Pending => return Poll::Pending,
             }
         }
-        match Pin::new(&mut self.websocket).poll_flush(cx) {
-            Poll::Ready(Ok(())) => {
-                self.close_flushed = true;
-                Poll::Ready(Ok(()))
+        if !self.transport_shutdown {
+            match Pin::new(self.websocket.get_mut()).poll_shutdown(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.transport_shutdown = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error))),
-            Poll::Pending => Poll::Pending,
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -205,14 +204,7 @@ impl AsyncRead for RelayByteStream {
                 }
                 Poll::Ready(Some(Ok(Message::Close(_)))) => {
                     if self.read_finished && self.write_finished {
-                        return match Pin::new(&mut self.websocket).poll_flush(cx) {
-                            Poll::Ready(Ok(())) => {
-                                self.close_flushed = true;
-                                Poll::Ready(Ok(()))
-                            }
-                            Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error))),
-                            Poll::Pending => Poll::Pending,
-                        };
+                        return self.poll_close(cx);
                     }
                     self.set_terminal_error(
                         io::ErrorKind::ConnectionReset,
