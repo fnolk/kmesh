@@ -10,9 +10,9 @@ use std::{error::Error as StdError, io};
 
 pub use http::{BoxedIo, WsStream, connect_wss, http_client};
 pub use iroh::{
-    IROH_SSH_ALPN, IrohByteStream, IrohEndpointOptions, IrohPathKind, IrohSelectedPath,
-    RelayChoice, accept_peer, allowed_relay_urls, connect_peer, create_endpoint,
-    validate_endpoint_addr, wait_endpoint_ready,
+    IROH_SSH_ALPN, IrohByteStream, IrohEndpointOptions, IrohPathKind, IrohPathStats,
+    IrohSelectedPath, RelayChoice, accept_peer, allowed_relay_urls, connect_peer, create_endpoint,
+    snapshot_iroh_paths, validate_endpoint_addr, wait_endpoint_ready,
 };
 
 /// A transport error with an explicit security and network classification.

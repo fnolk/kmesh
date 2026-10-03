@@ -123,6 +123,30 @@ pub async fn accept_peer(endpoint: &Endpoint) -> Result<Connection, TransportErr
     incoming.await.map_err(TransportError::IrohConnecting)
 }
 
+pub fn snapshot_iroh_paths(connection: &Connection) -> Vec<IrohPathStats> {
+    connection
+        .paths()
+        .iter()
+        .filter_map(|path| {
+            let kind = if path.is_ip() {
+                IrohPathKind::Direct
+            } else if path.is_relay() {
+                IrohPathKind::Relay
+            } else {
+                return None;
+            };
+            let stats = path.stats();
+            Some(IrohPathStats {
+                kind,
+                remote_address: path.remote_addr().to_string(),
+                selected: path.is_selected(),
+                udp_tx_bytes: stats.udp_tx.bytes,
+                udp_rx_bytes: stats.udp_rx.bytes,
+            })
+        })
+        .collect()
+}
+
 pub async fn wait_endpoint_ready(
     endpoint: &Endpoint,
     timeout: Duration,
@@ -241,10 +265,17 @@ impl IrohByteStream {
         } else {
             return None;
         };
+        let stats = path.stats();
         Some(IrohSelectedPath {
             kind,
             remote_address: path.remote_addr().to_string(),
+            udp_tx_bytes: stats.udp_tx.bytes,
+            udp_rx_bytes: stats.udp_rx.bytes,
         })
+    }
+
+    pub fn path_stats(&self) -> Vec<IrohPathStats> {
+        snapshot_iroh_paths(&self.connection)
     }
 
     /// Sends FIN and waits until the peer acknowledges every byte written to this stream.
@@ -325,6 +356,17 @@ pub enum IrohPathKind {
 pub struct IrohSelectedPath {
     pub kind: IrohPathKind,
     pub remote_address: String,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrohPathStats {
+    pub kind: IrohPathKind,
+    pub remote_address: String,
+    pub selected: bool,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
 }
 
 fn validate_relay_url(url: reqwest::Url) -> Result<iroh::RelayUrl, TransportError> {

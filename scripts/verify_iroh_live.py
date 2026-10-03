@@ -740,12 +740,73 @@ def upgrade_binary(harness: Harness) -> None:
     staged_path = f"{REMOTE_ROOT}/bin/kmesh.next"
     current_path = f"{REMOTE_ROOT}/bin/kmesh"
     hosts = ((harness.args.server_ssh, "server"), (harness.args.target_ssh, "target"))
+    backups: dict[str, dict[str, str]] = {}
+    swaps: dict[str, str] = {}
     for host, label in hosts:
         observed = remote_binary_hash(
             harness, "refresh-binary", f"{label}-verify-staged-sha256", host, staged_path
         )
         if observed != expected:
             raise VerificationError(f"{label} staged binary SHA-256 does not match requested artifact")
+
+        current_sha = remote_binary_hash(
+            harness, "refresh-binary", f"{label}-verify-current-sha256", host, current_path
+        )
+        backup_path = f"{REMOTE_ROOT}/bin/kmesh.{current_sha}.backup"
+        backup_exists = harness.ssh_raw(
+            "refresh-binary",
+            f"{label}-check-current-backup",
+            host,
+            f"test -e {shlex.quote(backup_path)}",
+            accepted=(0, 1),
+        )
+        if backup_exists.returncode == 0:
+            backup_sha = remote_binary_hash(
+                harness, "refresh-binary", f"{label}-verify-existing-backup", host, backup_path
+            )
+            if backup_sha != current_sha:
+                raise VerificationError(f"{label} SHA-named backup has unexpected contents")
+        else:
+            harness.ssh_raw(
+                "refresh-binary",
+                f"{label}-preserve-current-binary",
+                host,
+                f"cp -p {shlex.quote(current_path)} {shlex.quote(backup_path)}",
+            )
+            backup_sha = remote_binary_hash(
+                harness, "refresh-binary", f"{label}-verify-preserved-backup", host, backup_path
+            )
+            if backup_sha != current_sha:
+                raise VerificationError(f"{label} current binary backup SHA-256 mismatch")
+        backups[label] = {"path": backup_path, "sha256": current_sha}
+
+        swap_path = f"{REMOTE_ROOT}/bin/kmesh.{expected}.swap"
+        swap_exists = harness.ssh_raw(
+            "refresh-binary",
+            f"{label}-check-staged-swap",
+            host,
+            f"test -e {shlex.quote(swap_path)}",
+            accepted=(0, 1),
+        )
+        if swap_exists.returncode == 0:
+            swap_sha = remote_binary_hash(
+                harness, "refresh-binary", f"{label}-verify-existing-swap", host, swap_path
+            )
+            if swap_sha != expected:
+                raise VerificationError(f"{label} SHA-named swap has unexpected contents")
+        else:
+            harness.ssh_raw(
+                "refresh-binary",
+                f"{label}-prepare-atomic-swap",
+                host,
+                f"install -m 0755 {shlex.quote(staged_path)} {shlex.quote(swap_path)}",
+            )
+            swap_sha = remote_binary_hash(
+                harness, "refresh-binary", f"{label}-verify-prepared-swap", host, swap_path
+            )
+            if swap_sha != expected:
+                raise VerificationError(f"{label} prepared swap SHA-256 mismatch")
+        swaps[label] = swap_path
 
     close_run_masters(harness)
     target_unit = f"kmesh-iroh-verification-agent@{state['target_id']}.service"
@@ -759,12 +820,9 @@ def upgrade_binary(harness: Harness) -> None:
         "refresh-binary", "stop-current-new-server", harness.args.server_ssh, f"systemctl stop {server_unit}"
     )
     for host, label in hosts:
-        swap = f"{REMOTE_ROOT}/bin/kmesh.swap"
-        previous = f"{REMOTE_ROOT}/bin/kmesh.previous"
         command = (
-            f"test ! -e {previous} && cp -p {current_path} {previous} && "
-            f"install -m 0755 {staged_path} {swap} && mv -f {swap} {current_path} && "
-            f"rm {staged_path}"
+            f"mv -f {shlex.quote(swaps[label])} {shlex.quote(current_path)} && "
+            f"rm -f {shlex.quote(staged_path)}"
         )
         harness.ssh_raw("refresh-binary", f"{label}-atomic-install", host, command)
     harness.ssh_raw("refresh-binary", "start-new-server-current-mode", harness.args.server_ssh, f"systemctl start {server_unit}")
@@ -789,6 +847,7 @@ def upgrade_binary(harness: Harness) -> None:
         "server_and_agent_sha256_verified": True,
         "server_mode_preserved": state["server_mode"],
         "schema_and_target_identity_reused": True,
+        "preserved_current_binaries": backups,
         "legacy_deployment_touched": False,
     }
     harness.write_report()
@@ -1274,12 +1333,21 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
     lines = stderr.decode("utf-8", "replace").splitlines()
     candidates = []
     net_reports = []
+    qnt_attempts = []
+    udp_path_events = []
+    noq_negotiated = []
+    reach_out_events = []
+    nat_probe_tx: dict[str, dict[str, int]] = {}
+    path_response_tx: dict[str, dict[str, int]] = {}
+    received_paths: dict[str, int] = {}
+    validated_paths = []
     for line in lines:
-        candidate_match = re.search(r"target_ip_addrs=\[([^\]]*)\]", line)
+        candidate_match = re.search(r"(?P<role>target|client)_ip_addrs=\[([^\]]*)\]", line)
         if candidate_match:
             candidates.append(
                 {
-                    "ip_addrs": [item.strip() for item in candidate_match.group(1).split(",") if item.strip()],
+                    "role": candidate_match.group("role"),
+                    "ip_addrs": [item.strip() for item in candidate_match.group(2).split(",") if item.strip()],
                     "source_line": line,
                 }
             )
@@ -1296,7 +1364,63 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
                     "source_line": line,
                 }
             )
-    return {"target_candidate_events": candidates, "client_net_report_events": net_reports}
+        if "iroh::_events::qnt::init" in line:
+            qnt_attempts.append({"source_line": line})
+        if "n0's nat traversal negotiated" in line:
+            noq_negotiated.append(line)
+        if "got frame REACH_OUT" in line:
+            reach_out_events.append(line)
+        for message, counts in (
+            ("sending off-path NAT probe", nat_probe_tx),
+            ("sending off-path PATH_RESPONSE", path_response_tx),
+        ):
+            if message in line:
+                match = re.search(
+                    r"dst=\((?P<ip>[^,]+), (?P<port>\d+)\) len=(?P<length>\d+)",
+                    line,
+                )
+                if match:
+                    ip = match.group("ip").removeprefix("::ffff:")
+                    key = f"{ip}:{match.group('port')}"
+                    entry = counts.setdefault(key, {"datagrams": 0, "payload_bytes": 0})
+                    entry["datagrams"] += 1
+                    entry["payload_bytes"] += int(match.group("length"))
+        received = re.search(
+            r"got (?:Initial|Handshake|Data) packet \(\d+ bytes\) from \(local: .*?, remote: ([^)]+)\)",
+            line,
+        )
+        if received:
+            remote_path = received.group(1)
+            received_paths[remote_path] = received_paths.get(remote_path, 0) + 1
+        if "new path validated" in line:
+            validated_paths.append(line)
+        if any(
+            marker in line
+            for marker in (
+                "UDP baseline",
+                "UDP final",
+                "UDP delta",
+                "UDP snapshot",
+                "UDP interval",
+                "SSH QUIC path snapshots",
+                "SSH 数据路径统计",
+            )
+        ):
+            udp_path_events.append({"source_line": line})
+    return {
+        "candidate_events": candidates,
+        "client_net_report_events": net_reports,
+        "qnt_attempt_events": qnt_attempts,
+        "noq_nat_traversal": {
+            "negotiated_events": noq_negotiated,
+            "reach_out_events": reach_out_events,
+            "off_path_nat_probe_tx": nat_probe_tx,
+            "off_path_path_response_tx": path_response_tx,
+            "received_quic_packet_paths": received_paths,
+            "validated_path_events": validated_paths,
+        },
+        "udp_path_events": udp_path_events,
+    }
 
 
 def verify(harness: Harness, *, reuse_login: bool = False) -> None:
@@ -1460,7 +1584,7 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     alias = match.group(1)
     env = {
         "PATH": str(harness.args.client_binary.parent) + os.pathsep + os.environ.get("PATH", ""),
-        "RUST_LOG": "iroh::net_report=debug,kmesh::client::proxy=debug",
+        "RUST_LOG": "iroh::net_report=debug,iroh::_events::qnt::init=debug,iroh::socket::remote_map::remote_state=trace,noq_proto::connection=trace,noq_proto::connection::paths=trace,kmesh::client::proxy=debug",
     }
     result = harness.local(
         "path-probe",

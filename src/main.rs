@@ -1,13 +1,45 @@
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
+        .with_filter(filter_fn(|metadata| {
+            if metadata.target() == "noq_proto::connection::paths" {
+                return true;
+            }
+            if metadata.target() != "noq_proto::connection" {
+                return !metadata.target().starts_with("noq_proto::connection::");
+            }
+            let fields = metadata.fields();
+            let off_path_nat_probe = fields.field("dst").is_some()
+                && fields.field("len").is_some()
+                && fields.field("message").is_some()
+                && fields.iter().count() == 3
+                && metadata.fields().field("src").is_none();
+            let off_path_response = fields.field("dst").is_some()
+                && fields.field("src").is_some()
+                && fields.field("len").is_some()
+                && fields.field("message").is_some()
+                && fields.iter().count() == 4;
+            let nat_traversal_negotiated = fields.field("max_remote_addresses").is_some()
+                && fields.field("max_local_addresses").is_some()
+                && fields.field("message").is_some()
+                && fields.iter().count() == 3;
+            let metadata_only_event =
+                fields.field("message").is_some() && fields.iter().count() == 1;
+            off_path_nat_probe
+                || off_path_response
+                || nat_traversal_negotiated
+                || metadata_only_event
+        }));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
         .init();
 
     let cli = match kmesh::client::Cli::try_parse() {
