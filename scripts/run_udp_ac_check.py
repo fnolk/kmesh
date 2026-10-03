@@ -288,6 +288,8 @@ async def run(args):
         raise ValueError("--mapping-candidates is available for private mode only")
     if args.predict_target_next_port and (args.relay_mode != "private" or not args.mapping_candidates):
         raise ValueError("--predict-target-next-port requires private --mapping-candidates mode")
+    if args.peer_ip_only and (args.relay_mode != "private" or not args.mapping_candidates):
+        raise ValueError("--peer-ip-only requires private --mapping-candidates mode")
 
     run_id = uuid.uuid4().hex
     pid_file = f"/tmp/kmesh-udp-ac-{run_id}.pid"
@@ -302,6 +304,8 @@ async def run(args):
         ])
         if args.mapping_candidates:
             target_args.append("--mapping-candidates")
+        if args.peer_ip_only:
+            target_args.append("--peer-ip-only")
     remote_command = f"""umask 077
 pid=$$
 printf '%s\\n' \"$pid\" > {shlex.quote(pid_file)}
@@ -320,6 +324,12 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
         "control_to_client": None,
         "control_to_target": None,
         "local_candidates_published": {},
+        "peer_ip_only": args.peer_ip_only,
+        "peer_bootstrap": {
+            "candidates_by_receiver": {},
+            "expected_dial_endpoint_addr_by_receiver": {},
+            "actual_dial_endpoint_by_receiver": {},
+        },
         "prediction": {
             "enabled": args.predict_target_next_port,
             "input_source": "only this target process's successful QadProbeReport records, matched to its ready.relay_map URLs",
@@ -353,11 +363,14 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
         "tx_udp_payload_bytes": None,
         "rx_packets": None,
         "rx_udp_payload_bytes": None,
+        "udp_payload_length_1200_packet_count": None,
+        "udp_payload_length_count_note": "Raw tcpdump UDP payload length evidence only; a 1200-byte payload is not identified as a QUIC Initial packet.",
         "statistics": {},
         "stdout": str(logs["target-capture.packets.log"]),
         "stderr": str(logs["target-capture.stderr.log"]),
     }
     ready, direct, failure = {}, {}, None
+    dial_endpoints = {}
     gate_sent = False
 
     try:
@@ -374,6 +387,8 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
             ])
             if args.mapping_candidates:
                 client_args.append("--mapping-candidates")
+            if args.peer_ip_only:
+                client_args.append("--peer-ip-only")
         client = await asyncio.create_subprocess_exec(
             *client_args,
             stdin=asyncio.subprocess.PIPE,
@@ -515,6 +530,54 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
             control_to_target = copy.deepcopy(ready["client"])
             control_to_target["receiver_self_observed_candidates"] = target_self_candidates
             control_to_target["receiver_self_predicted_candidates"] = target_prediction
+            if args.peer_ip_only:
+                peer_candidates_by_receiver = {
+                    "client": list(dict.fromkeys(target_self_candidates + target_prediction)),
+                    "target": list(dict.fromkeys(client_self_candidates)),
+                }
+                sender_role_by_receiver = {"client": "target", "target": "client"}
+                peer_ready_by_receiver = {"client": control_to_client, "target": control_to_target}
+                for receiver_role, peer_candidates in peer_candidates_by_receiver.items():
+                    sender_role = sender_role_by_receiver[receiver_role]
+                    if not peer_candidates:
+                        raise ValueError(f"{receiver_role} peer bootstrap candidates are empty")
+                    peer_event = ready[sender_role]
+                    peer_addr = peer_event["endpoint_addr"]
+                    peer_global = parse_socket_address(
+                        peer_event.get("global_v4"), f"{sender_role} ready.global_v4"
+                    )
+                    peer_candidate_tuples = [
+                        parse_socket_address(candidate, f"{receiver_role} peer bootstrap candidate")
+                        for candidate in peer_candidates
+                    ]
+                    if (len(peer_candidates) > 4
+                            or any(candidate_ip.version != 4 or candidate_ip != peer_global[0]
+                                   for candidate_ip, _ in peer_candidate_tuples)):
+                        raise ValueError(f"{receiver_role} peer bootstrap candidates must be at most four IPv4 addresses for the peer's live public IP")
+                    if peer_global not in peer_candidate_tuples:
+                        raise ValueError(f"{receiver_role} peer bootstrap candidates omit the peer's live B QAD address")
+                    original_ip_addrs = []
+                    for address in peer_addr.get("addrs", []):
+                        if isinstance(address, dict) and isinstance(address.get("Ip"), str):
+                            original_ip, original_port = parse_socket_address(
+                                address["Ip"], f"{sender_role} ready EndpointAddr IPv4 candidate"
+                            )
+                            if original_ip.version == 4:
+                                original_ip_addrs.append(f"{original_ip}:{original_port}")
+                    expected_dial_ips = list(dict.fromkeys(original_ip_addrs + peer_candidates))
+                    expected_dial_addr = {
+                        "id": peer_addr["id"],
+                        "addrs": [{"Ip": address} for address in expected_dial_ips],
+                    }
+                    peer_ready_by_receiver[receiver_role]["peer_bootstrap_candidates"] = peer_candidates
+                    mapping_candidates["peer_bootstrap"]["candidates_by_receiver"][receiver_role] = {
+                        "sender_role": sender_role,
+                        "receiver_role": receiver_role,
+                        "peer_bootstrap_candidates": peer_candidates,
+                        "peer_endpoint_addr_original": copy.deepcopy(peer_addr),
+                        "expected_dial_endpoint_addr": expected_dial_addr,
+                    }
+                    mapping_candidates["peer_bootstrap"]["expected_dial_endpoint_addr_by_receiver"][receiver_role] = expected_dial_addr
             mapping_candidates["control_to_client"] = {
                 "sender_role": "target",
                 "sender_endpoint_id": ready["target"]["endpoint_id"],
@@ -631,10 +694,55 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
 
         if args.mapping_candidates:
             local_candidates_published = {}
-            while len(local_candidates_published) < 2:
+            peer_received_roles = set()
+            while (len(local_candidates_published) < 2
+                   or (args.peer_ip_only and len(peer_received_roles) < 2)):
                 role, event = await next_event(queue, deadline)
                 if event["event"] == "direct_selected":
                     direct[role] = event
+                    continue
+                if args.peer_ip_only and event["event"] == "peer_received":
+                    sender_role = {"client": "target", "target": "client"}[role]
+                    event_bootstrap = event.get("peer_bootstrap_candidates")
+                    source_addr = ready[sender_role]["endpoint_addr"]
+                    original_peer_addr = event.get("original_peer_endpoint_addr")
+                    dial_addr = event.get("dial_endpoint_addr")
+                    dial_endpoints[role] = {
+                        "sender_role": sender_role,
+                        "receiver_role": role,
+                        "peer_ip_only": event.get("peer_ip_only"),
+                        "peer_bootstrap_candidates": event_bootstrap,
+                        "original_peer_endpoint_addr": original_peer_addr,
+                        "dial_endpoint_addr": dial_addr,
+                        "validated": False,
+                    }
+                    mapping_candidates["peer_bootstrap"]["actual_dial_endpoint_by_receiver"] = copy.deepcopy(dial_endpoints)
+                    if event.get("peer_ip_only") is not True:
+                        raise ValueError(f"{role} helper did not report peer-ip-only dial setup")
+                    expected_bootstrap = mapping_candidates["peer_bootstrap"]["candidates_by_receiver"][role]["peer_bootstrap_candidates"]
+                    if (not isinstance(event_bootstrap, list)
+                            or len(event_bootstrap) != len(expected_bootstrap)
+                            or set(event_bootstrap) != set(expected_bootstrap)):
+                        raise ValueError(f"{role} helper dial candidates differ from the peer's live QAD and prediction inputs")
+                    expected_dial_addr = mapping_candidates["peer_bootstrap"]["expected_dial_endpoint_addr_by_receiver"][role]
+                    if original_peer_addr != source_addr:
+                        raise ValueError(f"{role} helper received a different peer EndpointAddr than the controller sent")
+                    if not isinstance(dial_addr, dict) or dial_addr.get("id") != source_addr.get("id"):
+                        raise ValueError(f"{role} helper reported a mismatched dial EndpointAddr identity")
+                    dial_addrs = dial_addr.get("addrs")
+                    if not isinstance(dial_addrs, list):
+                        raise ValueError(f"{role} helper dial EndpointAddr has no address list")
+                    dial_ips = [
+                        address["Ip"] for address in dial_addrs
+                        if isinstance(address, dict) and len(address) == 1 and isinstance(address.get("Ip"), str)
+                    ]
+                    expected_dial_ips = [address["Ip"] for address in expected_dial_addr["addrs"]]
+                    if (len(dial_ips) != len(dial_addrs) or set(dial_ips) != set(expected_dial_ips)
+                            or len(dial_ips) != len(expected_dial_ips)):
+                        raise ValueError(f"{role} actual dial EndpointAddr differs from peer LAN plus live bootstrap candidates or contains a relay")
+                    dial_endpoints[role]["validated"] = True
+                    mapping_candidates["peer_bootstrap"]["actual_dial_endpoint_by_receiver"] = copy.deepcopy(dial_endpoints)
+                    peer_received_roles.add(role)
                     continue
                 if event["event"] != "local_candidates_published":
                     continue
@@ -750,10 +858,12 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
             ip_packet_lines = [line for line in packet_lines if b" IP " in line or line.startswith(b"IP ")]
             capture_info["packet_lines"] = len(ip_packet_lines)
             local_endpoint = f"{capture_info['target_local_ip']}.{capture_info['bound_port']}".encode()
-            tx_packets = tx_bytes = rx_packets = rx_bytes = 0
+            tx_packets = tx_bytes = rx_packets = rx_bytes = udp_payload_length_1200_count = 0
             for line in ip_packet_lines:
                 payload = re.search(rb"length (\d+)", line)
                 byte_count = int(payload.group(1)) if payload else 0
+                if byte_count == 1200:
+                    udp_payload_length_1200_count += 1
                 if re.search(rb"(?:^|\s)" + re.escape(local_endpoint) + rb"\s+>", line):
                     tx_packets += 1
                     tx_bytes += byte_count
@@ -764,6 +874,7 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
             capture_info["tx_udp_payload_bytes"] = tx_bytes
             capture_info["rx_packets"] = rx_packets
             capture_info["rx_udp_payload_bytes"] = rx_bytes
+            capture_info["udp_payload_length_1200_packet_count"] = udp_payload_length_1200_count
             capture_stderr_text = logs["target-capture.stderr.log"].read_text(errors="replace")
             for key, pattern in (
                 ("captured", r"(\d+) packets captured"),
@@ -864,12 +975,21 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
         and all(proc.returncode == 0 for proc in procs.values())
         and all(event is not None and event.get("pass") is True for event in nonce_events.values())
         and all(event is not None and event.get("pass") is True for event in complete.values())
+        and all(
+            role in direct
+            and isinstance(direct[role].get("selected_path"), dict)
+            and direct[role]["selected_path"].get("selected") is True
+            and direct[role]["selected_path"].get("is_ip") is True
+            and direct[role]["selected_path"].get("is_ipv4") is True
+            for role in ("client", "target")
+        )
         and cleanup["verified"]
         and (not args.mapping_candidates or (
             len(mapping_candidates["observations"]) == 2
             and all(len(observation["successful_qad_reports"]) == 2
                     for observation in mapping_candidates["observations"].values())
             and len(mapping_candidates["local_candidates_published"]) == 2
+            and (not args.peer_ip_only or len(mapping_candidates["peer_bootstrap"]["actual_dial_endpoint_by_receiver"]) == 2)
         ))
         and (not args.capture_target or (
             capture_info["started_utc"] is not None
@@ -881,6 +1001,7 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
         "status": "passed" if success else "failed",
         "failure": failure,
         "relay_mode": args.relay_mode,
+        "peer_ip_only": args.peer_ip_only,
         "elapsed_seconds": round(asyncio.get_running_loop().time() - started, 3),
         "local_client_pid": procs["client"].pid if "client" in procs else None,
         "target_ssh_pid": procs["target"].pid if "target" in procs else None,
@@ -888,6 +1009,7 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
         "target_executable": args.target_bin,
         "ready": ready,
         "direct_selected": direct,
+        "dial_endpoints": dial_endpoints,
         "prediction_result": prediction_result,
         "nonce_result": nonce_events,
         "complete": complete,
@@ -917,6 +1039,7 @@ def main():
     parser.add_argument("--capture-target", action="store_true", help="capture the target UDP endpoint on target-1 ens1f0")
     parser.add_argument("--mapping-candidates", action="store_true", help="exchange each endpoint's two live QAD-observed IP:port candidates")
     parser.add_argument("--predict-target-next-port", action="store_true", help="add at most two target candidates predicted from this run's QAD ports")
+    parser.add_argument("--peer-ip-only", action="store_true", help="use peer IP candidates only, with same-run measured bootstrap candidates (private mapping-candidates mode only)")
     return asyncio.run(run(parser.parse_args()))
 
 
