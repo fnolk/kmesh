@@ -49,19 +49,14 @@ struct PrivateNetworkFailure(#[source] anyhow::Error);
 pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let access_token = auth::valid_access_token(context).await?;
     let transport_info = context.api.transport_info().await?;
-    let mut control = tokio::time::timeout(
-        CONTROL_CONNECT_TIMEOUT,
-        context.api.connect_control(&access_token),
-    )
-    .await
-    .context("connecting to kmesh control channel timed out")??;
+    let mut control = connect_control(context, &access_token).await?;
     let relay_mode = if transport_info.private_relay_url.is_some() {
         RelayMode::Private
     } else {
         RelayMode::PublicDefault
     };
     let (first_session_id, first_secret_key) = new_attempt_identity();
-    let (session_id, ssh_session) = match open_ssh_session(
+    let (session_id, ssh_session, mut control) = match open_ssh_session(
         context,
         &mut control,
         &transport_info,
@@ -72,7 +67,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     )
     .await
     {
-        Ok(session) => (first_session_id, session),
+        Ok(session) => (first_session_id, session, control),
         Err(error)
             if relay_mode == RelayMode::Private
                 && error.downcast_ref::<PrivateNetworkFailure>().is_some() =>
@@ -80,10 +75,17 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
             close_session(&mut control, first_session_id, "private_relay_failed")
                 .await
                 .context("close pending private SSH session before public retry")?;
+            drop(control);
+            let public_access_token = auth::valid_access_token(context)
+                .await
+                .context("refresh access token before public relay retry")?;
+            let mut public_control = connect_control(context, &public_access_token)
+                .await
+                .context("reconnect kmesh control channel before public relay retry")?;
             let (public_session_id, public_secret_key) = new_attempt_identity();
             let session = match open_ssh_session(
                 context,
-                &mut control,
+                &mut public_control,
                 &transport_info,
                 target_id,
                 public_session_id,
@@ -95,7 +97,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                 Ok(session) => session,
                 Err(error) => {
                     close_session_best_effort(
-                        &mut control,
+                        &mut public_control,
                         public_session_id,
                         "public_relay_setup_failed",
                     )
@@ -103,7 +105,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                     return Err(error);
                 }
             };
-            (public_session_id, session)
+            (public_session_id, session, public_control)
         }
         Err(error) => {
             close_session_best_effort(&mut control, first_session_id, "ssh_setup_failed").await;
@@ -164,6 +166,15 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
         tracing::debug!(session = %session_id, error = %error, "SSH finished after control channel disconnected");
     }
     Ok(())
+}
+
+async fn connect_control(context: &ClientContext, access_token: &str) -> Result<WsStream> {
+    tokio::time::timeout(
+        CONTROL_CONNECT_TIMEOUT,
+        context.api.connect_control(access_token),
+    )
+    .await
+    .context("connecting to kmesh control channel timed out")?
 }
 
 fn new_attempt_identity() -> (Uuid, SecretKey) {
