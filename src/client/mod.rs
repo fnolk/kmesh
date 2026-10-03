@@ -5,6 +5,7 @@ mod auth;
 mod cli;
 mod profile;
 mod proxy;
+mod route;
 pub mod ssh_config;
 
 use std::{fs, path::PathBuf};

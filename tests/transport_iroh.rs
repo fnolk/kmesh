@@ -55,10 +55,7 @@ async fn iroh_stream_preserves_half_close_and_final_ssh_exit_status_bytes() {
         sshd.shutdown().await.unwrap();
     });
 
-    let relay_choice = RelayChoice::Private {
-        url: "https://relay.invalid".parse().unwrap(),
-        qad_port: 3478,
-    };
+    let relay_choice = RelayChoice::DirectOnly;
     let connection = connect_peer(&client, target_addr, &relay_choice)
         .await
         .unwrap();

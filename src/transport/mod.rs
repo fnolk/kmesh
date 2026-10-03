@@ -15,11 +15,12 @@ pub use iroh::{
     HandoffOptions, IROH_SSH_ALPN, IrohByteStream, IrohEndpointOptions, IrohPathKind,
     IrohPathStats, IrohSelectedPath, RelayChoice, accept_peer, allowed_relay_urls, connect_peer,
     create_endpoint, snapshot_iroh_paths, validate_endpoint_addr, wait_endpoint_ready,
+    wait_for_selected_path,
 };
 pub use qad::{QadObservation, QadReflector, observe_ipv4_mappings};
 pub use udp_handoff::{
     DiscoveredUdpSocket, LocalBindState, MappingDiscovery, PreparedPunch, PunchCounters,
-    PunchError, PunchIdentity, PunchRole, PunchSelection, discover_ipv4_mappings,
+    PunchError, PunchIdentity, PunchRole, PunchSelection, QadPlan, discover_ipv4_mappings,
 };
 
 /// A transport error with an explicit security and network classification.

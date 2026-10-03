@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::{
     TransportError,
-    iroh::{RelayChoice, build_ca_tls_config, validate_relay_url},
+    iroh::{HandoffOptions, build_ca_tls_config},
     qad::{QadObservation, QadReflector, observe_ipv4_mappings},
 };
 use crate::config::TlsConfig;
@@ -43,6 +43,15 @@ const PACKET_HEADER_LEN: usize = 92;
 const PACKET_SIGNATURE_LEN: usize = 64;
 const PACKET_LEN: usize = PACKET_HEADER_LEN + PACKET_SIGNATURE_LEN;
 const PROBE_INDEX: u16 = u16::MAX;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QadPlan {
+    PrivateAndOfficial {
+        server_url: reqwest::Url,
+        udp_port: u16,
+    },
+    OfficialDefault,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,7 +107,16 @@ pub struct DiscoveredUdpSocket {
     pub socket: StdUdpSocket,
     pub local_socket: SocketAddrV4,
     pub observations: Vec<QadObservation>,
-    pub relay_choice: RelayChoice,
+    pub qad_plan: QadPlan,
+}
+
+impl DiscoveredUdpSocket {
+    pub fn handoff_options(&self) -> HandoffOptions {
+        HandoffOptions {
+            bind_addr: self.local_socket,
+            self_observed_addr: self.observations[0].observed_addr,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -148,7 +166,7 @@ struct MappingPair {
 /// QAD timeouts and route failures return `Unavailable`, so the caller can choose the standard
 /// native Iroh path. Certificate, TLS, configuration, and protocol failures remain errors.
 pub async fn discover_ipv4_mappings(
-    relay_choice: &RelayChoice,
+    qad_plan: &QadPlan,
     tls: &TlsConfig,
     deadline: Instant,
 ) -> Result<MappingDiscovery, TransportError> {
@@ -168,7 +186,7 @@ pub async fn discover_ipv4_mappings(
         }
     };
 
-    let reflectors = match qad_reflectors(relay_choice, deadline).await {
+    let reflectors = match qad_reflectors(qad_plan, deadline).await {
         Ok(reflectors) => reflectors,
         Err(error) if error.is_network_failure() => {
             return Ok(MappingDiscovery::Unavailable {
@@ -220,31 +238,33 @@ pub async fn discover_ipv4_mappings(
         socket,
         local_socket,
         observations,
-        relay_choice: relay_choice.clone(),
+        qad_plan: qad_plan.clone(),
     }))
 }
 
 async fn qad_reflectors(
-    relay_choice: &RelayChoice,
+    qad_plan: &QadPlan,
     deadline: Instant,
 ) -> Result<Vec<QadReflector>, TransportError> {
     let mut configs = Vec::new();
-    match relay_choice {
-        RelayChoice::Private { url, qad_port } => {
-            if *qad_port != PRIVATE_QAD_PORT {
+    match qad_plan {
+        QadPlan::PrivateAndOfficial {
+            server_url,
+            udp_port,
+        } => {
+            if *udp_port != PRIVATE_QAD_PORT {
                 return Err(TransportError::Configuration(
                     "private server QAD port is fixed at UDP 3478".to_owned(),
                 ));
             }
-            let url = validate_relay_url(url.clone())?;
-            let host = url.host_str().ok_or_else(|| {
+            let host = server_url.host_str().ok_or_else(|| {
                 TransportError::Configuration("private relay URL has no host".to_owned())
             })?;
-            configs.push((host.to_owned(), *qad_port));
+            configs.push((host.to_owned(), *udp_port));
             let official = default_qad_configs(1)?;
             configs.push(official[0].clone());
         }
-        RelayChoice::PublicDefault => configs.extend(default_qad_configs(2)?),
+        QadPlan::OfficialDefault => configs.extend(default_qad_configs(2)?),
     }
 
     let mut reflectors = Vec::with_capacity(configs.len());
@@ -399,7 +419,7 @@ impl PreparedPunch {
         }
         validate_mapping_pair(
             role,
-            &discovered.relay_choice,
+            &discovered.qad_plan,
             discovered.local_socket,
             &discovered.observations,
             peer_local_socket,
@@ -817,14 +837,14 @@ async fn target_receiver(
 
 fn validate_mapping_pair(
     role: PunchRole,
-    relay_choice: &RelayChoice,
+    qad_plan: &QadPlan,
     local_socket: SocketAddrV4,
     local_observations: &[QadObservation],
     peer_local_socket: SocketAddrV4,
     peer_observations: &[QadObservation],
 ) -> Result<(), PunchError> {
-    validate_observations(relay_choice, local_observations, local_socket)?;
-    validate_observations(relay_choice, peer_observations, peer_local_socket)?;
+    validate_observations(qad_plan, local_observations, local_socket)?;
+    validate_observations(qad_plan, peer_observations, peer_local_socket)?;
     let (target, client) = match role {
         PunchRole::Target => (local_observations, peer_observations),
         PunchRole::Client => (peer_observations, local_observations),
@@ -847,7 +867,7 @@ fn validate_mapping_pair(
 }
 
 fn validate_observations(
-    relay_choice: &RelayChoice,
+    qad_plan: &QadPlan,
     observations: &[QadObservation],
     expected_local_socket: SocketAddrV4,
 ) -> Result<(), PunchError> {
@@ -856,7 +876,7 @@ fn validate_observations(
             "mode 2 requires exactly two authenticated QAD observations per endpoint".to_owned(),
         ));
     }
-    let expected = expected_reflector_servers(relay_choice)?;
+    let expected = expected_reflector_servers(qad_plan)?;
     let mut unmatched = observations.iter().collect::<Vec<_>>();
     for (server_name, port) in expected {
         let Some(index) = unmatched.iter().position(|observation| {
@@ -918,26 +938,26 @@ fn target_public_ip(observations: &[QadObservation]) -> Result<Ipv4Addr, PunchEr
     Ok(*pair.first.ip())
 }
 
-fn expected_reflector_servers(
-    relay_choice: &RelayChoice,
-) -> Result<Vec<(String, u16)>, PunchError> {
+fn expected_reflector_servers(qad_plan: &QadPlan) -> Result<Vec<(String, u16)>, PunchError> {
     let mut reflectors = Vec::new();
-    match relay_choice {
-        RelayChoice::Private { url, qad_port } => {
-            if *qad_port != PRIVATE_QAD_PORT {
+    match qad_plan {
+        QadPlan::PrivateAndOfficial {
+            server_url,
+            udp_port,
+        } => {
+            if *udp_port != PRIVATE_QAD_PORT {
                 return Err(TransportError::Configuration(
                     "private server QAD port is fixed at UDP 3478".to_owned(),
                 )
                 .into());
             }
-            let url = validate_relay_url(url.clone())?;
-            let server_name = url.host_str().ok_or_else(|| {
+            let server_name = server_url.host_str().ok_or_else(|| {
                 TransportError::Configuration("private relay URL has no host".to_owned())
             })?;
             reflectors.push((server_name.to_owned(), PRIVATE_QAD_PORT));
             reflectors.extend(default_qad_configs(1)?);
         }
-        RelayChoice::PublicDefault => reflectors.extend(default_qad_configs(2)?),
+        QadPlan::OfficialDefault => reflectors.extend(default_qad_configs(2)?),
     }
     Ok(reflectors)
 }
@@ -1052,10 +1072,10 @@ fn decode_packet(
 mod tests {
     use super::*;
 
-    fn private_choice() -> RelayChoice {
-        RelayChoice::Private {
-            url: "https://192.0.2.11:9443".parse().unwrap(),
-            qad_port: PRIVATE_QAD_PORT,
+    fn private_qad_plan() -> QadPlan {
+        QadPlan::PrivateAndOfficial {
+            server_url: "https://192.0.2.11:9443".parse().unwrap(),
+            udp_port: PRIVATE_QAD_PORT,
         }
     }
 
@@ -1185,7 +1205,7 @@ mod tests {
             SocketAddr::V6(_) => unreachable!(),
         };
         let client_observations = observations(client_local, client_local, client_local);
-        let relay_choice = private_choice();
+        let qad_plan = private_qad_plan();
         let mut target = PreparedPunch::prepare(
             PunchRole::Target,
             identity,
@@ -1194,7 +1214,7 @@ mod tests {
                 socket: target_socket,
                 local_socket: target_local,
                 observations: target_observations.clone(),
-                relay_choice: relay_choice.clone(),
+                qad_plan: qad_plan.clone(),
             },
             client_local,
             client_observations.clone(),
@@ -1208,7 +1228,7 @@ mod tests {
                 socket: client_socket,
                 local_socket: client_local,
                 observations: client_observations,
-                relay_choice,
+                qad_plan,
             },
             target_local,
             target_observations,
@@ -1285,7 +1305,7 @@ mod tests {
                 socket: client_socket,
                 local_socket: client_local,
                 observations: client_observations,
-                relay_choice: private_choice(),
+                qad_plan: private_qad_plan(),
             },
             target_local,
             target_observations,

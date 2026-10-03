@@ -1,9 +1,9 @@
 use std::io;
 
-use kmesh::transport::{RelayChoice, TransportError, allowed_relay_urls};
+use kmesh::transport::{RelayChoice, TransportError, allowed_relay_urls, validate_endpoint_addr};
 
 #[test]
-fn only_classified_network_failures_are_eligible_for_private_retry() {
+fn only_classified_network_failures_advance_the_route_attempt() {
     let eligible = [
         TransportError::Timeout("relay connection"),
         TransportError::Network(io::Error::from(io::ErrorKind::ConnectionRefused)),
@@ -28,10 +28,22 @@ fn only_classified_network_failures_are_eligible_for_private_retry() {
 }
 
 #[test]
-fn private_relay_address_is_rejected_in_public_default_mode() {
+fn direct_route_has_no_relay_addresses_and_private_route_allows_only_its_server() {
     let private_url: reqwest::Url = "https://private-relay.invalid".parse().unwrap();
     let private_relay = iroh::RelayUrl::from(private_url.clone());
-    let public_urls = allowed_relay_urls(&RelayChoice::PublicDefault).unwrap();
+    let direct_urls = allowed_relay_urls(&RelayChoice::DirectOnly).unwrap();
+    assert!(direct_urls.is_empty());
 
-    assert!(!public_urls.contains(&private_relay));
+    let peer_addr = iroh::EndpointAddr::new(iroh::SecretKey::generate().public())
+        .with_relay_url(private_relay.clone());
+    assert!(validate_endpoint_addr(&peer_addr, &RelayChoice::DirectOnly).is_err());
+
+    let private_choice = RelayChoice::Private {
+        url: private_url,
+        quic_port: 3478,
+    };
+    assert_eq!(
+        allowed_relay_urls(&private_choice).unwrap(),
+        [private_relay].into_iter().collect()
+    );
 }

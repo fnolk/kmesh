@@ -8,8 +8,10 @@ use std::{
     time::Duration,
 };
 
+use futures_util::StreamExt;
 use iroh::{
-    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey, Watcher as _,
+    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey, TransportAddr,
+    Watcher as _,
     endpoint::{
         Connection, NetReportConfig, PortmapperConfig, RecvStream, SendStream, VarInt, presets,
     },
@@ -19,6 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
     config::{HttpProxyConfig, TlsConfig},
+    protocol::{RouteMode, SelectedPath},
     transport::{TransportError, http::validate_proxy_url},
 };
 
@@ -39,8 +42,8 @@ pub struct IrohEndpointOptions {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelayChoice {
-    Private { url: reqwest::Url, qad_port: u16 },
-    PublicDefault,
+    DirectOnly,
+    Private { url: reqwest::Url, quic_port: u16 },
 }
 
 pub async fn create_endpoint(
@@ -49,20 +52,20 @@ pub async fn create_endpoint(
     options: IrohEndpointOptions,
 ) -> Result<Endpoint, TransportError> {
     let relay_mode = match &options.relay_choice {
-        RelayChoice::Private { url, qad_port } => {
-            if *qad_port == 0 {
+        RelayChoice::DirectOnly => RelayMode::Disabled,
+        RelayChoice::Private { url, quic_port } => {
+            if *quic_port == 0 {
                 return Err(TransportError::Configuration(
-                    "QAD port must be nonzero".to_owned(),
+                    "private relay QUIC port must be nonzero".to_owned(),
                 ));
             }
             let relay_url = validate_relay_url(url.clone())?;
             let relay_map = RelayMap::from_iter([RelayConfig::new(
                 relay_url,
-                Some(RelayQuicConfig::new(*qad_port)),
+                Some(RelayQuicConfig::new(*quic_port)),
             )]);
             RelayMode::Custom(relay_map)
         }
-        RelayChoice::PublicDefault => RelayMode::Default,
     };
     let alpns = if accept {
         vec![IROH_SSH_ALPN.to_vec()]
@@ -70,22 +73,32 @@ pub async fn create_endpoint(
         Vec::new()
     };
 
-    let mut net_report = NetReportConfig::default();
-    net_report.captive_portal_check = false;
-
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .alpns(alpns)
         .relay_mode(relay_mode)
-        .net_report_config(net_report)
+        .net_report_config(NetReportConfig::minimal())
         .ca_tls_config(build_ca_tls_config(&options.tls)?);
 
-    if let Some(handoff) = options.handoff {
-        builder = builder
-            .portmapper_config(PortmapperConfig::Disabled)
-            .clear_ip_transports()
-            .bind_addr(SocketAddr::V4(handoff.bind_addr))
-            .map_err(|error| TransportError::Configuration(error.to_string()))?;
+    match (&options.relay_choice, options.handoff) {
+        (RelayChoice::DirectOnly, Some(handoff)) => {
+            builder = builder
+                .portmapper_config(PortmapperConfig::Disabled)
+                .clear_ip_transports()
+                .bind_addr(SocketAddr::V4(handoff.bind_addr))
+                .map_err(|error| TransportError::Configuration(error.to_string()))?;
+        }
+        (RelayChoice::DirectOnly, None) => {}
+        (RelayChoice::Private { .. }, None) => {
+            builder = builder
+                .portmapper_config(PortmapperConfig::Disabled)
+                .clear_ip_transports();
+        }
+        (RelayChoice::Private { .. }, Some(_)) => {
+            return Err(TransportError::Configuration(
+                "private relay-only endpoint cannot use a direct UDP handoff".to_owned(),
+            ));
+        }
     }
 
     if let Some(proxy) = &options.tls.proxy {
@@ -138,12 +151,45 @@ pub async fn connect_peer(
         .map_err(TransportError::IrohConnect)
 }
 
+pub async fn wait_for_selected_path(
+    connection: &Connection,
+    route_mode: RouteMode,
+    deadline: tokio::time::Instant,
+) -> Result<SelectedPath, TransportError> {
+    let mut snapshots = connection.paths_stream();
+    loop {
+        let snapshot = tokio::time::timeout_at(deadline, snapshots.next())
+            .await
+            .map_err(|_| TransportError::Timeout("waiting for route-selected Iroh path"))?
+            .ok_or(TransportError::EndpointClosed)?;
+        let Some(path) = snapshot.iter().find(|path| path.is_selected()) else {
+            continue;
+        };
+        return match (route_mode, path.remote_addr()) {
+            (
+                RouteMode::PrivateDirect | RouteMode::PublicDirect,
+                TransportAddr::Ip(remote_address),
+            ) => Ok(SelectedPath::Direct {
+                remote_address: *remote_address,
+            }),
+            (RouteMode::PrivateRelay, TransportAddr::Relay(url)) => {
+                Ok(SelectedPath::PrivateRelay {
+                    url: url.to_string(),
+                })
+            }
+            (mode, remote_address) => Err(TransportError::ProtocolViolation(format!(
+                "route {mode:?} selected an incompatible Iroh path {remote_address}"
+            ))),
+        };
+    }
+}
+
 pub fn allowed_relay_urls(
     relay_choice: &RelayChoice,
 ) -> Result<BTreeSet<iroh::RelayUrl>, TransportError> {
     match relay_choice {
         RelayChoice::Private { url, .. } => Ok(BTreeSet::from([validate_relay_url(url.clone())?])),
-        RelayChoice::PublicDefault => Ok(RelayMode::Default.relay_map().urls::<BTreeSet<_>>()),
+        RelayChoice::DirectOnly => Ok(BTreeSet::new()),
     }
 }
 
@@ -194,14 +240,18 @@ pub fn snapshot_iroh_paths(connection: &Connection) -> Vec<IrohPathStats> {
 
 pub async fn wait_endpoint_ready(
     endpoint: &Endpoint,
-    timeout: Duration,
+    relay_choice: &RelayChoice,
+    deadline: tokio::time::Instant,
 ) -> Result<(), TransportError> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let RelayChoice::Private { .. } = relay_choice else {
+        return Ok(());
+    };
+
     let mut status = endpoint.home_relay_status();
     loop {
         let relays = status.get();
         if relays.iter().any(|relay| relay.is_connected()) {
-            break;
+            return Ok(());
         }
         if let Some(reason) = relays.iter().find_map(|relay| relay.auth_denied_reason()) {
             return Err(TransportError::Authentication(reason.to_owned()));
@@ -224,42 +274,6 @@ pub async fn wait_endpoint_ready(
             }
         }
     }
-
-    let mut report = endpoint.net_report();
-    let report = tokio::time::timeout_at(deadline, report.initialized())
-        .await
-        .map_err(|_| TransportError::Timeout("Iroh initial network report"))?;
-
-    let observed = [
-        report.global_v4.map(SocketAddr::V4),
-        report.global_v6.map(SocketAddr::V6),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    if !observed.is_empty() {
-        let mut address = endpoint.watch_addr();
-        loop {
-            let current = address.get();
-            if observed
-                .iter()
-                .all(|observed| current.ip_addrs().any(|candidate| candidate == observed))
-            {
-                break;
-            }
-            tokio::select! {
-                update = address.updated() => {
-                    if update.is_err() {
-                        return Err(TransportError::EndpointClosed);
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err(TransportError::Timeout("publishing Iroh observed addresses"));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 pub struct IrohByteStream {
