@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs,
+    fs, io,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
@@ -79,6 +79,18 @@ struct AgentAuthenticationFailure(String);
 #[derive(Debug, thiserror::Error)]
 #[error("server selected an authentication failure: {0}")]
 struct ServerAuthenticationFailure(String);
+
+#[derive(Debug, thiserror::Error)]
+enum TicketReadError {
+    #[error("{context}: {source}")]
+    Io {
+        context: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid ticket frame: {0}")]
+    Invalid(String),
+}
 
 pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &str) -> Result<()> {
     let credential_path = profile::agent_credentials_path(&context.config.data_dir, target_id);
@@ -534,22 +546,46 @@ async fn handle_offer(
     mut control_rx: mpsc::Receiver<ControlMessage>,
     outbound: mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
-    let connection = tokio::time::timeout(SESSION_SETUP_TIMEOUT, peer_rx.recv())
+    let connection = tokio::time::timeout(SESSION_SETUP_TIMEOUT, async {
+        tokio::select! {
+            biased;
+            control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
+                control.map(|()| None)
+            },
+            connection = peer_rx.recv() => connection.context("agent peer listener stopped").map(Some),
+        }
+    })
         .await
         .context("timed out waiting for the authenticated Iroh peer")?
-        .context("agent peer listener stopped")?;
+        ?;
+    let Some(connection) = connection else {
+        return Ok(());
+    };
     let remote_endpoint_id = connection.remote_id().to_string();
     ensure_auth(
         remote_endpoint_id == offer.client_endpoint_id,
         "Iroh peer EndpointId differs from the ticket client EndpointId",
     )?;
 
-    let mut stream = IrohByteStream::accept_bi(connection)
-        .await
-        .map_err(transport_error)?;
-    let ticket_in_stream = read_ticket(&mut stream)
-        .await
-        .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
+    let mut stream = tokio::select! {
+        biased;
+        control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
+            control?;
+            return Ok(());
+        },
+        result = IrohByteStream::accept_bi(connection) => result.map_err(transport_error)?,
+    };
+    let ticket_in_stream = tokio::select! {
+        biased;
+        control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
+            control?;
+            return Ok(());
+        },
+        result = read_ticket(&mut stream) => result.map_err(|error| match error {
+            TicketReadError::Io { .. } => anyhow!(error),
+            TicketReadError::Invalid(message) => anyhow!(AgentAuthenticationFailure(message)),
+        })?,
+    };
     ensure_auth(
         ticket_in_stream == offer.ticket,
         "Iroh stream ticket differs from its offer",
@@ -562,7 +598,9 @@ async fn handle_offer(
         })
         .await
         .context("report authenticated Iroh peer to server")?;
-    wait_activated(offer.session_id, &mut control_rx).await?;
+    if !wait_activated(offer.session_id, &mut control_rx).await? {
+        return Ok(());
+    }
 
     let mut ssh = tokio::time::timeout(
         Duration::from_secs(context.config.ssh.connect_timeout_secs),
@@ -596,6 +634,32 @@ async fn handle_offer(
         Err(error) => {
             let _ = stream.reset();
             Err(error).context("copy SSH data between Iroh and local sshd")
+        }
+    }
+}
+
+async fn wait_for_setup_cancellation(
+    session_id: Uuid,
+    inbound: &mut mpsc::Receiver<ControlMessage>,
+) -> Result<()> {
+    loop {
+        match inbound.recv().await {
+            None => return Ok(()),
+            Some(ControlMessage::Close {
+                session_id: received,
+                ..
+            }) if received == session_id => return Ok(()),
+            Some(ControlMessage::Error {
+                session_id: Some(received),
+                code,
+                message,
+            }) if received == session_id => {
+                if code == "authentication" || code == "authorization" {
+                    bail!(AgentAuthenticationFailure(message));
+                }
+                bail!("server rejected SSH session during setup: {message}");
+            }
+            Some(_) => {}
         }
     }
 }
@@ -664,52 +728,57 @@ fn validate_ticket(
 async fn wait_activated(
     session_id: Uuid,
     inbound: &mut mpsc::Receiver<ControlMessage>,
-) -> Result<()> {
+) -> Result<bool> {
     loop {
-        match inbound
-            .recv()
-            .await
-            .context("agent control ended before SSH activation")?
-        {
-            ControlMessage::Activated {
+        match inbound.recv().await {
+            None => return Ok(false),
+            Some(ControlMessage::Activated {
                 session_id: received,
-            } if received == session_id => return Ok(()),
-            ControlMessage::Error {
+            }) if received == session_id => return Ok(true),
+            Some(ControlMessage::Error {
                 session_id: Some(received),
                 code,
                 message,
-            } if received == session_id => {
+            }) if received == session_id => {
                 if code == "authentication" || code == "authorization" {
                     bail!(AgentAuthenticationFailure(message));
                 }
                 bail!("server rejected SSH session before activation: {message}");
             }
-            ControlMessage::Close {
+            Some(ControlMessage::Close {
                 session_id: received,
-                reason,
-            } if received == session_id => {
-                bail!("server closed SSH session before activation: {reason}");
-            }
-            _ => {}
+                ..
+            }) if received == session_id => return Ok(false),
+            Some(_) => {}
         }
     }
 }
 
-async fn read_ticket(stream: &mut IrohByteStream) -> Result<String> {
-    let length = stream
-        .read_u32()
+async fn read_ticket(stream: &mut IrohByteStream) -> std::result::Result<String, TicketReadError> {
+    let mut length_bytes = [0; 4];
+    stream
+        .read_exact(&mut length_bytes)
         .await
-        .context("read ticket frame length")? as usize;
-    anyhow::ensure!(
-        length > 0 && length <= MAX_TICKET_FRAME,
-        "ticket frame length is invalid"
-    );
+        .map_err(|source| TicketReadError::Io {
+            context: "read ticket frame length",
+            source,
+        })?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    if length == 0 || length > MAX_TICKET_FRAME {
+        return Err(TicketReadError::Invalid(
+            "ticket frame length is invalid".to_owned(),
+        ));
+    }
     let mut bytes = vec![0; length];
     stream
         .read_exact(&mut bytes)
         .await
-        .context("read ticket frame")?;
-    String::from_utf8(bytes).context("ticket frame is not UTF-8")
+        .map_err(|source| TicketReadError::Io {
+            context: "read ticket frame",
+            source,
+        })?;
+    String::from_utf8(bytes)
+        .map_err(|error| TicketReadError::Invalid(format!("ticket frame is not UTF-8: {error}")))
 }
 
 fn message_session_id(message: &ControlMessage) -> Option<Uuid> {
@@ -764,6 +833,8 @@ fn transport_error(error: TransportError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::{Endpoint, SecretKey, endpoint::presets};
+    use tokio::io::AsyncWriteExt;
 
     async fn context(server_url: &str) -> ClientContext {
         let config = crate::config::Config {
@@ -779,6 +850,81 @@ mod tests {
             api,
             profiles,
         }
+    }
+
+    async fn local_iroh_connections() -> (Endpoint, Endpoint, Connection, Connection) {
+        let target = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![crate::transport::IROH_SSH_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind local target Iroh endpoint");
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![crate::transport::IROH_SSH_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind local client Iroh endpoint");
+
+        let target_accept = {
+            let target = target.clone();
+            tokio::spawn(async move {
+                target
+                    .accept()
+                    .await
+                    .expect("target endpoint closed")
+                    .await
+                    .expect("accept local client connection")
+            })
+        };
+        let client_connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.connect(target.addr(), crate::transport::IROH_SSH_ALPN),
+        )
+        .await
+        .expect("local Iroh connection timed out")
+        .expect("connect local Iroh endpoints");
+        let target_connection = tokio::time::timeout(Duration::from_secs(5), target_accept)
+            .await
+            .expect("target Iroh accept timed out")
+            .expect("target accept task failed");
+        (target, client, target_connection, client_connection)
+    }
+
+    fn offer(client_endpoint_id: String, ticket: &str) -> TunnelOffer {
+        TunnelOffer {
+            session_id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            ticket: ticket.to_owned(),
+            client_endpoint_id,
+            target_endpoint_addr: EndpointAddr::new(SecretKey::generate().public()),
+            ticket_public_key_pem: String::new(),
+            relay_mode: RelayMode::Private,
+        }
+    }
+
+    async fn await_offer(task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("agent offer did not finish promptly")
+            .expect("agent offer task panicked")
+    }
+
+    async fn handle_connected_offer(
+        context: &ClientContext,
+        offer: TunnelOffer,
+        target_connection: Connection,
+    ) -> Result<()> {
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        peer_tx
+            .send(target_connection)
+            .await
+            .expect("route local peer connection to agent");
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        handle_offer(context, offer, peer_rx, control_rx, outbound).await
     }
 
     #[tokio::test]
@@ -817,5 +963,254 @@ mod tests {
             qad_port: 3478,
         };
         assert!(endpoint_options(&context, &malicious, RelayMode::Private).is_err());
+    }
+
+    #[tokio::test]
+    async fn close_cancels_waiting_for_peer() {
+        let context = context("https://kmesh.test:9443").await;
+        let offer = offer("client-endpoint".to_owned(), "ticket");
+        let session_id = offer.session_id;
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
+        });
+
+        control_tx
+            .send(ControlMessage::Close {
+                session_id,
+                reason: "cancelled".to_owned(),
+            })
+            .await
+            .expect("send session close");
+        assert!(await_offer(task).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn control_disconnect_cancels_waiting_for_peer() {
+        let context = context("https://kmesh.test:9443").await;
+        let offer = offer("client-endpoint".to_owned(), "ticket");
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
+        });
+
+        drop(control_tx);
+        assert!(await_offer(task).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_cancels_waiting_for_ticket_bytes() {
+        let context = context("https://kmesh.test:9443").await;
+        let (target, _client, target_connection, client_connection) =
+            local_iroh_connections().await;
+        let mut client_stream = IrohByteStream::open_bi(client_connection.clone())
+            .await
+            .expect("open local client stream");
+        client_stream
+            .write_u32(32)
+            .await
+            .expect("write ticket frame length");
+        client_stream
+            .write_all(b"partial")
+            .await
+            .expect("write partial ticket frame");
+        client_stream
+            .flush()
+            .await
+            .expect("flush partial ticket frame");
+
+        let offer = offer(target_connection.remote_id().to_string(), "expected-ticket");
+        let session_id = offer.session_id;
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        peer_tx
+            .send(target_connection)
+            .await
+            .expect("route local peer connection to agent");
+        drop(peer_tx);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
+        });
+        // The frame is incomplete, so after the local stream is accepted the agent blocks in read_ticket.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        control_tx
+            .send(ControlMessage::Close {
+                session_id,
+                reason: "cancelled".to_owned(),
+            })
+            .await
+            .expect("send session close");
+        assert!(await_offer(task).await.is_ok());
+        drop(client_stream);
+        drop(target);
+    }
+
+    #[tokio::test]
+    async fn close_cancels_waiting_for_bidirectional_stream() {
+        let context = context("https://kmesh.test:9443").await;
+        let (target, _client, target_connection, client_connection) =
+            local_iroh_connections().await;
+        let offer = offer(target_connection.remote_id().to_string(), "expected-ticket");
+        let session_id = offer.session_id;
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        peer_tx
+            .send(target_connection)
+            .await
+            .expect("route local peer connection to agent");
+        drop(peer_tx);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        control_tx
+            .send(ControlMessage::Close {
+                session_id,
+                reason: "cancelled".to_owned(),
+            })
+            .await
+            .expect("send session close");
+        assert!(await_offer(task).await.is_ok());
+        drop(client_connection);
+        drop(target);
+    }
+
+    #[tokio::test]
+    async fn ticket_stream_disconnect_is_a_network_error() {
+        let context = context("https://kmesh.test:9443").await;
+        let (target, _client, target_connection, client_connection) =
+            local_iroh_connections().await;
+        let mut client_stream = IrohByteStream::open_bi(client_connection.clone())
+            .await
+            .expect("open local client stream");
+        client_stream
+            .write_u32(32)
+            .await
+            .expect("write ticket frame length");
+        client_stream
+            .write_all(b"partial")
+            .await
+            .expect("write partial ticket frame");
+        client_stream
+            .flush()
+            .await
+            .expect("flush partial ticket frame");
+
+        let offer = offer(target_connection.remote_id().to_string(), "expected-ticket");
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        peer_tx
+            .send(target_connection)
+            .await
+            .expect("route local peer connection to agent");
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client_stream.reset().expect("reset partial ticket stream");
+
+        let error = await_offer(task)
+            .await
+            .expect_err("truncated ticket stream must fail");
+        assert!(
+            !is_authentication_error(&error),
+            "stream reset was classified as authentication: {error:#}"
+        );
+        assert!(
+            crate::transport::is_network_failure_source(error.as_ref()),
+            "stream reset did not preserve a classifiable network source: {error:#}"
+        );
+        drop(control_tx);
+        drop(target);
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_ticket_and_peer_identity_remain_authentication_errors() {
+        let context = context("https://kmesh.test:9443").await;
+        let (target, _client, target_connection, client_connection) =
+            local_iroh_connections().await;
+        let client_endpoint_id = target_connection.remote_id().to_string();
+
+        let error = handle_connected_offer(
+            &context,
+            offer("different-endpoint".to_owned(), "expected-ticket"),
+            target_connection.clone(),
+        )
+        .await
+        .expect_err("wrong peer EndpointId must fail authentication");
+        assert!(is_authentication_error(&error), "{error:#}");
+
+        let mut invalid_frame = IrohByteStream::open_bi(client_connection.clone())
+            .await
+            .expect("open client stream for invalid frame");
+        invalid_frame
+            .write_u32(0)
+            .await
+            .expect("write invalid ticket frame length");
+        invalid_frame.flush().await.expect("flush invalid frame");
+        let error = handle_connected_offer(
+            &context,
+            offer(client_endpoint_id.clone(), "expected-ticket"),
+            target_connection.clone(),
+        )
+        .await
+        .expect_err("invalid ticket frame must fail authentication");
+        assert!(is_authentication_error(&error), "{error:#}");
+
+        let mut wrong_ticket = IrohByteStream::open_bi(client_connection.clone())
+            .await
+            .expect("open client stream for mismatched ticket");
+        wrong_ticket
+            .write_u32(5)
+            .await
+            .expect("write ticket frame length");
+        wrong_ticket
+            .write_all(b"wrong")
+            .await
+            .expect("write mismatched ticket");
+        wrong_ticket.flush().await.expect("flush mismatched ticket");
+        let error = handle_connected_offer(
+            &context,
+            offer(client_endpoint_id, "expected-ticket"),
+            target_connection,
+        )
+        .await
+        .expect_err("ticket differing from the signed offer must fail authentication");
+        assert!(is_authentication_error(&error), "{error:#}");
+        drop(target);
+    }
+
+    #[tokio::test]
+    async fn close_or_control_disconnect_before_activation_is_cancellation() {
+        let session_id = Uuid::new_v4();
+        let (close_tx, mut close_rx) = mpsc::channel(1);
+        close_tx
+            .send(ControlMessage::Close {
+                session_id,
+                reason: "cancelled".to_owned(),
+            })
+            .await
+            .expect("send session close");
+        assert!(
+            !wait_activated(session_id, &mut close_rx)
+                .await
+                .expect("close is a clean cancellation")
+        );
+
+        let (disconnected_tx, mut disconnected_rx) = mpsc::channel(1);
+        drop(disconnected_tx);
+        assert!(
+            !wait_activated(session_id, &mut disconnected_rx)
+                .await
+                .expect("control disconnect is a clean cancellation")
+        );
     }
 }
