@@ -1341,6 +1341,7 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
     reach_out_events = []
     nat_probe_tx: dict[str, dict[str, int]] = {}
     path_response_tx: dict[str, dict[str, int]] = {}
+    udp_transport_events = []
     received_paths: dict[str, int] = {}
     validated_paths = []
     for line in lines:
@@ -1396,6 +1397,17 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
             received_paths[remote_path] = received_paths.get(remote_path, 0) + 1
         if "new path validated" in line:
             validated_paths.append(line)
+        if "iroh::socket::transports" in line:
+            if "transport pending, dropped transmit" in line:
+                send_result = "pending_drop"
+            elif "dropped transmit" in line:
+                send_result = "send_error"
+            elif "sent transmit" in line:
+                send_result = "sent"
+            else:
+                send_result = None
+            if send_result is not None:
+                udp_transport_events.append({"result": send_result, "source_line": line})
         if any(
             marker in line
             for marker in (
@@ -1409,6 +1421,21 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
             )
         ):
             udp_path_events.append({"source_line": line})
+    target_candidates = [
+        address
+        for event in candidates
+        if event["role"] == "target"
+        for address in event["ip_addrs"]
+    ]
+    udp_transport_by_target_candidate = {}
+    for event in udp_transport_events:
+        matches = [address for address in target_candidates if address in event["source_line"]]
+        event["target_candidate_addresses"] = matches
+        for address in matches:
+            counts = udp_transport_by_target_candidate.setdefault(
+                address, {"sent": 0, "send_error": 0, "pending_drop": 0}
+            )
+            counts[event["result"]] += 1
     return {
         "candidate_events": candidates,
         "client_net_report_events": net_reports,
@@ -1421,6 +1448,8 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
             "received_quic_packet_paths": received_paths,
             "validated_path_events": validated_paths,
         },
+        "udp_transport_events": udp_transport_events,
+        "udp_transport_by_target_candidate": udp_transport_by_target_candidate,
         "udp_path_events": udp_path_events,
     }
 
@@ -1586,7 +1615,7 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     alias = match.group(1)
     env = {
         "PATH": str(harness.args.client_binary.parent) + os.pathsep + os.environ.get("PATH", ""),
-        "RUST_LOG": "iroh::net_report=debug,iroh::_events::qnt::init=debug,iroh::socket::remote_map::remote_state=trace,portmapper=debug,noq_proto::connection=trace,noq_proto::connection::paths=trace,kmesh::client::proxy=trace",
+        "RUST_LOG": "iroh::net_report=debug,iroh::_events::qnt::init=debug,iroh::socket=debug,iroh::socket::transports=trace,iroh::socket::remote_map::remote_state=trace,portmapper=trace,igd_next=debug,noq_proto::connection=trace,noq_proto::connection::paths=trace,kmesh::client::proxy=trace",
     }
     process = subprocess.Popen(
         [
