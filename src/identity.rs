@@ -1,4 +1,4 @@
-use crate::protocol::{AccessTokenClaims, RelayMode, TunnelTicketClaims};
+use crate::protocol::{AccessTokenClaims, RouteMode, TunnelTicketClaims};
 use anyhow::{Context, Result};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rcgen::{KeyPair, PKCS_ED25519};
@@ -95,7 +95,7 @@ pub fn decode_tunnel_ticket(
 pub fn agent_session_identity_payload(
     session_id: uuid::Uuid,
     target_id: uuid::Uuid,
-    relay_mode: RelayMode,
+    route_mode: RouteMode,
     target_data_endpoint_id: &iroh::EndpointId,
     expires_at: i64,
 ) -> Vec<u8> {
@@ -104,9 +104,10 @@ pub fn agent_session_identity_payload(
     payload.extend_from_slice(DOMAIN);
     payload.extend_from_slice(session_id.as_bytes());
     payload.extend_from_slice(target_id.as_bytes());
-    payload.push(match relay_mode {
-        RelayMode::Private => 1,
-        RelayMode::PublicDefault => 2,
+    payload.push(match route_mode {
+        RouteMode::PrivateDirect => 1,
+        RouteMode::PublicDirect => 2,
+        RouteMode::PrivateRelay => 3,
     });
     payload.extend_from_slice(target_data_endpoint_id.as_bytes());
     payload.extend_from_slice(&expires_at.to_be_bytes());
@@ -117,7 +118,7 @@ pub fn verify_agent_session_identity(
     stable_device_endpoint_id: &str,
     session_id: uuid::Uuid,
     target_id: uuid::Uuid,
-    relay_mode: RelayMode,
+    route_mode: RouteMode,
     target_data_endpoint_id: &str,
     expires_at: i64,
     signature: &[u8],
@@ -132,7 +133,7 @@ pub fn verify_agent_session_identity(
     let payload = agent_session_identity_payload(
         session_id,
         target_id,
-        relay_mode,
+        route_mode,
         &target_data_endpoint_id,
         expires_at,
     );
@@ -171,11 +172,28 @@ mod tests {
         let session_id = uuid::Uuid::new_v4();
         let target_id = uuid::Uuid::new_v4();
         let expires_at = 1_800_000_000;
+        let mode_offset = b"kmesh/agent-session-identity/1\0".len() + 32;
+        for (mode, tag) in [
+            (RouteMode::PrivateDirect, 1),
+            (RouteMode::PublicDirect, 2),
+            (RouteMode::PrivateRelay, 3),
+        ] {
+            assert_eq!(
+                agent_session_identity_payload(
+                    session_id,
+                    target_id,
+                    mode,
+                    &data_key.public(),
+                    expires_at,
+                )[mode_offset],
+                tag
+            );
+        }
         let signature = device_key
             .sign(&agent_session_identity_payload(
                 session_id,
                 target_id,
-                RelayMode::Private,
+                RouteMode::PrivateDirect,
                 &data_key.public(),
                 expires_at,
             ))
@@ -185,7 +203,7 @@ mod tests {
             &device_key.public().to_string(),
             session_id,
             target_id,
-            RelayMode::Private,
+            RouteMode::PrivateDirect,
             &data_key.public().to_string(),
             expires_at,
             &signature,
@@ -196,7 +214,7 @@ mod tests {
                 &device_key.public().to_string(),
                 uuid::Uuid::new_v4(),
                 target_id,
-                RelayMode::Private,
+                RouteMode::PrivateDirect,
                 &data_key.public().to_string(),
                 expires_at,
                 &signature,
@@ -209,7 +227,7 @@ mod tests {
                 &other_device_key.public().to_string(),
                 session_id,
                 target_id,
-                RelayMode::Private,
+                RouteMode::PrivateDirect,
                 &data_key.public().to_string(),
                 expires_at,
                 &signature,
@@ -222,7 +240,7 @@ mod tests {
                 &device_key.public().to_string(),
                 session_id,
                 target_id,
-                RelayMode::Private,
+                RouteMode::PrivateDirect,
                 &other_data_key.public().to_string(),
                 expires_at,
                 &signature,
@@ -234,7 +252,7 @@ mod tests {
                 &device_key.public().to_string(),
                 session_id,
                 target_id,
-                RelayMode::PublicDefault,
+                RouteMode::PublicDirect,
                 &data_key.public().to_string(),
                 expires_at,
                 &signature,
@@ -246,7 +264,19 @@ mod tests {
                 &device_key.public().to_string(),
                 session_id,
                 target_id,
-                RelayMode::Private,
+                RouteMode::PrivateRelay,
+                &data_key.public().to_string(),
+                expires_at,
+                &signature,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_agent_session_identity(
+                &device_key.public().to_string(),
+                session_id,
+                target_id,
+                RouteMode::PrivateDirect,
                 &data_key.public().to_string(),
                 expires_at + 1,
                 &signature,

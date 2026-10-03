@@ -1,4 +1,4 @@
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -221,9 +221,10 @@ pub struct TransportInfo {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum RelayMode {
-    Private,
-    PublicDefault,
+pub enum RouteMode {
+    PrivateDirect,
+    PublicDirect,
+    PrivateRelay,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -245,7 +246,7 @@ pub struct TunnelTicketClaims {
     pub client_endpoint_id: String,
     /// This ticket's target data-plane EndpointId, scoped to `session_id`.
     pub target_endpoint_id: String,
-    pub relay_mode: RelayMode,
+    pub route_mode: RouteMode,
     pub iss: String,
     pub aud: String,
     pub iat: u64,
@@ -285,6 +286,13 @@ pub enum NativePlan {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SelectedPath {
+    Direct { remote_address: SocketAddr },
+    PrivateRelay { url: String },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
@@ -292,7 +300,7 @@ pub enum ControlMessage {
         session_id: Uuid,
         target_id: Uuid,
         client_endpoint_id: String,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
     },
     ClientOffer {
         session_id: Uuid,
@@ -301,70 +309,70 @@ pub enum ControlMessage {
         client_endpoint_id: String,
         target_endpoint_id: String,
         ticket_public_key_pem: String,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
     },
     Prepare {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         client_endpoint_id: String,
         expires_at: i64,
     },
     AgentIdentity {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         target_data_endpoint_id: String,
         signature: Vec<u8>,
     },
     IdentityAccepted {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
     },
     CandidatesReady {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         discovery: DiscoveryResult,
     },
     PunchPair {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         target_endpoint_id: String,
         client_endpoint_id: String,
         peer_discovery: ReadyDiscovery,
     },
     PunchReady {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         socket_count: u16,
     },
     StartPunch {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
     },
     PunchSelected {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         index: u16,
         local_socket: SocketAddrV4,
         peer_observed_addr: SocketAddrV4,
     },
     PunchFailed {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         reason: String,
     },
     ContinueNative {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         plan: NativePlan,
     },
     AgentReady {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         endpoint_addr: iroh::EndpointAddr,
     },
     ClientReady {
         session_id: Uuid,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
         client_endpoint_addr: iroh::EndpointAddr,
     },
     DialOffer {
@@ -374,13 +382,18 @@ pub enum ControlMessage {
         client_endpoint_id: String,
         client_endpoint_addr: iroh::EndpointAddr,
         ticket_public_key_pem: String,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
+    },
+    PathReady {
+        session_id: Uuid,
+        route_mode: RouteMode,
+        path: SelectedPath,
     },
     IrohReady {
         session_id: Uuid,
         client_endpoint_id: String,
         target_data_endpoint_id: String,
-        relay_mode: RelayMode,
+        route_mode: RouteMode,
     },
     Activated {
         session_id: Uuid,
