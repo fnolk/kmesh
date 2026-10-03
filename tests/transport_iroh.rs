@@ -4,7 +4,9 @@ use iroh::{
     Endpoint, RelayMode, SecretKey,
     endpoint::{NetReportConfig, PortmapperConfig, presets},
 };
-use kmesh::transport::{IROH_SSH_ALPN, IrohByteStream, IrohPathKind, accept_peer, connect_peer};
+use kmesh::transport::{
+    IROH_SSH_ALPN, IrohByteStream, IrohPathKind, RelayChoice, accept_peer, connect_peer,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn loopback_endpoint(accept: bool) -> Endpoint {
@@ -53,7 +55,13 @@ async fn iroh_stream_preserves_half_close_and_final_ssh_exit_status_bytes() {
         sshd.shutdown().await.unwrap();
     });
 
-    let connection = connect_peer(&client, target_addr).await.unwrap();
+    let relay_choice = RelayChoice::Private {
+        url: "https://relay.invalid".parse().unwrap(),
+        qad_port: 3478,
+    };
+    let connection = connect_peer(&client, target_addr, &relay_choice)
+        .await
+        .unwrap();
     let mut stream = IrohByteStream::open_bi(connection).await.unwrap();
     assert_eq!(stream.selected_path().unwrap().kind, IrohPathKind::Direct);
     let client_task = tokio::spawn(async move {

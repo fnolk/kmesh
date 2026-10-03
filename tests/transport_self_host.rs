@@ -1,13 +1,16 @@
 use std::{io::BufReader, net::SocketAddr, path::PathBuf, time::Duration};
 
-use iroh::{RelayUrl, SecretKey, Watcher, unstable_net_report::Probe};
+use iroh::{EndpointAddr, RelayUrl, SecretKey, Watcher, unstable_net_report::Probe};
 use iroh_relay::server::{
     CertConfig, QuicConfig as RelayQuicConfig, RelayConfig as RelayHttpConfig,
     Server as RelayServer, ServerConfig as RelayServerConfig, TlsConfig as RelayTlsConfig,
 };
 use kmesh::{
     config::TlsConfig,
-    transport::{IrohEndpointOptions, create_endpoint},
+    transport::{
+        IrohEndpointOptions, RelayChoice, allowed_relay_urls, create_endpoint,
+        validate_endpoint_addr,
+    },
 };
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::PrivateKeyDer;
@@ -20,6 +23,28 @@ impl Drop for TestCertificate {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+#[test]
+fn relay_address_allowlist_is_scoped_to_the_selected_mode() {
+    let private_url: reqwest::Url = "https://private.kmesh.invalid".parse().unwrap();
+    let private_relay = RelayUrl::from(private_url.clone());
+    let private_choice = RelayChoice::Private {
+        url: private_url,
+        qad_port: 3478,
+    };
+    let endpoint_addr =
+        EndpointAddr::new(SecretKey::generate().public()).with_relay_url(private_relay.clone());
+
+    let private_relays = allowed_relay_urls(&private_choice).unwrap();
+    assert_eq!(private_relays.len(), 1);
+    assert!(private_relays.contains(&private_relay));
+    assert!(validate_endpoint_addr(&endpoint_addr, &private_choice).is_ok());
+
+    let official_relays = allowed_relay_urls(&RelayChoice::PublicDefault).unwrap();
+    assert!(!official_relays.is_empty());
+    assert!(!official_relays.contains(&private_relay));
+    assert!(validate_endpoint_addr(&endpoint_addr, &RelayChoice::PublicDefault).is_err());
 }
 
 #[tokio::test]
@@ -73,8 +98,10 @@ async fn self_hosted_https_and_qad_report_the_observed_ipv4_address() {
         SecretKey::generate(),
         true,
         IrohEndpointOptions {
-            relay_url,
-            qad_port: qad_addr.port(),
+            relay_choice: RelayChoice::Private {
+                url: relay_url,
+                qad_port: qad_addr.port(),
+            },
             tls: TlsConfig {
                 ca_certificates: vec![certificate_file.0.clone()],
                 server_name: None,

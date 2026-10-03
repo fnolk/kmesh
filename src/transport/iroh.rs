@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::{self, BufReader},
     pin::Pin,
@@ -23,9 +24,14 @@ pub const IROH_SSH_ALPN: &[u8] = b"kmesh/ssh/1";
 
 #[derive(Clone, Debug)]
 pub struct IrohEndpointOptions {
-    pub relay_url: reqwest::Url,
-    pub qad_port: u16,
+    pub relay_choice: RelayChoice,
     pub tls: TlsConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RelayChoice {
+    Private { url: reqwest::Url, qad_port: u16 },
+    PublicDefault,
 }
 
 pub async fn create_endpoint(
@@ -33,16 +39,22 @@ pub async fn create_endpoint(
     accept: bool,
     options: IrohEndpointOptions,
 ) -> Result<Endpoint, TransportError> {
-    if options.qad_port == 0 {
-        return Err(TransportError::Configuration(
-            "QAD port must be nonzero".to_owned(),
-        ));
-    }
-    let relay_url = validate_relay_url(options.relay_url)?;
-    let relay_map = RelayMap::from_iter([RelayConfig::new(
-        relay_url,
-        Some(RelayQuicConfig::new(options.qad_port)),
-    )]);
+    let relay_mode = match &options.relay_choice {
+        RelayChoice::Private { url, qad_port } => {
+            if *qad_port == 0 {
+                return Err(TransportError::Configuration(
+                    "QAD port must be nonzero".to_owned(),
+                ));
+            }
+            let relay_url = validate_relay_url(url.clone())?;
+            let relay_map = RelayMap::from_iter([RelayConfig::new(
+                relay_url,
+                Some(RelayQuicConfig::new(*qad_port)),
+            )]);
+            RelayMode::Custom(relay_map)
+        }
+        RelayChoice::PublicDefault => RelayMode::Default,
+    };
     let alpns = if accept {
         vec![IROH_SSH_ALPN.to_vec()]
     } else {
@@ -55,7 +67,7 @@ pub async fn create_endpoint(
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .alpns(alpns)
-        .relay_mode(RelayMode::Custom(relay_map))
+        .relay_mode(relay_mode)
         .portmapper_config(PortmapperConfig::Disabled)
         .net_report_config(net_report)
         .ca_tls_config(build_ca_tls_config(&options.tls)?);
@@ -73,11 +85,35 @@ pub async fn create_endpoint(
 pub async fn connect_peer(
     endpoint: &Endpoint,
     address: EndpointAddr,
+    relay_choice: &RelayChoice,
 ) -> Result<Connection, TransportError> {
+    validate_endpoint_addr(&address, relay_choice)?;
     endpoint
         .connect(address, IROH_SSH_ALPN)
         .await
-        .map_err(|error| TransportError::Iroh(error.to_string()))
+        .map_err(TransportError::IrohConnect)
+}
+
+pub fn allowed_relay_urls(
+    relay_choice: &RelayChoice,
+) -> Result<BTreeSet<iroh::RelayUrl>, TransportError> {
+    match relay_choice {
+        RelayChoice::Private { url, .. } => Ok(BTreeSet::from([validate_relay_url(url.clone())?])),
+        RelayChoice::PublicDefault => Ok(RelayMode::Default.relay_map().urls::<BTreeSet<_>>()),
+    }
+}
+
+pub fn validate_endpoint_addr(
+    address: &EndpointAddr,
+    relay_choice: &RelayChoice,
+) -> Result<(), TransportError> {
+    let allowed = allowed_relay_urls(relay_choice)?;
+    if address.relay_urls().any(|url| !allowed.contains(url)) {
+        return Err(TransportError::ProtocolViolation(
+            "peer address includes a relay outside the selected relay mode".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn accept_peer(endpoint: &Endpoint) -> Result<Connection, TransportError> {

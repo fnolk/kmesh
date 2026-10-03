@@ -6,12 +6,13 @@ compile_error!("kmesh transport supports Linux and macOS only");
 mod http;
 mod iroh;
 
-use std::io;
+use std::{error::Error as StdError, io};
 
 pub use http::{BoxedIo, WsStream, connect_wss, http_client};
 pub use iroh::{
     IROH_SSH_ALPN, IrohByteStream, IrohEndpointOptions, IrohPathKind, IrohSelectedPath,
-    accept_peer, connect_peer, create_endpoint,
+    RelayChoice, accept_peer, allowed_relay_urls, connect_peer, create_endpoint,
+    validate_endpoint_addr,
 };
 
 /// A transport error with an explicit security and network classification.
@@ -31,6 +32,8 @@ pub enum TransportError {
     Tls(String),
     #[error("Iroh transport failed: {0}")]
     Iroh(String),
+    #[error("Iroh connection failed: {0}")]
+    IrohConnect(#[source] ::iroh::endpoint::ConnectError),
     #[error("WebSocket failed: {0}")]
     WebSocket(String),
     #[error("invalid transport configuration: {0}")]
@@ -41,6 +44,57 @@ impl TransportError {
     pub fn is_security_failure(&self) -> bool {
         matches!(self, Self::Authentication(_) | Self::ProtocolViolation(_))
     }
+
+    pub fn is_auth_failure(&self) -> bool {
+        match self {
+            Self::Authentication(_) => true,
+            Self::IrohConnect(error) => is_auth_failure_source(error),
+            _ => false,
+        }
+    }
+}
+
+pub fn is_auth_failure_source(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<rustls::Error>()
+            .is_some_and(|error| matches!(error, rustls::Error::InvalidCertificate(_)))
+        {
+            return true;
+        }
+        if let Some(error) = error.downcast_ref::<iroh_relay::client::ConnectError>() {
+            match error {
+                iroh_relay::client::ConnectError::Tls { .. }
+                | iroh_relay::client::ConnectError::Handshake { .. }
+                | iroh_relay::client::ConnectError::InvalidTlsServername { .. }
+                | iroh_relay::client::ConnectError::InvalidRelayUrl { .. }
+                | iroh_relay::client::ConnectError::InvalidWebsocketUrl { .. }
+                | iroh_relay::client::ConnectError::MissingCryptoProvider { .. } => return true,
+                iroh_relay::client::ConnectError::UnexpectedUpgradeStatus { code, .. }
+                    if matches!(code.as_u16(), 401 | 403) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(error) = error.downcast_ref::<iroh_relay::client::DialError>() {
+            match error {
+                iroh_relay::client::DialError::ProxyConnectInvalidStatus { status, .. }
+                    if status.as_u16() == 407 =>
+                {
+                    return true;
+                }
+                iroh_relay::client::DialError::ProxyInvalidUrl { .. }
+                | iroh_relay::client::DialError::ProxyInvalidTlsServername { .. }
+                | iroh_relay::client::DialError::ProxyInvalidTargetPort { .. } => return true,
+                _ => {}
+            }
+        }
+        current = error.source();
+    }
+    false
 }
 
 impl From<io::Error> for TransportError {
