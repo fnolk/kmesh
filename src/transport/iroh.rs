@@ -10,7 +10,9 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey, Watcher as _,
-    endpoint::{Connection, NetReportConfig, RecvStream, SendStream, VarInt, presets},
+    endpoint::{
+        Connection, NetReportConfig, PortmapperConfig, RecvStream, SendStream, VarInt, presets,
+    },
 };
 use iroh_relay::{RelayQuicConfig, tls::CaTlsConfig};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -22,10 +24,17 @@ use crate::{
 
 pub const IROH_SSH_ALPN: &[u8] = b"kmesh/ssh/1";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandoffOptions {
+    pub bind_addr: std::net::SocketAddrV4,
+    pub self_observed_addr: std::net::SocketAddrV4,
+}
+
 #[derive(Clone, Debug)]
 pub struct IrohEndpointOptions {
     pub relay_choice: RelayChoice,
     pub tls: TlsConfig,
+    pub handoff: Option<HandoffOptions>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,14 +80,50 @@ pub async fn create_endpoint(
         .net_report_config(net_report)
         .ca_tls_config(build_ca_tls_config(&options.tls)?);
 
+    if let Some(handoff) = options.handoff {
+        builder = builder
+            .portmapper_config(PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr(SocketAddr::V4(handoff.bind_addr))
+            .map_err(|error| TransportError::Configuration(error.to_string()))?;
+    }
+
     if let Some(proxy) = &options.tls.proxy {
         builder = builder.proxy_url(build_proxy_url(proxy)?);
     }
 
-    builder
+    let endpoint = builder
         .bind()
         .await
-        .map_err(|error| TransportError::Iroh(error.to_string()))
+        .map_err(|error| TransportError::Iroh(error.to_string()))?;
+
+    if let Some(handoff) = options.handoff {
+        let self_observed_addr = SocketAddr::V4(handoff.self_observed_addr);
+        endpoint.add_external_addr(self_observed_addr).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut address = endpoint.watch_addr();
+        loop {
+            if address
+                .get()
+                .ip_addrs()
+                .any(|candidate| *candidate == self_observed_addr)
+            {
+                break;
+            }
+            tokio::select! {
+                updated = address.updated() => {
+                    if updated.is_err() {
+                        return Err(TransportError::EndpointClosed);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(TransportError::Timeout("publishing the peer-observed UDP address"));
+                }
+            }
+        }
+    }
+
+    Ok(endpoint)
 }
 
 pub async fn connect_peer(
@@ -369,7 +414,7 @@ pub struct IrohPathStats {
     pub udp_rx_bytes: u64,
 }
 
-fn validate_relay_url(url: reqwest::Url) -> Result<iroh::RelayUrl, TransportError> {
+pub(super) fn validate_relay_url(url: reqwest::Url) -> Result<iroh::RelayUrl, TransportError> {
     if !matches!(url.scheme(), "https" | "http")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -386,7 +431,7 @@ fn validate_relay_url(url: reqwest::Url) -> Result<iroh::RelayUrl, TransportErro
     Ok(url.into())
 }
 
-fn build_ca_tls_config(tls: &TlsConfig) -> Result<CaTlsConfig, TransportError> {
+pub(super) fn build_ca_tls_config(tls: &TlsConfig) -> Result<CaTlsConfig, TransportError> {
     let mut certificates = Vec::new();
     for path in &tls.ca_certificates {
         let file = File::open(path).map_err(|error| {
