@@ -14,9 +14,9 @@ use crate::{
     },
     transport::{
         DiscoveredUdpSocket, HandoffOptions, IrohByteStream, IrohEndpointOptions, IrohPathKind,
-        IrohPathStats, IrohSelectedPath, MappingDiscovery, PreparedPunch, PunchError,
-        PunchIdentity, PunchRole, RelayChoice, TransportError, accept_peer, create_endpoint,
-        discover_ipv4_mappings, is_auth_failure_source, snapshot_iroh_paths, wait_endpoint_ready,
+        IrohPathStats, MappingDiscovery, PreparedPunch, PunchError, PunchIdentity, PunchRole,
+        RelayChoice, TransportError, accept_peer, create_endpoint, discover_ipv4_mappings,
+        is_auth_failure_source, snapshot_iroh_paths, wait_endpoint_ready,
     },
 };
 
@@ -129,21 +129,54 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
         mut stream,
     } = ssh_session;
 
-    match stream.selected_path() {
-        Some(path) if path.kind == IrohPathKind::Direct => {
-            eprintln!("连接路径：P2P 直连 ({})", path.remote_address);
-        }
-        Some(path) => eprintln!("连接路径：Iroh 中继 ({})", path.remote_address),
-        None => eprintln!("连接已建立；Iroh 正在选择网络路径。"),
-    }
-
     let path_connection = stream.connection().clone();
-    let mut path_events = path_connection.path_events();
     let path_task = tokio::spawn(async move {
+        let mut path_snapshots = path_connection.paths_stream();
+        let mut path_events = path_connection.path_events();
         let mut previous = HashMap::<String, IrohPathStats>::new();
+        let mut previous_selected = None;
+        let mut reported_initial = false;
         let mut ticker = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
+                biased;
+                snapshot = path_snapshots.next() => {
+                    let Some(snapshot) = snapshot else { break; };
+                    let selected = snapshot
+                        .iter()
+                        .find(|path| path.is_selected())
+                        .and_then(|path| {
+                            let kind = if path.is_ip() {
+                                IrohPathKind::Direct
+                            } else if path.is_relay() {
+                                IrohPathKind::Relay
+                            } else {
+                                return None;
+                            };
+                            Some((kind, path.remote_addr().to_string()))
+                        });
+                    if !reported_initial || selected != previous_selected {
+                        match selected.as_ref() {
+                            Some((kind, remote_address)) => {
+                                let label = match kind {
+                                    IrohPathKind::Direct => "P2P 直连",
+                                    IrohPathKind::Relay => "Iroh 中继",
+                                };
+                                if reported_initial {
+                                    eprintln!("连接路径切换：{label} ({remote_address})");
+                                } else {
+                                    eprintln!("连接路径：{label} ({remote_address})");
+                                }
+                            }
+                            None if reported_initial => {
+                                eprintln!("当前没有已选网络路径；Iroh 正在重新选择。");
+                            }
+                            None => eprintln!("连接已建立；Iroh 正在选择网络路径。"),
+                        }
+                        previous_selected = selected;
+                        reported_initial = true;
+                    }
+                }
                 _ = ticker.tick(), if tracing::enabled!(tracing::Level::TRACE) => {
                     for current in snapshot_iroh_paths(&path_connection) {
                         if let Some(before) = previous.get(&current.remote_address) {
@@ -186,7 +219,6 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                             }
                         }
                         PathEvent::Selected { id, remote_addr, .. } => {
-                            let label = if remote_addr.is_relay() { "Iroh 中继" } else { "P2P 直连" };
                             if let Some(path) = path_connection.paths().iter().find(|path| path.id() == id) {
                                 let kind = if path.is_relay() { IrohPathKind::Relay } else { IrohPathKind::Direct };
                                 let stats = path.stats();
@@ -198,7 +230,6 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                                     udp_rx_bytes: stats.udp_rx.bytes,
                                 });
                             }
-                            eprintln!("连接路径切换：{label} ({remote_addr})");
                         }
                         PathEvent::Closed { remote_addr, last_stats, .. } => {
                             if let Some(before) = previous.remove(&remote_addr.to_string()) {
@@ -222,7 +253,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let copy_result = copy_stdio(&mut stream).await;
     path_task.abort();
     let _ = path_task.await;
-    let (ssh_upload_bytes, ssh_download_bytes, final_path) = match copy_result {
+    let (ssh_upload_bytes, ssh_download_bytes) = match copy_result {
         Ok(stats) => stats,
         Err(error) => {
             let _ = stream.reset();
@@ -237,20 +268,10 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
             return Err(error).context("copy local SSH stdio over Iroh");
         }
     };
-    if let Some(path) = final_path {
-        let label = match path.kind {
-            IrohPathKind::Direct => "P2P 直连",
-            IrohPathKind::Relay => "Iroh 中继",
-        };
-        eprintln!(
-            "SSH 数据路径统计：{label} ({})；QUIC/UDP TX={} bytes RX={} bytes；SSH 本地→目标={} bytes 目标→本地={} bytes",
-            path.remote_address,
-            path.udp_tx_bytes,
-            path.udp_rx_bytes,
-            ssh_upload_bytes,
-            ssh_download_bytes,
-        );
-    }
+    eprintln!(
+        "SSH 流量统计：本地→目标={} bytes；目标→本地={} bytes",
+        ssh_upload_bytes, ssh_download_bytes,
+    );
     if let Err(error) = Api::send_control(
         &mut control,
         &ControlMessage::Close {
@@ -1244,7 +1265,7 @@ async fn wait_activated(
     }
 }
 
-async fn copy_stdio(stream: &mut IrohByteStream) -> Result<(u64, u64, Option<IrohSelectedPath>)> {
+async fn copy_stdio(stream: &mut IrohByteStream) -> Result<(u64, u64)> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let paths_before = stream.path_stats();
@@ -1305,7 +1326,7 @@ async fn copy_stdio(stream: &mut IrohByteStream) -> Result<(u64, u64, Option<Iro
     stream
         .connection()
         .close(iroh::endpoint::VarInt::from_u32(0), b"ssh session complete");
-    Ok((transferred.0, transferred.1, selected_path))
+    Ok((transferred.0, transferred.1))
 }
 
 #[cfg(test)]
