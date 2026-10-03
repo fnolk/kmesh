@@ -743,6 +743,7 @@ fn transport_error(error: TransportError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{client::proxy::read_ticket, transport::accept_peer};
     use iroh::{Endpoint, endpoint::presets};
 
     async fn context(server_url: &str) -> ClientContext {
@@ -853,14 +854,17 @@ mod tests {
         });
         let (control_tx, control_rx) = mpsc::channel(1);
         let (outbound, mut outbound_rx) = mpsc::channel(1);
-        let task = tokio::spawn(handle_dial_offer(
-            &context,
-            offer,
-            target.clone(),
-            RelayChoice::PublicDefault,
-            control_rx,
-            outbound,
-        ));
+        let task = tokio::spawn(async move {
+            handle_dial_offer(
+                &context,
+                offer,
+                target,
+                RelayChoice::PublicDefault,
+                control_rx,
+                outbound,
+            )
+            .await
+        });
 
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
@@ -895,14 +899,17 @@ mod tests {
         let session_id = offer.session_id;
         let (control_tx, control_rx) = mpsc::channel(1);
         let (outbound, _outbound_rx) = mpsc::channel(1);
-        let task = tokio::spawn(handle_dial_offer(
-            &context,
-            offer,
-            target,
-            RelayChoice::PublicDefault,
-            control_rx,
-            outbound,
-        ));
+        let task = tokio::spawn(async move {
+            handle_dial_offer(
+                &context,
+                offer,
+                target,
+                RelayChoice::PublicDefault,
+                control_rx,
+                outbound,
+            )
+            .await
+        });
 
         tokio::task::yield_now().await;
         control_tx
@@ -922,14 +929,17 @@ mod tests {
         let offer = offer(&client);
         let (control_tx, control_rx) = mpsc::channel(1);
         let (outbound, _outbound_rx) = mpsc::channel(1);
-        let task = tokio::spawn(handle_dial_offer(
-            &context,
-            offer,
-            target,
-            RelayChoice::PublicDefault,
-            control_rx,
-            outbound,
-        ));
+        let task = tokio::spawn(async move {
+            handle_dial_offer(
+                &context,
+                offer,
+                target,
+                RelayChoice::PublicDefault,
+                control_rx,
+                outbound,
+            )
+            .await
+        });
         drop(control_tx);
         assert!(await_offer(task).await.is_ok());
     }

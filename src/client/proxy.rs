@@ -634,7 +634,7 @@ fn validate_offer(
     Ok(())
 }
 
-async fn read_ticket(stream: &mut IrohByteStream) -> Result<String> {
+pub(super) async fn read_ticket(stream: &mut IrohByteStream) -> Result<String> {
     let mut length_bytes = [0; 4];
     stream
         .read_exact(&mut length_bytes)
@@ -724,7 +724,10 @@ async fn copy_stdio(stream: &mut IrohByteStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{protocol::RelayMode, transport::TransportError};
+    use crate::{
+        protocol::RelayMode,
+        transport::{TransportError, connect_peer},
+    };
     use iroh::{Endpoint, SecretKey, endpoint::presets};
     use std::io;
     use tokio::io::AsyncWriteExt;
