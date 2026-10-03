@@ -22,7 +22,6 @@ use crate::{
 
 use super::{
     ClientContext,
-    agent::ensure_auth,
     api::{Api, WsStream},
     auth,
 };
@@ -50,6 +49,14 @@ struct SshAuthenticationFailure(String);
 #[derive(Debug, thiserror::Error)]
 #[error("private relay network path failed: {0}")]
 struct PrivateNetworkFailure(#[source] anyhow::Error);
+
+fn ensure_auth(condition: bool, message: &str) -> Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(anyhow!(SshAuthenticationFailure(message.to_owned())))
+    }
+}
 
 pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let access_token = auth::valid_access_token(context).await?;

@@ -1014,7 +1014,7 @@ async fn handle_dial_offer(
         })
         .await
         .context("report authenticated Iroh peer to server")?;
-    if timeout_at(
+    if !timeout_at(
         setup_deadline,
         wait_activated(offer.session_id, &mut control_rx),
     )
