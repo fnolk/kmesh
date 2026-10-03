@@ -27,7 +27,7 @@ use crate::{
     },
     transport::{
         IrohByteStream, IrohEndpointOptions, RelayChoice, TransportError, connect_peer,
-        create_endpoint, validate_endpoint_addr, wait_endpoint_ready,
+        create_endpoint, snapshot_iroh_paths, validate_endpoint_addr, wait_endpoint_ready,
     },
 };
 
@@ -488,6 +488,35 @@ async fn handle_dial_offer(
         "Iroh peer EndpointId differs from the ticket client EndpointId",
     )?;
 
+    let mut path_events = connection.path_events();
+    let direct_selected = tokio::select! {
+        biased;
+        control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
+            control?;
+            return Ok(());
+        },
+        result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if connection
+                    .paths()
+                    .iter()
+                    .any(|path| path.is_ip() && path.is_selected())
+                {
+                    break true;
+                }
+                if path_events.next().await.is_none() {
+                    break false;
+                }
+            }
+        }) => result.unwrap_or(false),
+    };
+    tracing::debug!(
+        session = %offer.session_id,
+        direct_selected,
+        paths = ?snapshot_iroh_paths(&connection),
+        "target Iroh path state before ticket stream"
+    );
+
     let mut stream = tokio::select! {
         biased;
         control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
@@ -525,9 +554,24 @@ async fn handle_dial_offer(
     .with_context(|| format!("connect to local sshd at {}", context.config.ssh.address))?;
     ssh.set_nodelay(true)
         .context("set local sshd TCP_NODELAY")?;
+    let paths_before_ssh = snapshot_iroh_paths(stream.connection());
+    tracing::debug!(
+        session = %offer.session_id,
+        paths = ?paths_before_ssh,
+        "target Iroh paths before SSH byte forwarding"
+    );
     let result = tokio::io::copy_bidirectional(&mut ssh, &mut stream).await;
+    let paths_after_ssh = snapshot_iroh_paths(stream.connection());
     match result {
         Ok((to_ssh, from_ssh)) => {
+            tracing::debug!(
+                session = %offer.session_id,
+                ssh_bytes_to_target = to_ssh,
+                ssh_bytes_from_target = from_ssh,
+                paths_before = ?paths_before_ssh,
+                paths_after = ?paths_after_ssh,
+                "target SSH forwarding path and byte counters"
+            );
             stream
                 .finish_send_and_wait()
                 .await
@@ -546,6 +590,13 @@ async fn handle_dial_offer(
             Ok(())
         }
         Err(error) => {
+            tracing::debug!(
+                session = %offer.session_id,
+                error = %error,
+                paths_before = ?paths_before_ssh,
+                paths_after = ?paths_after_ssh,
+                "target SSH forwarding ended with an Iroh path snapshot"
+            );
             let _ = stream.reset();
             Err(error).context("copy SSH data between Iroh and local sshd")
         }
