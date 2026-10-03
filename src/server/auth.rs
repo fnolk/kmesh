@@ -69,6 +69,7 @@ impl AuthRateLimiter {
 pub(crate) struct AuthenticatedUser {
     pub user_id: Uuid,
     pub session_id: Uuid,
+    pub access_expires_at: i64,
 }
 
 pub(crate) async fn password_login(
@@ -422,6 +423,7 @@ pub(crate) async fn authenticate(
     Ok(AuthenticatedUser {
         user_id: claims.sub,
         session_id: claims.sid,
+        access_expires_at: claims.exp as i64,
     })
 }
 

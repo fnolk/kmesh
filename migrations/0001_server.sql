@@ -56,8 +56,7 @@ CREATE TABLE IF NOT EXISTS targets (
     enrollment_token_hash TEXT,
     enrollment_expires_at INTEGER,
     agent_token_hash TEXT UNIQUE,
-    agent_certificate_der BLOB,
-    agent_certificate_fingerprint TEXT,
+    agent_endpoint_id TEXT UNIQUE,
     enrolled_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -110,13 +109,17 @@ CREATE TABLE IF NOT EXISTS tunnel_sessions (
     user_id TEXT NOT NULL REFERENCES users(id),
     auth_session_id TEXT NOT NULL REFERENCES auth_sessions(id),
     target_id TEXT NOT NULL REFERENCES targets(id),
-    client_public_key TEXT NOT NULL,
+    client_endpoint_id TEXT NOT NULL,
+    target_endpoint_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'closed')),
-    selected_path TEXT CHECK (selected_path IN ('quic', 'relay')),
     created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
     activated_at INTEGER,
     closed_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS tunnel_sessions_target_status_idx ON tunnel_sessions(target_id, status);
+CREATE INDEX IF NOT EXISTS tunnel_sessions_client_endpoint_idx ON tunnel_sessions(client_endpoint_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS tunnel_sessions_target_endpoint_idx ON tunnel_sessions(target_endpoint_id, status, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS tunnel_sessions_client_live_idx ON tunnel_sessions(client_endpoint_id) WHERE status IN ('pending', 'active');
 
-INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, unixepoch());
+INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, unixepoch());

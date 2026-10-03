@@ -20,7 +20,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/agent/enroll", post(super::control::enroll))
         .route("/v1/agent/control", get(super::control::agent_control))
         .route("/v1/connect", get(super::control::client_control))
-        .route("/v1/relay", get(super::relay::connect))
+        .route("/v1/transport", get(super::control::transport_info))
         .layer(axum::extract::DefaultBodyLimit::max(96 * 1024))
         .with_state(state)
 }

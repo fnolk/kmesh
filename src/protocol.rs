@@ -1,9 +1,5 @@
-use std::net::SocketAddr;
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-pub const QUIC_STREAM_MAGIC: [u8; 4] = *b"KMS1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoginTokens {
@@ -197,7 +193,7 @@ pub enum AdminResponse {
 pub struct AgentEnrollmentRequest {
     pub target_id: Uuid,
     pub enrollment_token: String,
-    pub certificate_der: Vec<u8>,
+    pub agent_endpoint_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,19 +208,13 @@ pub struct AgentCredentials {
     pub target_id: Uuid,
     pub agent_token: String,
     pub ticket_public_key_pem: String,
-    pub certificate_pem: String,
-    pub private_key_pem: String,
+    pub endpoint_secret_key: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct QuicChallenge {
-    pub nonce: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DirectAuthentication {
-    pub ticket: String,
-    pub signature: String,
+pub struct TransportInfo {
+    pub relay_url: String,
+    pub qad_port: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -243,56 +233,12 @@ pub struct TunnelTicketClaims {
     pub user_id: Uuid,
     pub login_session_id: Uuid,
     pub target_id: Uuid,
-    pub client_public_key: String,
-    pub target_certificate_fingerprint: String,
+    pub client_endpoint_id: String,
+    pub target_endpoint_id: String,
     pub iss: String,
     pub aud: String,
     pub iat: u64,
     pub exp: u64,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PeerRole {
-    Client,
-    Target,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RelayConnectQuery {
-    pub session_id: Uuid,
-    pub peer: PeerRole,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LocalCandidate {
-    pub address: SocketAddr,
-    pub prefix_len: u8,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StunMapping {
-    pub server: SocketAddr,
-    pub mapped: Option<SocketAddr>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NatObservation {
-    pub local_candidates: Vec<LocalCandidate>,
-    pub stun_mappings: Vec<StunMapping>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NatPlan {
-    pub client_remote_candidates: Vec<SocketAddr>,
-    pub target_remote_candidates: Vec<SocketAddr>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SelectedPath {
-    Quic,
-    Relay,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -301,50 +247,35 @@ pub enum ControlMessage {
     Open {
         session_id: Uuid,
         target_id: Uuid,
-        client_public_key: String,
+        client_endpoint_id: String,
     },
     Offer {
         session_id: Uuid,
         target_id: Uuid,
         ticket: String,
-        client_public_key: String,
-        probe_token: String,
-        target_certificate_der: Vec<u8>,
+        client_endpoint_id: String,
+        target_endpoint_addr: iroh::EndpointAddr,
         ticket_public_key_pem: String,
     },
-    Candidates {
-        session_id: Uuid,
-        observation: NatObservation,
+    AgentReady {
+        endpoint_addr: iroh::EndpointAddr,
     },
-    NatPlan {
-        session_id: Uuid,
-        plan: NatPlan,
-    },
-    ProbeSeen {
-        session_id: Uuid,
-        peer: PeerRole,
-        candidate: SocketAddr,
-    },
-    QuicReady {
+    OfferReady {
         session_id: Uuid,
     },
-    SelectRelay {
+    IrohReady {
         session_id: Uuid,
-    },
-    Activate {
-        session_id: Uuid,
-        path: SelectedPath,
+        client_endpoint_id: String,
     },
     Activated {
         session_id: Uuid,
-        path: SelectedPath,
     },
     Error {
         session_id: Option<Uuid>,
         code: String,
         message: String,
     },
-    Cancel {
+    Close {
         session_id: Uuid,
         reason: String,
     },

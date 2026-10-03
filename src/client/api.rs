@@ -10,8 +10,8 @@ use crate::{
     protocol::{
         AdminRequest, AdminResponse, AgentEnrollmentRequest, AgentEnrollmentResponse,
         ControlMessage, LoginTokens, PasswordLoginRequest, PublicKeyChallenge,
-        PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest, RelayConnectQuery,
-        TargetView,
+        PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest, TargetView,
+        TransportInfo,
     },
     transport::{connect_wss, http_client},
 };
@@ -85,6 +85,10 @@ impl Api {
         self.get("targets", Some(access_token)).await
     }
 
+    pub async fn transport_info(&self) -> Result<TransportInfo> {
+        self.get("transport", None).await
+    }
+
     pub async fn admin(&self, access_token: &str, request: &AdminRequest) -> Result<AdminResponse> {
         self.post("admin", request, Some(access_token)).await
     }
@@ -102,15 +106,6 @@ impl Api {
 
     pub async fn agent_control(&self, agent_token: &str) -> Result<WsStream> {
         self.websocket("agent/control", Some(agent_token)).await
-    }
-
-    pub async fn relay(&self, bearer: &str, query: &RelayConnectQuery) -> Result<WsStream> {
-        let peer = match query.peer {
-            crate::protocol::PeerRole::Client => "client",
-            crate::protocol::PeerRole::Target => "target",
-        };
-        let path = format!("relay?session_id={}&peer={peer}", query.session_id);
-        self.websocket(&path, Some(bearer)).await
     }
 
     pub async fn send_control(ws: &mut WsStream, message: &ControlMessage) -> Result<()> {

@@ -4,7 +4,7 @@ mod control;
 mod db;
 mod error;
 mod http;
-mod relay;
+mod iroh;
 #[cfg(test)]
 mod tests;
 
@@ -13,18 +13,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use axum_server::tls_rustls::RustlsConfig;
 use db::Database;
 use identity::{Ed25519PemKeypair, TokenKeySet};
 use rand::random;
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, watch};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::identity;
 
 pub use control::OnlineAgent;
 pub use http::router;
+pub use iroh::IrohServer;
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -33,7 +33,7 @@ pub struct ServerOptions {
     pub bind: SocketAddr,
     pub tls_cert: PathBuf,
     pub tls_key: PathBuf,
-    pub stun_bind: SocketAddr,
+    pub qad_bind: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -48,6 +48,7 @@ pub(crate) struct ServerInner {
     pub auth_rate_limiter: auth::AuthRateLimiter,
     pub online_agents: RwLock<std::collections::HashMap<Uuid, OnlineAgent>>,
     pub tunnels: RwLock<std::collections::HashMap<Uuid, Arc<control::TunnelRuntime>>>,
+    pub transport_info: RwLock<crate::protocol::TransportInfo>,
 }
 
 /// Create the database, token keys and initial management account once.
@@ -96,7 +97,7 @@ pub async fn initialize(
     Ok(())
 }
 
-/// Run HTTPS/WSS and STUN listeners using the persistent server state.
+/// Run the HTTPS API, embedded Iroh relay, and Iroh QAD using persistent server state.
 pub async fn run(options: ServerOptions) -> Result<()> {
     if options.issuer.trim().is_empty() || options.issuer.len() > 512 {
         bail!("configured issuer is invalid");
@@ -114,6 +115,13 @@ pub async fn run(options: ServerOptions) -> Result<()> {
         .context("read persistent server token keys")?;
     let keys = PersistedKeys::from_slice(&key_bytes)?.into_token_keys();
     validate_token_keys(&keys, &options.issuer)?;
+    sqlx::query(
+        "UPDATE tunnel_sessions SET status = 'closed', closed_at = unixepoch() \
+         WHERE status IN ('pending', 'active')",
+    )
+    .execute(&db.pool)
+    .await
+    .context("close sessions from the previous server process")?;
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -123,53 +131,30 @@ pub async fn run(options: ServerOptions) -> Result<()> {
     let state = ServerState {
         inner: Arc::new(ServerInner {
             db,
-            issuer: options.issuer,
+            issuer: options.issuer.clone(),
             keys,
             auth_rate_limiter: auth::AuthRateLimiter::default(),
             online_agents: RwLock::new(std::collections::HashMap::new()),
             tunnels: RwLock::new(std::collections::HashMap::new()),
+            transport_info: RwLock::new(crate::protocol::TransportInfo {
+                relay_url: options.issuer.clone(),
+                qad_port: options.qad_bind.port(),
+            }),
         }),
     };
-    let tls = RustlsConfig::from_pem_file(&options.tls_cert, &options.tls_key)
-        .await
-        .context("load HTTPS certificate and private key")?;
-    let (stun_shutdown_tx, stun_shutdown_rx) = watch::channel(false);
-    let mut stun_task = tokio::spawn(crate::transport::serve_stun(
-        options.stun_bind,
-        stun_shutdown_rx,
-    ));
-
-    let app = router(state);
-    let handle = axum_server::Handle::new();
-    let server_handle = handle.clone();
-    let mut server = tokio::spawn(async move {
-        axum_server::bind_rustls(options.bind, tls)
-            .handle(server_handle)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-    });
-    tokio::select! {
-        result = &mut server => {
-            let _ = stun_shutdown_tx.send(true);
-            stun_task.await.context("join STUN listener")??;
-            result.context("join HTTPS server")??;
-            Ok(())
-        }
-        result = &mut stun_task => {
-            handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-            server.await.context("join HTTPS server")??;
-            result.context("join STUN listener")??;
-            bail!("STUN listener stopped unexpectedly");
-        }
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("wait for shutdown signal")?;
-            handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-            let _ = stun_shutdown_tx.send(true);
-            stun_task.await.context("join STUN listener")??;
-            server.await.context("join HTTPS server")??;
-            Ok(())
-        }
-    }
+    let relay_access: Arc<dyn iroh_relay::server::DynAccessControl> = Arc::new(state.clone());
+    let server = iroh::listen_and_serve(
+        router(state.clone()),
+        relay_access,
+        options.bind,
+        options.qad_bind,
+        &options.tls_cert,
+        &options.tls_key,
+    )
+    .await?;
+    state.inner.transport_info.write().await.qad_port = server.qad_addr().port();
+    tracing::info!(https = %server.https_addr(), qad = %server.qad_addr(), "kmesh HTTPS, Iroh relay, and QAD listeners started");
+    server.run_until_shutdown().await
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -232,8 +217,8 @@ fn validate_token_keys(keys: &TokenKeySet, issuer: &str) -> Result<()> {
         user_id: claims.sub,
         login_session_id: claims.sid,
         target_id: Uuid::new_v4(),
-        client_public_key: String::new(),
-        target_certificate_fingerprint: String::new(),
+        client_endpoint_id: String::new(),
+        target_endpoint_id: String::new(),
         iss: issuer.to_owned(),
         aud: identity::TUNNEL_TICKET_AUDIENCE.to_owned(),
         iat: now,

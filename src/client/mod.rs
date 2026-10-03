@@ -3,7 +3,6 @@ mod agent;
 mod api;
 mod auth;
 mod cli;
-mod nat;
 mod profile;
 mod proxy;
 pub mod ssh_config;
@@ -107,7 +106,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     bind: args.bind,
                     tls_cert: args.tls_cert.clone(),
                     tls_key: args.tls_key.clone(),
-                    stun_bind: args.stun_bind,
+                    qad_bind: args.qad_bind,
                 })
                 .await?;
             }
@@ -170,12 +169,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ssh_config::render(&target, &context.config, context.config_path.as_deref())
             );
         }
-        cli::Command::Diagnose { command } => match command {
-            cli::DiagnoseCommand::Nat(args) => {
-                let (config, _) = load_config(&cli)?;
-                nat::diagnose(&config.stun, &args.stun_servers).await?;
-            }
-        },
         cli::Command::Proxy { target_id } => {
             let context = ClientContext::new(&cli).await?;
             proxy::run(&context, *target_id).await?;

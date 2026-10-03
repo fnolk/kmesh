@@ -1,12 +1,8 @@
-use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
-use serde::de::DeserializeOwned;
-use sha2::{Digest, Sha256};
-use uuid::Uuid;
-
 use crate::protocol::{AccessTokenClaims, TunnelTicketClaims};
+use anyhow::{Context, Result};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use rcgen::{KeyPair, PKCS_ED25519};
+use serde::de::DeserializeOwned;
 
 pub const USER_TOKEN_AUDIENCE: &str = "kmesh-user";
 pub const TUNNEL_TICKET_AUDIENCE: &str = "kmesh-tunnel";
@@ -23,13 +19,6 @@ pub struct TokenKeySet {
     pub tunnel_ticket: Ed25519PemKeypair,
 }
 
-#[derive(Clone, Debug)]
-pub struct TargetCertificate {
-    pub certificate_pem: String,
-    pub private_key_pem: String,
-    pub fingerprint: String,
-}
-
 pub fn generate_ed25519_keypair() -> Result<Ed25519PemKeypair> {
     let key = KeyPair::generate_for(&PKCS_ED25519).context("generate Ed25519 key")?;
     Ok(Ed25519PemKeypair {
@@ -42,24 +31,6 @@ pub fn generate_token_key_set() -> Result<TokenKeySet> {
     Ok(TokenKeySet {
         user_access: generate_ed25519_keypair()?,
         tunnel_ticket: generate_ed25519_keypair()?,
-    })
-}
-
-pub fn generate_target_certificate(target_id: Uuid) -> Result<TargetCertificate> {
-    let dns_name = format!("target-{target_id}.kmesh.invalid");
-    let params = CertificateParams::new(vec![dns_name]).context("build target certificate")?;
-    let key = KeyPair::generate_for(&PKCS_ED25519).context("generate target key")?;
-    let certificate = params
-        .self_signed(&key)
-        .context("self-sign target certificate")?;
-    let fingerprint = format!(
-        "sha256:{}",
-        URL_SAFE_NO_PAD.encode(Sha256::digest(certificate.der()))
-    );
-    Ok(TargetCertificate {
-        certificate_pem: certificate.pem(),
-        private_key_pem: key.serialize_pem(),
-        fingerprint,
     })
 }
 

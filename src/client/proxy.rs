@@ -1,121 +1,179 @@
-use std::{io, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signer, SigningKey};
 use futures_util::StreamExt;
-use rand::rng;
-use sha2::Digest;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    time::{Instant, timeout_at},
-};
+use iroh::{EndpointAddr, SecretKey, endpoint::PathEvent};
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use crate::{
     identity::{TUNNEL_TICKET_AUDIENCE, decode_tunnel_ticket},
-    protocol::{
-        ControlMessage, DirectAuthentication, PeerRole, QuicChallenge, RelayConnectQuery,
-        SelectedPath, TunnelTicketClaims,
-    },
-    transport::{QuicByteStream, QuicConfig, RelayByteStream, TransportError, UdpAttempt},
+    protocol::{ControlMessage, TransportInfo, TunnelTicketClaims},
+    transport::{IrohByteStream, IrohEndpointOptions, IrohPathKind, connect_peer, create_endpoint},
 };
 
 use super::{
     ClientContext,
-    agent::quic_auth_message,
+    agent::ensure_auth,
     api::{Api, WsStream},
-    auth, nat,
+    auth,
 };
 
-const DIRECT_BUDGET: Duration = Duration::from_secs(2);
-const RELAY_SELECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_HANDSHAKE_FRAME: usize = 8192;
+const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_TICKET_FRAME: usize = 8 * 1024;
 
-#[derive(Debug)]
-enum DirectFailure {
-    Network(String),
-    Fatal(anyhow::Error),
-    RelaySelected,
+struct TunnelOffer {
+    ticket: String,
+    target_endpoint_addr: EndpointAddr,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("SSH access authentication failed: {0}")]
+struct SshAuthenticationFailure(String);
 
 pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let access_token = auth::valid_access_token(context).await?;
+    let secret_key = SecretKey::generate();
+    let client_endpoint_id = secret_key.public().to_string();
     let session_id = Uuid::new_v4();
-    let ephemeral = SigningKey::generate(&mut rng());
-    let client_public_key = URL_SAFE_NO_PAD.encode(ephemeral.verifying_key().to_bytes());
-    let mut control = context.api.connect_control(&access_token).await?;
+    let mut control = tokio::time::timeout(
+        CONTROL_CONNECT_TIMEOUT,
+        context.api.connect_control(&access_token),
+    )
+    .await
+    .context("connecting to kmesh control channel timed out")??;
     Api::send_control(
         &mut control,
         &ControlMessage::Open {
             session_id,
             target_id,
-            client_public_key: client_public_key.clone(),
+            client_endpoint_id: client_endpoint_id.clone(),
         },
     )
     .await?;
     let offer = tokio::time::timeout(
-        CONTROL_CONNECT_TIMEOUT,
-        next_offer(&mut control, session_id, target_id, context.api.issuer()),
-    )
-    .await
-    .context("waiting for connection offer timed out")??;
-    let deadline = Instant::now() + DIRECT_BUDGET;
-    let direct = timeout_at(
-        deadline,
-        direct_attempt(
-            context,
+        SESSION_SETUP_TIMEOUT,
+        next_offer(
             &mut control,
-            &offer,
             session_id,
-            &client_public_key,
-            &ephemeral,
-            deadline,
+            target_id,
+            &client_endpoint_id,
+            context.api.issuer(),
         ),
     )
-    .await;
-    match direct {
-        Ok(Ok(mut stream)) => {
-            eprintln!("连接路径：P2P / QUIC");
-            copy_stdio(&mut stream).await
+    .await
+    .context("waiting for target Iroh offer timed out")??;
+    let transport_info = context.api.transport_info().await?;
+    let endpoint = create_endpoint(
+        secret_key,
+        false,
+        endpoint_options(context, transport_info)?,
+    )
+    .await
+    .map_err(anyhow::Error::new)
+    .context("create client Iroh endpoint")?;
+    let connection = tokio::time::timeout(
+        SESSION_SETUP_TIMEOUT,
+        connect_peer(&endpoint, offer.target_endpoint_addr.clone()),
+    )
+    .await
+    .context("connecting to target Iroh endpoint timed out")?
+    .map_err(anyhow::Error::new)
+    .context("connect to target Iroh endpoint")?;
+    let mut stream = IrohByteStream::open_bi(connection)
+        .await
+        .map_err(anyhow::Error::new)
+        .context("open SSH Iroh stream")?;
+    write_ticket(&mut stream, &offer.ticket)
+        .await
+        .context("send signed SSH ticket to target")?;
+    tokio::time::timeout(
+        SESSION_SETUP_TIMEOUT,
+        wait_activated(&mut control, session_id),
+    )
+    .await
+    .context("waiting for SSH activation timed out")??;
+
+    match stream.selected_path() {
+        Some(path) if path.kind == IrohPathKind::Direct => {
+            eprintln!("连接路径：P2P 直连 ({})", path.remote_address);
         }
-        Ok(Err(DirectFailure::Fatal(error))) => Err(error),
-        Ok(Err(DirectFailure::RelaySelected)) => {
-            relay(context, &mut control, &access_token, session_id).await
-        }
-        Ok(Err(DirectFailure::Network(reason))) => {
-            tracing::debug!(session = %session_id, reason = %reason, "direct path unavailable; requesting relay");
-            select_relay(context, &mut control, &access_token, session_id).await
-        }
-        Err(_) => {
-            tracing::debug!(session = %session_id, "direct path deadline reached; requesting relay");
-            select_relay(context, &mut control, &access_token, session_id).await
-        }
+        Some(path) => eprintln!("连接路径：Iroh 中继 ({})", path.remote_address),
+        None => eprintln!("连接已建立；Iroh 正在选择网络路径。"),
     }
+
+    let path_connection = stream.connection().clone();
+    let mut path_events = path_connection.path_events();
+    let path_task = tokio::spawn(async move {
+        while let Some(event) = path_events.next().await {
+            if let PathEvent::Selected { remote_addr, .. } = event {
+                let label = if remote_addr.is_relay() {
+                    "Iroh 中继"
+                } else {
+                    "P2P 直连"
+                };
+                eprintln!("连接路径切换：{label} ({remote_addr})");
+            }
+        }
+    });
+    let copy_result = copy_stdio(&mut stream).await;
+    path_task.abort();
+    let _ = path_task.await;
+    if let Err(error) = copy_result {
+        let _ = stream.reset();
+        let _ = Api::send_control(
+            &mut control,
+            &ControlMessage::Close {
+                session_id,
+                reason: "client_ssh_stream_failed".to_owned(),
+            },
+        )
+        .await;
+        return Err(error).context("copy local SSH stdio over Iroh");
+    }
+    if let Err(error) = Api::send_control(
+        &mut control,
+        &ControlMessage::Close {
+            session_id,
+            reason: "ssh_stream_complete".to_owned(),
+        },
+    )
+    .await
+    {
+        tracing::debug!(session = %session_id, error = %error, "SSH finished after control channel disconnected");
+    }
+    Ok(())
 }
 
-struct OfferData {
-    target_id: Uuid,
-    ticket: String,
-    client_public_key: String,
-    probe_token: [u8; 32],
-    target_certificate_der: Vec<u8>,
-    claims: TunnelTicketClaims,
+fn endpoint_options(context: &ClientContext, info: TransportInfo) -> Result<IrohEndpointOptions> {
+    let relay_url = reqwest::Url::parse(&info.relay_url).context("parse Iroh relay URL")?;
+    let control_origin =
+        reqwest::Url::parse(context.api.issuer()).context("parse configured kmesh server URL")?;
+    anyhow::ensure!(
+        relay_url == control_origin,
+        "Iroh relay URL differs from the configured kmesh server"
+    );
+    Ok(IrohEndpointOptions {
+        relay_url,
+        qad_port: info.qad_port,
+        tls: context.config.tls.clone(),
+    })
 }
 
 async fn next_offer(
     control: &mut WsStream,
     session_id: Uuid,
-    requested_target_id: Uuid,
-    expected_issuer: &str,
-) -> Result<OfferData> {
+    target_id: Uuid,
+    client_endpoint_id: &str,
+    issuer: &str,
+) -> Result<TunnelOffer> {
     loop {
         let message = control
             .next()
             .await
-            .context("control WebSocket ended before offer")?
+            .context("control WebSocket ended before target offer")?
             .context("read control WebSocket")?;
         if matches!(message, Message::Ping(_) | Message::Pong(_)) {
             continue;
@@ -123,38 +181,34 @@ async fn next_offer(
         match Api::control_message(message)? {
             ControlMessage::Offer {
                 session_id: received,
-                target_id,
+                target_id: offered_target,
                 ticket,
-                client_public_key,
-                probe_token,
-                target_certificate_der,
+                client_endpoint_id: offered_client,
+                target_endpoint_addr,
                 ticket_public_key_pem,
             } if received == session_id => {
-                let claims = decode_tunnel_ticket(&ticket, &ticket_public_key_pem, expected_issuer)
-                    .map_err(|error| anyhow!(DirectAuthenticationFailure(error.to_string())))?;
-                let decoded_probe = URL_SAFE_NO_PAD
-                    .decode(&probe_token)
-                    .context("decode UDP probe token")
-                    .map_err(as_auth_failure)?;
-                let probe_token: [u8; 32] = decoded_probe.try_into().map_err(|_| {
-                    anyhow!(DirectAuthenticationFailure(
-                        "UDP probe token must contain 32 bytes".to_owned()
-                    ))
-                })?;
-                let data = OfferData {
-                    target_id,
-                    ticket,
-                    client_public_key,
-                    probe_token,
-                    target_certificate_der,
-                    claims,
-                };
-                validate_offer(&data, session_id)?;
                 ensure_auth(
-                    data.target_id == requested_target_id,
-                    "offer target ID differs from requested target",
+                    offered_target == target_id,
+                    "offer target ID differs from request",
                 )?;
-                return Ok(data);
+                ensure_auth(
+                    offered_client == client_endpoint_id,
+                    "offer client EndpointId differs from this SSH connection",
+                )?;
+                let claims = decode_tunnel_ticket(&ticket, &ticket_public_key_pem, issuer)
+                    .map_err(|error| anyhow!(SshAuthenticationFailure(error.to_string())))?;
+                validate_offer(
+                    &claims,
+                    session_id,
+                    target_id,
+                    client_endpoint_id,
+                    &target_endpoint_addr,
+                    issuer,
+                )?;
+                return Ok(TunnelOffer {
+                    ticket,
+                    target_endpoint_addr,
+                });
             }
             ControlMessage::Error {
                 session_id: Some(received),
@@ -162,525 +216,155 @@ async fn next_offer(
                 message,
             } if received == session_id => {
                 if code == "authentication" || code == "authorization" {
-                    bail!("server rejected SSH access: {message}");
+                    bail!(SshAuthenticationFailure(message));
                 }
                 bail!("server could not prepare SSH access: {message}");
             }
-            _ => tracing::debug!("ignoring unexpected control message before offer"),
+            _ => {
+                tracing::debug!(session = %session_id, "ignoring unexpected control message before target offer")
+            }
         }
     }
 }
 
-fn validate_offer(offer: &OfferData, session_id: Uuid) -> Result<()> {
+fn validate_offer(
+    claims: &TunnelTicketClaims,
+    session_id: Uuid,
+    target_id: Uuid,
+    client_endpoint_id: &str,
+    target_endpoint_addr: &EndpointAddr,
+    self_relay_url: &str,
+) -> Result<()> {
+    let expected_relay: iroh::RelayUrl = reqwest::Url::parse(self_relay_url)
+        .context("parse configured self-relay URL")?
+        .into();
     ensure_auth(
-        offer.claims.session_id == session_id,
+        claims.session_id == session_id,
         "ticket session ID mismatch",
     )?;
+    ensure_auth(claims.target_id == target_id, "ticket target ID mismatch")?;
     ensure_auth(
-        offer.claims.target_id == offer.target_id,
-        "ticket target ID mismatch",
+        claims.client_endpoint_id == client_endpoint_id,
+        "ticket client EndpointId mismatch",
     )?;
     ensure_auth(
-        offer.claims.client_public_key == offer.client_public_key,
-        "ticket client key mismatch",
+        claims.target_endpoint_id == target_endpoint_addr.id.to_string(),
+        "ticket target EndpointId mismatch",
+    )?;
+    let relay_urls = target_endpoint_addr.relay_urls().collect::<Vec<_>>();
+    ensure_auth(
+        relay_urls.len() == 1 && relay_urls[0] == &expected_relay,
+        "target offer does not use the configured private relay",
     )?;
     ensure_auth(
-        offer.claims.aud == TUNNEL_TICKET_AUDIENCE,
+        target_endpoint_addr
+            .addrs
+            .iter()
+            .all(|address| match address {
+                iroh::TransportAddr::Ip(_) => true,
+                iroh::TransportAddr::Relay(url) => url == &expected_relay,
+                iroh::TransportAddr::Custom(_) => false,
+                _ => false,
+            }),
+        "target offer contains an unrecognized transport address",
+    )?;
+    ensure_auth(
+        claims.aud == TUNNEL_TICKET_AUDIENCE,
         "ticket audience mismatch",
     )?;
-    let fingerprint = fingerprint(&offer.target_certificate_der);
     ensure_auth(
-        offer.claims.target_certificate_fingerprint == fingerprint,
-        "ticket target certificate fingerprint mismatch",
-    )
+        claims.exp
+            > std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("system clock is before Unix epoch")?
+                .as_secs(),
+        "ticket has expired",
+    )?;
+    client_endpoint_id
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| {
+            anyhow!(SshAuthenticationFailure(
+                "client EndpointId is invalid".to_owned()
+            ))
+        })?;
+    Ok(())
 }
 
-async fn direct_attempt(
-    context: &ClientContext,
-    control: &mut WsStream,
-    offer: &OfferData,
-    session_id: Uuid,
-    client_public_key: &str,
-    ephemeral: &SigningKey,
-    deadline: Instant,
-) -> std::result::Result<QuicByteStream, DirectFailure> {
-    let started = Instant::now();
-    if offer.client_public_key != client_public_key {
-        return Err(DirectFailure::Fatal(anyhow!(DirectAuthenticationFailure(
-            "offer client key differs from this connection".to_owned(),
-        ))));
-    }
-    let stun = context.config.stun.clone();
-    let destinations = timeout_at(
-        deadline,
-        nat::resolve_stun_destinations(&stun, &context.config.server_url),
-    )
-    .await
-    .map_err(|_| DirectFailure::Network("STUN endpoint resolution timed out".to_owned()))?
-    .map_err(DirectFailure::Fatal)?;
-    let mut bind_config = stun;
-    bind_config.servers.clear();
-    let mut attempt = timeout_at(deadline, UdpAttempt::bind(bind_config))
+async fn write_ticket(stream: &mut IrohByteStream, ticket: &str) -> Result<()> {
+    let bytes = ticket.as_bytes();
+    anyhow::ensure!(
+        bytes.len() <= MAX_TICKET_FRAME,
+        "signed ticket exceeds the handshake frame limit"
+    );
+    stream
+        .write_u32(bytes.len() as u32)
         .await
-        .map_err(|_| DirectFailure::Network("UDP bind timed out".to_owned()))?
-        .map_err(classify_transport)?;
-    let (local_candidates, mappings) =
-        timeout_at(deadline, attempt.gather_observations(&destinations))
-            .await
-            .map_err(|_| DirectFailure::Network("STUN gather timed out".to_owned()))?
-            .map_err(classify_transport)?;
-    let observation = nat::to_nat_observation(local_candidates, mappings);
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), observation = ?observation, "client NAT observations gathered");
-    Api::send_control(
-        control,
-        &ControlMessage::Candidates {
-            session_id,
-            observation,
-        },
-    )
-    .await
-    .map_err(DirectFailure::Fatal)?;
-    let plan = receive_nat_plan(control, session_id, deadline).await?;
-    let remote = plan.client_remote_candidates;
-    if remote.is_empty() {
-        return Err(DirectFailure::Network(
-            "server NAT plan contains no target candidates".to_owned(),
-        ));
-    }
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), client_remote_candidates = ?remote, "client received bounded NAT plan");
-    let probe_result = timeout_at(
-        deadline,
-        attempt.probe(
-            session_id,
-            offer.probe_token,
-            &remote,
-            remaining(deadline).map_err(DirectFailure::Fatal)?,
-        ),
-    )
-    .await
-    .map_err(|_| DirectFailure::Network("UDP hole-punch probe timed out".to_owned()))?
-    .map_err(classify_transport)?;
-    let peer = probe_result.peer_addr;
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client UDP probe complete");
-    Api::send_control(
-        control,
-        &ControlMessage::ProbeSeen {
-            session_id,
-            peer: PeerRole::Client,
-            candidate: peer,
-        },
-    )
-    .await
-    .map_err(DirectFailure::Fatal)?;
-    wait_quic_ready(control, session_id, deadline).await?;
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "target QUIC acceptor ready");
-    let mut stream = timeout_at(
-        deadline,
-        attempt.into_quic_client(
-            offer.target_id,
-            peer,
-            offer.target_certificate_der.clone(),
-            &offer.claims.target_certificate_fingerprint,
-            QuicConfig::default(),
-        ),
-    )
-    .await
-    .map_err(|_| DirectFailure::Network("QUIC connect timed out".to_owned()))?
-    .map_err(classify_transport)?;
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client QUIC stream established");
-    Api::send_control(control, &ControlMessage::QuicReady { session_id })
+        .context("write ticket frame length")?;
+    stream
+        .write_all(bytes)
         .await
-        .map_err(DirectFailure::Fatal)?;
-
-    let challenge: QuicChallenge = timeout_read_frame(
-        &mut stream,
-        remaining(deadline).map_err(DirectFailure::Fatal)?,
-    )
-    .await
-    .map_err(classify_anyhow)?;
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "client QUIC proof sent");
-    let nonce = URL_SAFE_NO_PAD
-        .decode(&challenge.nonce)
-        .context("decode QUIC challenge nonce")
-        .map_err(as_auth_failure)
-        .map_err(DirectFailure::Fatal)?;
-    if nonce.len() != 32 {
-        return Err(DirectFailure::Fatal(anyhow!(DirectAuthenticationFailure(
-            "QUIC challenge nonce must contain 32 bytes".to_owned(),
-        ))));
-    }
-    let signature = ephemeral.sign(&quic_auth_message(&offer.ticket, &challenge.nonce));
-    let authentication = DirectAuthentication {
-        ticket: offer.ticket.clone(),
-        signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
-    };
-    timeout_write_frame(
-        &mut stream,
-        &authentication,
-        remaining(deadline).map_err(DirectFailure::Fatal)?,
-    )
-    .await
-    .map_err(classify_anyhow)?;
-    wait_activated(control, session_id, SelectedPath::Quic, deadline).await?;
-    tracing::debug!(session = %session_id, elapsed_ms = started.elapsed().as_millis(), "direct path activated");
-    Ok(stream)
+        .context("write ticket frame")?;
+    stream.flush().await.context("flush ticket frame")
 }
 
-async fn select_relay(
-    context: &ClientContext,
-    control: &mut WsStream,
-    access_token: &str,
-    session_id: Uuid,
-) -> Result<()> {
-    Api::send_control(control, &ControlMessage::SelectRelay { session_id }).await?;
-    loop {
-        match tokio::time::timeout(RELAY_SELECTION_TIMEOUT, next_control(control))
-            .await
-            .context("server relay selection timed out")??
-        {
-            ControlMessage::SelectRelay {
-                session_id: received,
-            } if received == session_id => break,
-            ControlMessage::Error {
-                session_id: Some(received),
-                code,
-                message,
-            } if received == session_id => {
-                bail!("server rejected relay selection ({code}): {message}");
-            }
-            _ => tracing::debug!("waiting for relay selection"),
-        }
-    }
-    relay(context, control, access_token, session_id).await
-}
-
-async fn relay(
-    context: &ClientContext,
-    control: &mut WsStream,
-    access_token: &str,
-    session_id: Uuid,
-) -> Result<()> {
-    let ws = context
-        .api
-        .relay(
-            access_token,
-            &RelayConnectQuery {
-                session_id,
-                peer: PeerRole::Client,
-            },
-        )
-        .await?;
-    let mut stream = RelayByteStream::from_ws(ws);
-    wait_activated(
-        control,
-        session_id,
-        SelectedPath::Relay,
-        Instant::now() + RELAY_SELECTION_TIMEOUT,
-    )
-    .await
-    .map_err(direct_failure_to_anyhow)?;
-    eprintln!("连接路径：relay");
-    copy_stdio(&mut stream).await
-}
-
-async fn receive_nat_plan(
-    control: &mut WsStream,
-    session_id: Uuid,
-    deadline: Instant,
-) -> std::result::Result<crate::protocol::NatPlan, DirectFailure> {
-    loop {
-        match receive_control_until(control, deadline).await? {
-            ControlMessage::NatPlan {
-                session_id: received,
-                plan,
-            } if received == session_id => return Ok(plan),
-            ControlMessage::SelectRelay {
-                session_id: received,
-            } if received == session_id => return Err(DirectFailure::RelaySelected),
-            ControlMessage::Error {
-                session_id: Some(received),
-                code,
-                message,
-            } if received == session_id => {
-                if code == "network" || code == "timeout" {
-                    return Err(DirectFailure::Network(message));
-                }
-                return Err(DirectFailure::Fatal(anyhow!(
-                    "server rejected connection ({code}): {message}"
-                )));
-            }
-            _ => {}
-        }
-    }
-}
-
-async fn wait_quic_ready(
-    control: &mut super::api::WsStream,
-    session_id: Uuid,
-    deadline: Instant,
-) -> std::result::Result<(), DirectFailure> {
-    loop {
-        match receive_control_until(control, deadline).await? {
-            ControlMessage::QuicReady {
-                session_id: received,
-            } if received == session_id => return Ok(()),
-            ControlMessage::SelectRelay {
-                session_id: received,
-            } if received == session_id => return Err(DirectFailure::RelaySelected),
-            ControlMessage::Error {
-                session_id: Some(received),
-                code,
-                message,
-            } if received == session_id => {
-                if code == "network" || code == "timeout" {
-                    return Err(DirectFailure::Network(message));
-                }
-                return Err(DirectFailure::Fatal(anyhow!(
-                    "server rejected connection ({code}): {message}"
-                )));
-            }
-            _ => {}
-        }
-    }
-}
-
-async fn wait_activated(
-    control: &mut super::api::WsStream,
-    session_id: Uuid,
-    expected: SelectedPath,
-    deadline: Instant,
-) -> std::result::Result<(), DirectFailure> {
-    loop {
-        match receive_control_until(control, deadline).await? {
-            ControlMessage::Activated {
-                session_id: received,
-                path,
-            } if received == session_id => {
-                if path == expected {
-                    return Ok(());
-                }
-                if path == SelectedPath::Relay {
-                    return Err(DirectFailure::RelaySelected);
-                }
-                return Err(DirectFailure::Fatal(anyhow!(
-                    "server activated an unexpected path"
-                )));
-            }
-            ControlMessage::SelectRelay {
-                session_id: received,
-            } if received == session_id => return Err(DirectFailure::RelaySelected),
-            ControlMessage::Error {
-                session_id: Some(received),
-                code,
-                message,
-            } if received == session_id => {
-                if code == "network" || code == "timeout" {
-                    return Err(DirectFailure::Network(message));
-                }
-                return Err(DirectFailure::Fatal(anyhow!(
-                    "server rejected connection ({code}): {message}"
-                )));
-            }
-            _ => {}
-        }
-    }
-}
-
-async fn next_control(control: &mut WsStream) -> Result<ControlMessage> {
+async fn wait_activated(control: &mut WsStream, session_id: Uuid) -> Result<()> {
     loop {
         let message = control
             .next()
             .await
-            .context("control WebSocket ended")?
+            .context("control WebSocket ended before SSH activation")?
             .context("read control WebSocket")?;
         if matches!(message, Message::Ping(_) | Message::Pong(_)) {
             continue;
         }
-        return Api::control_message(message);
+        match Api::control_message(message)? {
+            ControlMessage::Activated {
+                session_id: received,
+            } if received == session_id => return Ok(()),
+            ControlMessage::Error {
+                session_id: Some(received),
+                code,
+                message,
+            } if received == session_id => {
+                if code == "authentication" || code == "authorization" {
+                    bail!(SshAuthenticationFailure(message));
+                }
+                bail!("server rejected SSH session before activation: {message}");
+            }
+            ControlMessage::Close {
+                session_id: received,
+                reason,
+            } if received == session_id => {
+                bail!("server closed SSH session before activation: {reason}");
+            }
+            _ => {
+                tracing::debug!(session = %session_id, "ignoring unexpected control message before activation")
+            }
+        }
     }
 }
 
-async fn receive_control_until(
-    control: &mut WsStream,
-    deadline: Instant,
-) -> std::result::Result<ControlMessage, DirectFailure> {
-    timeout_at(deadline, next_control(control))
-        .await
-        .map_err(|_| DirectFailure::Network("direct path deadline expired".to_owned()))?
-        .map_err(DirectFailure::Fatal)
-}
-
-async fn copy_stdio<S>(stream: &mut S) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut reader, mut writer) = tokio::io::split(stream);
+async fn copy_stdio(stream: &mut IrohByteStream) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let remote_finished = {
-        let to_remote = async {
-            tokio::io::copy(&mut stdin, &mut writer)
-                .await
-                .context("read SSH bytes from stdin")?;
-            writer.shutdown().await.context("finish SSH input stream")
+    {
+        let (mut reader, mut writer) = tokio::io::split(&mut *stream);
+        let upload = async {
+            tokio::io::copy(&mut stdin, &mut writer).await?;
+            writer.shutdown().await
         };
-        let to_stdout = async {
-            tokio::io::copy(&mut reader, &mut stdout)
-                .await
-                .context("write SSH bytes to stdout")?;
-            stdout.flush().await.context("flush SSH stdout")
+        let download = async {
+            tokio::io::copy(&mut reader, &mut stdout).await?;
+            stdout.flush().await
         };
-        tokio::pin!(to_remote, to_stdout);
-        tokio::select! {
-            result = &mut to_remote => {
-                result?;
-                to_stdout.await?;
-                false
-            }
-            result = &mut to_stdout => {
-                result?;
-                true
-            }
-        }
+        tokio::try_join!(upload, download).context("copy bidirectional SSH stdio")?;
     };
-    if remote_finished {
-        writer
-            .shutdown()
-            .await
-            .context("finish SSH input after remote EOF")?;
-    }
-    tracing::debug!(remote_finished, "SSH stdio data copy complete");
+    stream
+        .finish_send_and_wait()
+        .await
+        .context("wait for target to acknowledge final SSH bytes")?;
+    stream
+        .connection()
+        .close(iroh::endpoint::VarInt::from_u32(0), b"ssh session complete");
     Ok(())
-}
-
-async fn timeout_write_frame<W, T>(stream: &mut W, message: &T, duration: Duration) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-    T: serde::Serialize,
-{
-    let payload = serde_json::to_vec(message).context("encode QUIC handshake frame")?;
-    anyhow::ensure!(
-        payload.len() <= MAX_HANDSHAKE_FRAME,
-        "QUIC handshake frame is too large"
-    );
-    tokio::time::timeout(duration, async {
-        stream.write_u32(payload.len() as u32).await?;
-        stream.write_all(&payload).await?;
-        stream.flush().await
-    })
-    .await
-    .context("write QUIC handshake frame timed out")?
-    .context("write QUIC handshake frame")
-}
-
-async fn timeout_read_frame<R, T>(stream: &mut R, duration: Duration) -> Result<T>
-where
-    R: AsyncRead + Unpin,
-    T: for<'de> serde::Deserialize<'de>,
-{
-    tokio::time::timeout(duration, async {
-        let size = stream.read_u32().await? as usize;
-        anyhow::ensure!(
-            size <= MAX_HANDSHAKE_FRAME,
-            "QUIC handshake frame is too large"
-        );
-        let mut frame = vec![0; size];
-        stream.read_exact(&mut frame).await?;
-        serde_json::from_slice(&frame).context("decode QUIC handshake frame")
-    })
-    .await
-    .context("read QUIC handshake frame timed out")?
-}
-
-fn classify_transport(error: TransportError) -> DirectFailure {
-    match error {
-        TransportError::Authentication(_)
-        | TransportError::ProtocolViolation(_)
-        | TransportError::Tls(_) => DirectFailure::Fatal(error.into()),
-        TransportError::Configuration(_) => DirectFailure::Fatal(error.into()),
-        TransportError::Network(_)
-        | TransportError::Timeout(_)
-        | TransportError::Quic(_)
-        | TransportError::Stun(_) => {
-            if error
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("certificate")
-            {
-                DirectFailure::Fatal(error.into())
-            } else {
-                DirectFailure::Network(error.to_string())
-            }
-        }
-        TransportError::WebSocket(_) => DirectFailure::Network(error.to_string()),
-    }
-}
-
-fn classify_anyhow(error: anyhow::Error) -> DirectFailure {
-    if error.chain().any(|cause| {
-        cause
-            .downcast_ref::<TransportError>()
-            .is_some_and(|transport| {
-                matches!(
-                    transport,
-                    TransportError::Authentication(_)
-                        | TransportError::ProtocolViolation(_)
-                        | TransportError::Configuration(_)
-                        | TransportError::Tls(_)
-                )
-            })
-    }) || error.chain().any(|cause| {
-        cause
-            .downcast_ref::<DirectAuthenticationFailure>()
-            .is_some()
-    }) {
-        return DirectFailure::Fatal(error);
-    }
-    if error.chain().any(|cause| {
-        cause.downcast_ref::<io::Error>().is_some()
-            || cause
-                .downcast_ref::<tokio::time::error::Elapsed>()
-                .is_some()
-    }) {
-        DirectFailure::Network(error.to_string())
-    } else {
-        DirectFailure::Fatal(error)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("direct authentication failed: {0}")]
-struct DirectAuthenticationFailure(String);
-
-fn as_auth_failure(error: anyhow::Error) -> anyhow::Error {
-    anyhow!(DirectAuthenticationFailure(error.to_string()))
-}
-
-fn ensure_auth(condition: bool, message: &str) -> Result<()> {
-    if condition {
-        Ok(())
-    } else {
-        Err(anyhow!(DirectAuthenticationFailure(message.to_owned())))
-    }
-}
-
-fn fingerprint(certificate_der: &[u8]) -> String {
-    format!(
-        "sha256:{}",
-        URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(certificate_der))
-    )
-}
-
-fn remaining(deadline: Instant) -> Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .context("direct connection budget expired")
-}
-
-fn direct_failure_to_anyhow(error: DirectFailure) -> anyhow::Error {
-    match error {
-        DirectFailure::Network(message) => anyhow!("network path unavailable: {message}"),
-        DirectFailure::Fatal(error) => error,
-        DirectFailure::RelaySelected => anyhow!("server selected relay path"),
-    }
 }

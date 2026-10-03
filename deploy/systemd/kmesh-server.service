@@ -1,5 +1,5 @@
 [Unit]
-Description=kmesh SSH coordination and relay server
+Description=kmesh SSH coordination, Iroh relay, and QAD server
 After=network-online.target
 Wants=network-online.target
 
@@ -9,11 +9,9 @@ User=kmesh
 Group=kmesh
 StateDirectory=kmesh
 StateDirectoryMode=0700
-ExecStart=/usr/local/bin/kmesh server run --data-dir /var/lib/kmesh --issuer https://kmesh.example.com --bind 0.0.0.0:443 --tls-cert /etc/kmesh/tls.crt --tls-key /etc/kmesh/tls.key --stun-bind 0.0.0.0:3478
+ExecStart=/usr/local/bin/kmesh server run --data-dir /var/lib/kmesh --issuer https://kmesh.example.com:9443 --bind 0.0.0.0:9443 --tls-cert /etc/kmesh/tls.crt --tls-key /etc/kmesh/tls.key --qad-bind 0.0.0.0:3478
 Restart=on-failure
 RestartSec=3s
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

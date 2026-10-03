@@ -45,25 +45,10 @@ pub enum Command {
     SshConfig {
         target: String,
     },
-    Diagnose {
-        #[command(subcommand)]
-        command: DiagnoseCommand,
-    },
     Proxy {
         target_id: Uuid,
     },
     Admin(AdminArgs),
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DiagnoseCommand {
-    Nat(NatDiagnoseArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct NatDiagnoseArgs {
-    #[arg(long = "stun", required = true)]
-    pub stun_servers: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -86,14 +71,14 @@ pub struct ServerInitArgs {
 pub struct ServerRunArgs {
     #[arg(long)]
     pub issuer: String,
-    #[arg(long, default_value = "0.0.0.0:443")]
+    #[arg(long, default_value = "0.0.0.0:9443")]
     pub bind: SocketAddr,
     #[arg(long)]
     pub tls_cert: PathBuf,
     #[arg(long)]
     pub tls_key: PathBuf,
     #[arg(long, default_value = "0.0.0.0:3478")]
-    pub stun_bind: SocketAddr,
+    pub qad_bind: SocketAddr,
 }
 
 #[derive(Debug, Subcommand)]

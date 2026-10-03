@@ -31,6 +31,23 @@ impl Database {
     }
 
     pub async fn apply_schema(&self) -> Result<()> {
+        let schema_table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if schema_table_exists != 0 {
+            let version =
+                sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM schema_migrations")
+                    .fetch_one(&self.pool)
+                    .await?;
+            if let Some(version) = version {
+                anyhow::ensure!(
+                    version == 2,
+                    "server database schema version {version} requires a fresh data directory"
+                );
+            }
+        }
         sqlx::raw_sql(include_str!("../../migrations/0001_server.sql"))
             .execute(&self.pool)
             .await
@@ -157,24 +174,34 @@ impl Database {
         Ok(found != 0)
     }
 
-    pub async fn target_certificate(
-        &self,
-        target_id: uuid::Uuid,
-    ) -> Result<Option<(Vec<u8>, String)>> {
-        let row = sqlx::query(
-            "SELECT agent_certificate_der, agent_certificate_fingerprint FROM targets \
+    pub async fn target_endpoint_id(&self, target_id: uuid::Uuid) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT agent_endpoint_id FROM targets \
              WHERE id = ?1 AND enabled = 1 AND deleted_at IS NULL AND agent_token_hash IS NOT NULL",
         )
         .bind(target_id.to_string())
         .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn endpoint_can_use_relay(&self, endpoint_id: &str) -> Result<bool> {
+        let now = unix_time();
+        let found = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(\
+                SELECT 1 FROM targets \
+                WHERE agent_endpoint_id = ?1 AND enabled = 1 AND deleted_at IS NULL \
+                  AND agent_token_hash IS NOT NULL\
+             ) OR EXISTS(\
+                SELECT 1 FROM tunnel_sessions \
+                WHERE (client_endpoint_id = ?1 OR target_endpoint_id = ?1) \
+                  AND (status = 'active' OR (status = 'pending' AND expires_at > ?2))\
+             )",
+        )
+        .bind(endpoint_id)
+        .bind(now)
+        .fetch_one(&self.pool)
         .await?;
-        row.map(|row| {
-            Ok((
-                row.try_get("agent_certificate_der")?,
-                row.try_get("agent_certificate_fingerprint")?,
-            ))
-        })
-        .transpose()
+        Ok(found != 0)
     }
 }
 

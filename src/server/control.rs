@@ -1,90 +1,93 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-
-use axum::extract::{
-    State,
-    ws::{Message, WebSocket, WebSocketUpgrade},
+use std::{
+    sync::Arc,
+    sync::atomic::{AtomicI64, Ordering},
+    time::Duration,
 };
-use axum::http::HeaderMap;
-use axum::response::Response;
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::VerifyingKey;
+
+use axum::{
+    extract::{
+        State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::HeaderMap,
+    response::Response,
+};
 use futures_util::{SinkExt, StreamExt};
+use iroh::{EndpointAddr, RelayUrl, TransportAddr};
 use sqlx::Row;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-use crate::identity::{self, TUNNEL_TICKET_AUDIENCE};
-use crate::protocol::{
-    AgentEnrollmentRequest, AgentEnrollmentResponse, ControlMessage, LocalCandidate,
-    NatObservation, NatPlan, PeerRole, SelectedPath, StunMapping, TunnelTicketClaims,
+use crate::{
+    identity::{self, TUNNEL_TICKET_AUDIENCE},
+    protocol::{
+        AgentEnrollmentRequest, AgentEnrollmentResponse, ControlMessage, TunnelTicketClaims,
+    },
 };
 
-use super::auth::{AuthenticatedUser, authenticate, bearer_token};
-use super::db::{row_uuid, unix_time};
-use super::error::ApiError;
-use super::{ServerState, hash_secret, new_secret};
+use super::{
+    ServerState,
+    auth::{AuthenticatedUser, authenticate, bearer_token},
+    db::{row_uuid, unix_time},
+    error::ApiError,
+    hash_secret,
+};
 
-const DIRECT_TICKET_TTL_SECS: i64 = 60;
-const PENDING_TUNNEL_TTL_SECS: u64 = 65;
-const MAX_NAT_LOCAL_CANDIDATES: usize = 128;
-const MAX_NAT_STUN_MAPPINGS: usize = 16;
-const MAX_NAT_PLAN_CANDIDATES: usize = 8;
+const TICKET_TTL_SECS: i64 = 60;
+const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct OnlineAgent {
     pub(crate) connection_id: Uuid,
     pub(crate) sender: mpsc::Sender<ControlMessage>,
+    pub(crate) endpoint_addr: Option<EndpointAddr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TunnelPhase {
     Pending,
-    RelaySelected,
-    Active(SelectedPath),
+    Active,
     Closed,
-}
-
-pub(crate) struct TunnelState {
-    pub phase: TunnelPhase,
-    pub client_quic_ready: bool,
-    pub target_quic_ready: bool,
-    client_nat_observation: Option<NatObservation>,
-    target_nat_observation: Option<NatObservation>,
-    nat_plan_sent: bool,
 }
 
 pub(crate) struct TunnelRuntime {
     pub session_id: Uuid,
     pub user_id: Uuid,
     pub auth_session_id: Uuid,
+    pub access_expires_at: i64,
     pub target_id: Uuid,
     pub target_connection_id: Uuid,
+    pub client_endpoint_id: String,
+    pub target_endpoint_id: String,
+    pub offer: ControlMessage,
     pub client_sender: mpsc::Sender<ControlMessage>,
     pub target_sender: mpsc::Sender<ControlMessage>,
-    pub state: Mutex<TunnelState>,
-    pub phase_tx: watch::Sender<TunnelPhase>,
-    pub relay_slots: Mutex<super::relay::RelaySlots>,
+    pub phase: Mutex<TunnelPhase>,
     pub expires_at: i64,
+}
+
+pub(crate) async fn transport_info(
+    State(state): State<ServerState>,
+) -> axum::Json<crate::protocol::TransportInfo> {
+    axum::Json(state.inner.transport_info.read().await.clone())
 }
 
 pub(crate) async fn enroll(
     State(state): State<ServerState>,
     axum::Json(request): axum::Json<AgentEnrollmentRequest>,
 ) -> Result<axum::Json<AgentEnrollmentResponse>, ApiError> {
-    if request.enrollment_token.len() > 256 || request.certificate_der.len() > 64 * 1024 {
+    if request.enrollment_token.len() > 256 {
         return Err(ApiError::bad_request("enrollment request is too large"));
     }
-    if request.certificate_der.is_empty() {
-        return Err(ApiError::bad_request("agent certificate is empty"));
-    }
-    validate_certificate_der(&request.certificate_der)?;
+    let endpoint_id = request
+        .agent_endpoint_id
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| ApiError::bad_request("agent EndpointId is invalid"))?
+        .to_string();
     let token_hash = hash_secret(&request.enrollment_token);
     let now = unix_time();
-    let agent_token = new_secret();
+    let agent_token = super::new_secret();
     let agent_token_hash = hash_secret(&agent_token);
-    let fingerprint = certificate_fingerprint(&request.certificate_der);
     let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
     let target = sqlx::query(
         "SELECT enrollment_token_hash, enrollment_expires_at, enabled, deleted_at FROM targets WHERE id = ?1",
@@ -106,13 +109,11 @@ pub(crate) async fn enroll(
     }
     let changed = sqlx::query(
         "UPDATE targets SET enrollment_token_hash = NULL, enrollment_expires_at = NULL, \
-             agent_token_hash = ?1, agent_certificate_der = ?2, agent_certificate_fingerprint = ?3, \
-             enrolled_at = ?4, updated_at = ?4 WHERE id = ?5 AND enrollment_token_hash = ?6 \
-             AND enrollment_expires_at > ?4 AND enabled = 1",
+             agent_token_hash = ?1, agent_endpoint_id = ?2, enrolled_at = ?3, updated_at = ?3 \
+         WHERE id = ?4 AND enrollment_token_hash = ?5 AND enrollment_expires_at > ?3 AND enabled = 1",
     )
     .bind(agent_token_hash)
-    .bind(&request.certificate_der)
-    .bind(fingerprint)
+    .bind(&endpoint_id)
     .bind(now)
     .bind(request.target_id.to_string())
     .bind(token_hash)
@@ -136,8 +137,8 @@ pub(crate) async fn client_control(
 ) -> Result<Response, ApiError> {
     let user = authenticate(&state, &headers).await?;
     Ok(ws
-        .max_message_size(256 * 1024)
-        .max_frame_size(256 * 1024)
+        .max_message_size(MAX_CONTROL_MESSAGE)
+        .max_frame_size(MAX_CONTROL_MESSAGE)
         .on_upgrade(move |socket| run_client_control(state, user, socket)))
 }
 
@@ -148,8 +149,8 @@ pub(crate) async fn agent_control(
 ) -> Result<Response, ApiError> {
     let target_id = authenticate_agent(&state, &headers).await?;
     Ok(ws
-        .max_message_size(256 * 1024)
-        .max_frame_size(256 * 1024)
+        .max_message_size(MAX_CONTROL_MESSAGE)
+        .max_frame_size(MAX_CONTROL_MESSAGE)
         .on_upgrade(move |socket| run_agent_control(state, target_id, socket)))
 }
 
@@ -169,13 +170,13 @@ pub(crate) async fn authenticate_agent(
 }
 
 async fn run_client_control(state: ServerState, user: AuthenticatedUser, socket: WebSocket) {
-    let (sender, receiver) = mpsc::channel(128);
+    let (sender, receiver) = mpsc::channel(64);
     let (mut sink, mut stream) = socket.split();
     let last_pong = Arc::new(AtomicI64::new(unix_time()));
     let writer_last_pong = last_pong.clone();
     let mut writer = tokio::spawn(async move {
         let mut receiver = receiver;
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
+        let mut ticker = tokio::time::interval(Duration::from_secs(20));
         ticker.tick().await;
         loop {
             tokio::select! {
@@ -199,7 +200,7 @@ async fn run_client_control(state: ServerState, user: AuthenticatedUser, socket:
             message = stream.next() => match message {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<ControlMessage>(text.as_str()) {
                     Ok(message) => handle_client_message(&state, user, &sender, message).await,
-                    Err(_) => send_error(&sender, None, "invalid_message", "invalid control message".to_owned()).await,
+                    Err(_) => send_error(&sender, None, "invalid_message", "invalid control message").await,
                 },
                 Some(Ok(Message::Pong(_))) => { last_pong.store(unix_time(), Ordering::Relaxed); }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -209,12 +210,12 @@ async fn run_client_control(state: ServerState, user: AuthenticatedUser, socket:
         }
     }
     writer.abort();
-    close_pending_user_tunnels(&state, user.user_id, user.session_id, &sender).await;
+    close_pending_user_tunnels(&state, user.user_id, user.session_id).await;
 }
 
 async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocket) {
     let connection_id = Uuid::new_v4();
-    let (sender, mut receiver) = mpsc::channel(128);
+    let (sender, mut receiver) = mpsc::channel(64);
     {
         let mut online = state.inner.online_agents.write().await;
         if online.contains_key(&target_id) {
@@ -228,6 +229,7 @@ async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocke
             OnlineAgent {
                 connection_id,
                 sender,
+                endpoint_addr: None,
             },
         );
     }
@@ -235,7 +237,7 @@ async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocke
     let last_pong = Arc::new(AtomicI64::new(unix_time()));
     let writer_last_pong = last_pong.clone();
     let mut writer = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
+        let mut ticker = tokio::time::interval(Duration::from_secs(20));
         ticker.tick().await;
         loop {
             tokio::select! {
@@ -275,104 +277,37 @@ async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocke
 async fn handle_client_message(
     state: &ServerState,
     user: AuthenticatedUser,
-    client_sender: &mpsc::Sender<ControlMessage>,
+    sender: &mpsc::Sender<ControlMessage>,
     message: ControlMessage,
 ) {
     match message {
         ControlMessage::Open {
             session_id,
             target_id,
-            client_public_key,
+            client_endpoint_id,
         } => {
             if let Err(error) = open_tunnel(
                 state,
                 user,
-                client_sender,
+                sender,
                 session_id,
                 target_id,
-                client_public_key,
+                client_endpoint_id,
             )
             .await
             {
-                send_error(
-                    client_sender,
-                    Some(session_id),
-                    "open_denied",
-                    error.to_string(),
-                )
-                .await;
+                send_error(sender, Some(session_id), "open_denied", &error.to_string()).await;
             }
         }
-        ControlMessage::Candidates {
-            session_id,
-            observation,
-        } => {
-            if !valid_nat_observation(&observation) {
-                send_error(
-                    client_sender,
-                    Some(session_id),
-                    "invalid_candidates",
-                    "NAT observation is invalid".to_owned(),
-                )
-                .await;
-                return;
-            }
-            if let Err(error) = submit_nat_observation(
-                state,
-                session_id,
-                Endpoint::Client(user),
-                Some(client_sender),
-                observation,
-            )
-            .await
-            {
-                send_error(
-                    client_sender,
-                    Some(session_id),
-                    "invalid_candidates",
-                    error.to_owned(),
-                )
-                .await;
-            }
-        }
-        ControlMessage::ProbeSeen {
-            session_id,
-            peer: PeerRole::Client,
-            candidate,
-        } if valid_candidate(candidate) => {
-            route_client_message(
-                state,
-                user,
-                session_id,
-                ControlMessage::ProbeSeen {
-                    session_id,
-                    peer: PeerRole::Client,
-                    candidate,
-                },
-            )
-            .await;
-        }
-        ControlMessage::QuicReady { session_id } => {
-            route_quic_ready(
-                state,
-                session_id,
-                Endpoint::Client(user),
-                ControlMessage::QuicReady { session_id },
-            )
-            .await;
-        }
-        ControlMessage::SelectRelay { session_id } => {
-            select_relay(state, session_id, Endpoint::Client(user)).await;
-        }
-        ControlMessage::Cancel { session_id, reason } => {
-            cancel_tunnel(state, session_id, Endpoint::Client(user), reason).await;
+        ControlMessage::Close { session_id, reason } if reason.len() <= 512 => {
+            close_from_client(state, session_id, user).await;
         }
         _ => {
             send_error(
-                client_sender,
+                sender,
                 None,
                 "invalid_direction",
-                "message is not valid from a client".to_owned(),
+                "message is not valid from a client",
             )
             .await
         }
@@ -386,100 +321,46 @@ async fn handle_agent_message(
     message: ControlMessage,
 ) {
     match message {
-        ControlMessage::Candidates {
-            session_id,
-            observation,
-        } => {
-            if !valid_nat_observation(&observation) {
-                send_agent_error(
-                    state,
-                    target_id,
-                    connection_id,
-                    Some(session_id),
-                    "invalid_candidates",
-                    "NAT observation is invalid",
-                )
-                .await;
-                return;
-            }
-            if let Err(error) = submit_nat_observation(
-                state,
-                session_id,
-                Endpoint::Target {
-                    target_id,
-                    connection_id,
-                },
-                None,
-                observation,
-            )
-            .await
+        ControlMessage::AgentReady { endpoint_addr } => {
+            if let Err(error) =
+                register_agent_endpoint(state, target_id, connection_id, endpoint_addr).await
             {
                 send_agent_error(
                     state,
                     target_id,
                     connection_id,
-                    Some(session_id),
-                    "invalid_candidates",
-                    error,
+                    None,
+                    "endpoint_mismatch",
+                    &error.to_string(),
                 )
                 .await;
             }
         }
-        ControlMessage::ProbeSeen {
+        ControlMessage::OfferReady { session_id } => {
+            send_offer_to_client(state, target_id, connection_id, session_id).await;
+        }
+        ControlMessage::IrohReady {
             session_id,
-            peer: PeerRole::Target,
-            candidate,
-        } if valid_candidate(candidate) => {
-            route_agent_message(
+            client_endpoint_id,
+        } => {
+            activate_tunnel(
                 state,
                 target_id,
                 connection_id,
                 session_id,
-                ControlMessage::ProbeSeen {
-                    session_id,
-                    peer: PeerRole::Target,
-                    candidate,
-                },
+                client_endpoint_id,
             )
             .await;
         }
-        ControlMessage::QuicReady { session_id } => {
-            route_quic_ready(
-                state,
-                session_id,
-                Endpoint::Target {
-                    target_id,
-                    connection_id,
-                },
-                ControlMessage::QuicReady { session_id },
-            )
-            .await;
+        ControlMessage::Close { session_id, reason } if reason.len() <= 512 => {
+            close_from_target(state, session_id, target_id, connection_id).await;
         }
-        ControlMessage::SelectRelay { session_id } => {
-            select_relay(
-                state,
-                session_id,
-                Endpoint::Target {
-                    target_id,
-                    connection_id,
-                },
-            )
-            .await;
-        }
-        ControlMessage::Activate { session_id, path } => {
-            activate_path(state, target_id, connection_id, session_id, path).await;
-        }
-        ControlMessage::Cancel { session_id, reason } => {
-            cancel_tunnel(
-                state,
-                session_id,
-                Endpoint::Target {
-                    target_id,
-                    connection_id,
-                },
-                reason,
-            )
-            .await;
+        ControlMessage::Error {
+            session_id: Some(session_id),
+            code,
+            message,
+        } => {
+            fail_from_target(state, session_id, target_id, connection_id, code, message).await;
         }
         _ => {
             send_agent_error(
@@ -495,32 +376,24 @@ async fn handle_agent_message(
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum Endpoint {
-    Client(AuthenticatedUser),
-    Target {
-        target_id: Uuid,
-        connection_id: Uuid,
-    },
-}
-
 pub(super) async fn open_tunnel(
     state: &ServerState,
     user: AuthenticatedUser,
     client_sender: &mpsc::Sender<ControlMessage>,
     session_id: Uuid,
     target_id: Uuid,
-    client_public_key: String,
+    client_endpoint_id: String,
 ) -> Result<(), ApiError> {
-    let key_bytes = URL_SAFE_NO_PAD
-        .decode(client_public_key.as_bytes())
-        .map_err(|_| ApiError::bad_request("client ephemeral key is invalid"))?;
-    let key_array: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| ApiError::bad_request("client ephemeral key is invalid"))?;
-    VerifyingKey::from_bytes(&key_array)
-        .map_err(|_| ApiError::bad_request("client ephemeral key is invalid"))?;
-
+    let client_endpoint_id = client_endpoint_id
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| ApiError::bad_request("client EndpointId is invalid"))?
+        .to_string();
+    let target_endpoint_id = state
+        .inner
+        .db
+        .target_endpoint_id(target_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("target agent is not enrolled"))?;
     let target_agent = state
         .inner
         .online_agents
@@ -528,77 +401,99 @@ pub(super) async fn open_tunnel(
         .await
         .get(&target_id)
         .cloned()
+        .filter(|agent| agent.endpoint_addr.is_some())
         .ok_or_else(|| ApiError::not_found("target is offline"))?;
-    let (target_certificate_der, target_certificate_fingerprint) = state
-        .inner
-        .db
-        .target_certificate(target_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("target agent is not enrolled"))?;
+    let target_endpoint_addr = target_agent.endpoint_addr.clone().expect("filtered above");
+    if target_endpoint_addr.id.to_string() != target_endpoint_id {
+        return Err(ApiError::conflict(
+            "target EndpointId changed while opening the SSH session",
+        ));
+    }
+
     let now = unix_time();
-    let expires_at = now + DIRECT_TICKET_TTL_SECS;
-    let probe_token = new_secret();
-    let ticket_claims = TunnelTicketClaims {
+    let expires_at = (now + TICKET_TTL_SECS).min(user.access_expires_at);
+    if expires_at <= now {
+        return Err(ApiError::unauthorized());
+    }
+    let claims = TunnelTicketClaims {
         session_id,
         user_id: user.user_id,
         login_session_id: user.session_id,
         target_id,
-        client_public_key: client_public_key.clone(),
-        target_certificate_fingerprint,
+        client_endpoint_id: client_endpoint_id.clone(),
+        target_endpoint_id: target_endpoint_id.clone(),
         iss: state.inner.issuer.clone(),
         aud: TUNNEL_TICKET_AUDIENCE.to_owned(),
         iat: now as u64,
         exp: expires_at as u64,
     };
-    let ticket = identity::encode_tunnel_ticket(
-        &ticket_claims,
-        &state.inner.keys.tunnel_ticket.private_key_pem,
-    )
-    .map_err(ApiError::from)?;
-    let mut sessions = state.inner.tunnels.write().await;
-    if sessions.contains_key(&session_id) {
-        return Err(ApiError::conflict("tunnel session already exists"));
-    }
+    let ticket =
+        identity::encode_tunnel_ticket(&claims, &state.inner.keys.tunnel_ticket.private_key_pem)
+            .map_err(ApiError::from)?;
+
     let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
-    if !authorized_for_target(&mut tx, user, target_id).await? {
+    if !authorized_for_target(&mut tx, user, target_id, &target_endpoint_id, now).await? {
         return Err(ApiError::forbidden());
     }
     sqlx::query(
-        "INSERT INTO tunnel_sessions(id, user_id, auth_session_id, target_id, client_public_key, status, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+        "INSERT INTO tunnel_sessions(\
+             id, user_id, auth_session_id, target_id, client_endpoint_id, target_endpoint_id, \
+             status, created_at, expires_at\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
     )
     .bind(session_id.to_string())
     .bind(user.user_id.to_string())
     .bind(user.session_id.to_string())
     .bind(target_id.to_string())
-    .bind(&client_public_key)
+    .bind(&client_endpoint_id)
+    .bind(&target_endpoint_id)
     .bind(now)
+    .bind(expires_at)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|error| {
+        if matches!(&error, sqlx::Error::Database(database) if database.is_unique_violation()) {
+            ApiError::conflict("client EndpointId already has a pending or active SSH session")
+        } else {
+            ApiError::from(error)
+        }
+    })?;
     tx.commit().await?;
-    let runtime = Arc::new(TunnelRuntime::new(
-        session_id,
-        user,
-        target_id,
-        target_agent.connection_id,
-        client_sender.clone(),
-        target_agent.sender.clone(),
-        expires_at,
-    ));
-    sessions.insert(session_id, runtime.clone());
-    drop(sessions);
 
-    let offer = ControlMessage::Offer {
+    let runtime = Arc::new(TunnelRuntime {
         session_id,
+        user_id: user.user_id,
+        auth_session_id: user.session_id,
+        access_expires_at: user.access_expires_at,
         target_id,
-        ticket,
-        client_public_key,
-        probe_token,
-        target_certificate_der,
-        ticket_public_key_pem: state.inner.keys.tunnel_ticket.public_key_pem.clone(),
-    };
-    if runtime.target_sender.send(offer.clone()).await.is_err()
-        || runtime.client_sender.send(offer).await.is_err()
+        target_connection_id: target_agent.connection_id,
+        client_endpoint_id: client_endpoint_id.clone(),
+        target_endpoint_id,
+        offer: ControlMessage::Offer {
+            session_id,
+            target_id,
+            ticket,
+            client_endpoint_id,
+            target_endpoint_addr,
+            ticket_public_key_pem: state.inner.keys.tunnel_ticket.public_key_pem.clone(),
+        },
+        client_sender: client_sender.clone(),
+        target_sender: target_agent.sender.clone(),
+        phase: Mutex::new(TunnelPhase::Pending),
+        expires_at,
+    });
+    state
+        .inner
+        .tunnels
+        .write()
+        .await
+        .insert(session_id, runtime.clone());
+
+    if runtime
+        .target_sender
+        .send(runtime.offer.clone())
+        .await
+        .is_err()
     {
         close_tunnel(state, &runtime, "peer control connection closed").await;
         return Err(ApiError::conflict("peer control connection closed"));
@@ -607,11 +502,48 @@ pub(super) async fn open_tunnel(
     Ok(())
 }
 
+async fn send_offer_to_client(
+    state: &ServerState,
+    target_id: Uuid,
+    connection_id: Uuid,
+    session_id: Uuid,
+) {
+    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+    let Some(runtime) = runtime else {
+        return;
+    };
+    if runtime.target_id != target_id
+        || runtime.target_connection_id != connection_id
+        || *runtime.phase.lock().await != TunnelPhase::Pending
+        || runtime.expires_at <= unix_time()
+    {
+        return;
+    }
+    if runtime
+        .client_sender
+        .send(runtime.offer.clone())
+        .await
+        .is_err()
+    {
+        close_tunnel(
+            state,
+            &runtime,
+            "client control connection closed before offer",
+        )
+        .await;
+    }
+}
+
 async fn authorized_for_target(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     user: AuthenticatedUser,
     target_id: Uuid,
+    target_endpoint_id: &str,
+    now: i64,
 ) -> Result<bool, ApiError> {
+    if user.access_expires_at <= now {
+        return Ok(false);
+    }
     let allowed = sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS(SELECT 1 FROM users u \
          JOIN auth_sessions s ON s.user_id = u.id \
@@ -619,355 +551,97 @@ async fn authorized_for_target(
          JOIN target_permissions tp ON tp.role_id = ur.role_id \
          JOIN targets t ON t.id = tp.target_id \
          WHERE u.id = ?1 AND u.enabled = 1 AND s.id = ?2 AND s.revoked_at IS NULL \
-           AND s.refresh_expires_at >= ?3 AND t.id = ?4 AND t.enabled = 1 AND t.deleted_at IS NULL \
+           AND s.refresh_expires_at > ?3 AND t.id = ?4 AND t.enabled = 1 \
+           AND t.deleted_at IS NULL AND t.agent_endpoint_id = ?5 \
            AND tp.permission = 'ssh_connect')",
     )
     .bind(user.user_id.to_string())
     .bind(user.session_id.to_string())
-    .bind(unix_time())
+    .bind(now)
     .bind(target_id.to_string())
+    .bind(target_endpoint_id)
     .fetch_one(&mut **tx)
     .await?;
     Ok(allowed != 0)
 }
 
-pub(super) async fn submit_nat_observation(
+async fn register_agent_endpoint(
     state: &ServerState,
-    session_id: Uuid,
-    endpoint: Endpoint,
-    client_sender: Option<&mpsc::Sender<ControlMessage>>,
-    observation: NatObservation,
-) -> Result<(), &'static str> {
-    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
-    let Some(runtime) = runtime else {
-        return Ok(());
-    };
-    let endpoint_matches = match endpoint {
-        Endpoint::Client(user) => {
-            runtime.user_id == user.user_id
-                && runtime.auth_session_id == user.session_id
-                && client_sender.is_some_and(|sender| runtime.client_sender.same_channel(sender))
-        }
-        Endpoint::Target {
-            target_id,
-            connection_id,
-        } => runtime.target_id == target_id && runtime.target_connection_id == connection_id,
-    };
-    if !endpoint_matches {
-        return Ok(());
+    target_id: Uuid,
+    connection_id: Uuid,
+    endpoint_addr: EndpointAddr,
+) -> Result<(), ApiError> {
+    let endpoint_id = state
+        .inner
+        .db
+        .target_endpoint_id(target_id)
+        .await?
+        .ok_or_else(ApiError::unauthorized)?;
+    let expected_relay_url: RelayUrl =
+        reqwest::Url::parse(&state.inner.transport_info.read().await.relay_url)
+            .expect("configured relay URL is a validated HTTPS origin")
+            .into();
+    let relay_urls = endpoint_addr.relay_urls().collect::<Vec<_>>();
+    if endpoint_addr.id.to_string() != endpoint_id
+        || endpoint_addr.ip_addrs().count() > 32
+        || relay_urls.len() != 1
+        || relay_urls[0] != &expected_relay_url
+        || endpoint_addr.addrs.iter().any(|address| match address {
+            TransportAddr::Ip(_) => false,
+            TransportAddr::Relay(url) => url != &expected_relay_url,
+            TransportAddr::Custom(_) => true,
+            _ => true,
+        })
+    {
+        return Err(ApiError::unauthorized());
     }
-
-    let plan = {
-        let mut tunnel_state = runtime.state.lock().await;
-        if tunnel_state.phase != TunnelPhase::Pending {
-            return Ok(());
-        }
-        let observation_slot = match endpoint {
-            Endpoint::Client(_) => &mut tunnel_state.client_nat_observation,
-            Endpoint::Target { .. } => &mut tunnel_state.target_nat_observation,
-        };
-        if observation_slot.is_some() {
-            return Err("NAT observation was already submitted");
-        }
-        *observation_slot = Some(observation);
-        let plan = if tunnel_state.nat_plan_sent {
-            None
-        } else {
-            tunnel_state
-                .client_nat_observation
-                .as_ref()
-                .zip(tunnel_state.target_nat_observation.as_ref())
-                .map(|(client, target)| build_nat_plan(client, target))
-        };
-        if plan.is_some() {
-            tunnel_state.nat_plan_sent = true;
-        }
-        plan
-    };
-
-    if let Some(plan) = plan {
-        let message = ControlMessage::NatPlan { session_id, plan };
-        if runtime.client_sender.send(message.clone()).await.is_err()
-            || runtime.target_sender.send(message).await.is_err()
-        {
-            close_tunnel(
-                state,
-                &runtime,
-                "control connection closed while sending NAT plan",
-            )
-            .await;
-        }
-    }
+    let mut online = state.inner.online_agents.write().await;
+    let agent = online
+        .get_mut(&target_id)
+        .filter(|agent| agent.connection_id == connection_id)
+        .ok_or_else(ApiError::unauthorized)?;
+    agent.endpoint_addr = Some(endpoint_addr);
     Ok(())
 }
 
-pub(super) fn valid_nat_observation(observation: &NatObservation) -> bool {
-    observation.local_candidates.len() <= MAX_NAT_LOCAL_CANDIDATES
-        && observation.stun_mappings.len() <= MAX_NAT_STUN_MAPPINGS
-        && (!observation.local_candidates.is_empty() || !observation.stun_mappings.is_empty())
-        && observation.local_candidates.iter().all(|candidate| {
-            valid_candidate(candidate.address)
-                && match candidate.address.ip() {
-                    std::net::IpAddr::V4(_) => candidate.prefix_len <= 32,
-                    std::net::IpAddr::V6(_) => candidate.prefix_len <= 128,
-                }
-        })
-        && observation.stun_mappings.iter().all(|mapping| {
-            valid_candidate(mapping.server) && mapping.mapped.is_none_or(valid_candidate)
-        })
-}
-
-pub(super) fn build_nat_plan(client: &NatObservation, target: &NatObservation) -> NatPlan {
-    NatPlan {
-        client_remote_candidates: remote_candidates(client, target),
-        target_remote_candidates: remote_candidates(target, client),
-    }
-}
-
-fn remote_candidates(local: &NatObservation, remote: &NatObservation) -> Vec<std::net::SocketAddr> {
-    let mut candidates = Vec::with_capacity(MAX_NAT_PLAN_CANDIDATES);
-    for mapping in &remote.stun_mappings {
-        if let Some(mapped) = mapping.mapped {
-            push_candidate(&mut candidates, mapped);
-        }
-    }
-
-    for peer in &remote.local_candidates {
-        if usable_lan_candidate(peer.address)
-            && local
-                .local_candidates
-                .iter()
-                .any(|local| usable_lan_candidate(local.address) && prefixes_overlap(local, peer))
-        {
-            push_candidate(&mut candidates, peer.address);
-        }
-    }
-
-    if candidates.len() < MAX_NAT_PLAN_CANDIDATES {
-        let remaining = MAX_NAT_PLAN_CANDIDATES - candidates.len();
-        for candidate in bounded_port_samples(&remote.stun_mappings, remaining) {
-            push_candidate(&mut candidates, candidate);
-            if candidates.len() == MAX_NAT_PLAN_CANDIDATES {
-                break;
-            }
-        }
-    }
-    candidates
-}
-
-fn push_candidate(candidates: &mut Vec<std::net::SocketAddr>, candidate: std::net::SocketAddr) {
-    if candidates.len() < MAX_NAT_PLAN_CANDIDATES && !candidates.contains(&candidate) {
-        candidates.push(candidate);
-    }
-}
-
-fn bounded_port_samples(mappings: &[StunMapping], limit: usize) -> Vec<std::net::SocketAddr> {
-    if mappings.len() != 3
-        || mappings[0].server == mappings[1].server
-        || mappings[0].server != mappings[2].server
+async fn activate_tunnel(
+    state: &ServerState,
+    target_id: Uuid,
+    connection_id: Uuid,
+    session_id: Uuid,
+    client_endpoint_id: String,
+) {
+    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+    let Some(runtime) = runtime else {
+        return;
+    };
+    if runtime.target_id != target_id
+        || runtime.target_connection_id != connection_id
+        || runtime.client_endpoint_id != client_endpoint_id
     {
-        return Vec::new();
-    }
-    let (Some(first), Some(middle), Some(last)) =
-        (mappings[0].mapped, mappings[1].mapped, mappings[2].mapped)
-    else {
-        return Vec::new();
-    };
-    if first != last || first.ip() != middle.ip() {
-        return Vec::new();
-    }
-
-    let low = u32::from(first.port().min(middle.port()));
-    let high = u32::from(first.port().max(middle.port()));
-    let span = high - low;
-    if span <= 1 {
-        return Vec::new();
-    }
-    let sample_count = ((span - 1) as usize).min(limit);
-    let denominator = (sample_count + 1) as u32;
-    (1..=sample_count)
-        .map(|index| {
-            let index = index as u32;
-            let offset = (span * index + denominator / 2) / denominator;
-            std::net::SocketAddr::new(first.ip(), (low + offset) as u16)
-        })
-        .collect()
-}
-
-fn usable_lan_candidate(address: std::net::SocketAddr) -> bool {
-    if !valid_candidate(address) || address.ip().is_loopback() {
-        return false;
-    }
-    match address.ip() {
-        std::net::IpAddr::V4(ip) => !ip.octets().starts_with(&[169, 254]),
-        std::net::IpAddr::V6(ip) => ip.segments()[0] & 0xffc0 != 0xfe80,
-    }
-}
-
-fn prefixes_overlap(left: &LocalCandidate, right: &LocalCandidate) -> bool {
-    let prefix_len = left.prefix_len.min(right.prefix_len);
-    if prefix_len == 0 {
-        return false;
-    }
-    match (left.address.ip(), right.address.ip()) {
-        (std::net::IpAddr::V4(left), std::net::IpAddr::V4(right)) => {
-            let mask = u32::MAX << (32 - prefix_len);
-            u32::from(left) & mask == u32::from(right) & mask
-        }
-        (std::net::IpAddr::V6(left), std::net::IpAddr::V6(right)) => {
-            let mask = u128::MAX << (128 - u32::from(prefix_len));
-            u128::from(left) & mask == u128::from(right) & mask
-        }
-        _ => false,
-    }
-}
-
-async fn route_client_message(
-    state: &ServerState,
-    user: AuthenticatedUser,
-    session_id: Uuid,
-    message: ControlMessage,
-) {
-    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
-    let Some(runtime) = runtime else {
-        return;
-    };
-    if runtime.user_id != user.user_id || runtime.auth_session_id != user.session_id {
         return;
     }
-    if runtime.target_sender.send(message).await.is_err() {
-        close_tunnel(state, &runtime, "target control connection closed").await;
-    }
-}
-
-async fn route_agent_message(
-    state: &ServerState,
-    target_id: Uuid,
-    connection_id: Uuid,
-    session_id: Uuid,
-    message: ControlMessage,
-) {
-    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
-    let Some(runtime) = runtime else {
-        return;
-    };
-    if runtime.target_id != target_id || runtime.target_connection_id != connection_id {
+    let mut phase = runtime.phase.lock().await;
+    if *phase != TunnelPhase::Pending {
         return;
     }
-    if runtime.client_sender.send(message).await.is_err() {
-        close_tunnel(state, &runtime, "client control connection closed").await;
-    }
-}
-
-async fn route_quic_ready(
-    state: &ServerState,
-    session_id: Uuid,
-    endpoint: Endpoint,
-    message: ControlMessage,
-) {
-    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
-    let Some(runtime) = runtime else {
-        return;
-    };
-    let mut tunnel_state = runtime.state.lock().await;
-    if tunnel_state.phase != TunnelPhase::Pending {
-        return;
-    }
-    let other = match endpoint {
-        Endpoint::Client(user)
-            if runtime.user_id == user.user_id && runtime.auth_session_id == user.session_id =>
-        {
-            tunnel_state.client_quic_ready = true;
-            runtime.target_sender.clone()
-        }
-        Endpoint::Target {
-            target_id,
-            connection_id,
-        } if runtime.target_id == target_id && runtime.target_connection_id == connection_id => {
-            tunnel_state.target_quic_ready = true;
-            runtime.client_sender.clone()
-        }
-        _ => return,
-    };
-    drop(tunnel_state);
-    let _ = other.send(message).await;
-}
-
-pub(super) async fn select_relay(state: &ServerState, session_id: Uuid, endpoint: Endpoint) {
-    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
-    let Some(runtime) = runtime else {
-        return;
-    };
-    let valid_endpoint = match endpoint {
-        Endpoint::Client(user) => {
-            runtime.user_id == user.user_id && runtime.auth_session_id == user.session_id
-        }
-        Endpoint::Target {
-            target_id,
-            connection_id,
-        } => runtime.target_id == target_id && runtime.target_connection_id == connection_id,
-    };
-    if !valid_endpoint {
-        return;
-    }
-    let mut tunnel_state = runtime.state.lock().await;
-    if tunnel_state.phase != TunnelPhase::Pending {
-        return;
-    }
-    tunnel_state.phase = TunnelPhase::RelaySelected;
-    runtime.phase_tx.send_replace(TunnelPhase::RelaySelected);
-    drop(tunnel_state);
-    let message = ControlMessage::SelectRelay { session_id };
-    let _ = runtime.client_sender.send(message.clone()).await;
-    let _ = runtime.target_sender.send(message).await;
-}
-
-pub(super) async fn activate_path(
-    state: &ServerState,
-    target_id: Uuid,
-    connection_id: Uuid,
-    session_id: Uuid,
-    path: SelectedPath,
-) {
-    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
-    let Some(runtime) = runtime else {
-        return;
-    };
-    if runtime.target_id != target_id || runtime.target_connection_id != connection_id {
-        return;
-    }
-    let mut tunnel_state = runtime.state.lock().await;
-    let selected = match (tunnel_state.phase, path) {
-        (TunnelPhase::RelaySelected, SelectedPath::Relay) => true,
-        (TunnelPhase::Pending, SelectedPath::Quic) => {
-            tunnel_state.client_quic_ready && tunnel_state.target_quic_ready
-        }
-        _ => false,
-    };
-    if !selected || unix_time() >= runtime.expires_at {
-        drop(tunnel_state);
-        send_error(
-            &runtime.target_sender,
-            Some(session_id),
-            "path_not_ready",
-            "path cannot be activated".to_owned(),
-        )
-        .await;
-        return;
-    }
-
     let now = unix_time();
     let activation = async {
         let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if !authorized_for_target(
-            &mut tx,
-            AuthenticatedUser {
-                user_id: runtime.user_id,
-                session_id: runtime.auth_session_id,
-            },
-            target_id,
-        )
-        .await?
+        if runtime.expires_at <= now
+            || runtime.access_expires_at <= now
+            || !authorized_for_target(
+                &mut tx,
+                AuthenticatedUser {
+                    user_id: runtime.user_id,
+                    session_id: runtime.auth_session_id,
+                    access_expires_at: runtime.access_expires_at,
+                },
+                target_id,
+                &runtime.target_endpoint_id,
+                now,
+            )
+            .await?
         {
             sqlx::query(
                 "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
@@ -980,233 +654,146 @@ pub(super) async fn activate_path(
             tx.commit().await?;
             return Ok::<bool, ApiError>(false);
         }
-        let path_text = match path {
-            SelectedPath::Quic => "quic",
-            SelectedPath::Relay => "relay",
-        };
         let updated = sqlx::query(
-            "UPDATE tunnel_sessions SET status = 'active', selected_path = ?1, activated_at = ?2 \
-             WHERE id = ?3 AND status = 'pending'",
+            "UPDATE tunnel_sessions SET status = 'active', activated_at = ?1 \
+             WHERE id = ?2 AND status = 'pending' AND expires_at > ?1 \
+               AND client_endpoint_id = ?3 AND target_endpoint_id = ?4",
         )
-        .bind(path_text)
         .bind(now)
         .bind(session_id.to_string())
+        .bind(&runtime.client_endpoint_id)
+        .bind(&runtime.target_endpoint_id)
         .execute(&mut *tx)
         .await?;
-        if updated.rows_affected() != 1 {
-            return Err(ApiError::conflict("tunnel path was already activated"));
-        }
         tx.commit().await?;
-        Ok(true)
+        Ok(updated.rows_affected() == 1)
     }
     .await;
 
     match activation {
         Ok(true) => {
-            tunnel_state.phase = TunnelPhase::Active(path);
-            runtime.phase_tx.send_replace(TunnelPhase::Active(path));
-            drop(tunnel_state);
-            let activated = ControlMessage::Activated { session_id, path };
+            *phase = TunnelPhase::Active;
+            drop(phase);
+            let activated = ControlMessage::Activated { session_id };
             let _ = runtime.client_sender.send(activated.clone()).await;
             let _ = runtime.target_sender.send(activated).await;
-            if path == SelectedPath::Quic {
-                let mut tunnels = state.inner.tunnels.write().await;
-                if tunnels
-                    .get(&session_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &runtime))
-                {
-                    tunnels.remove(&session_id);
-                }
-            }
         }
         Ok(false) => {
-            drop(tunnel_state);
-            close_tunnel(state, &runtime, "access revoked before activation").await;
+            *phase = TunnelPhase::Closed;
+            drop(phase);
+            let error = ControlMessage::Error {
+                session_id: Some(session_id),
+                code: "authorization".to_owned(),
+                message: "SSH authorization expired or changed before activation".to_owned(),
+            };
+            let _ = runtime.client_sender.send(error.clone()).await;
+            let _ = runtime.target_sender.send(error).await;
+            remove_tunnel(state, session_id, &runtime).await;
         }
         Err(error) => {
-            drop(tunnel_state);
-            send_error(
-                &runtime.target_sender,
-                Some(session_id),
+            drop(phase);
+            tracing::error!(session = %session_id, error = %error, "activate Iroh SSH session failed");
+            fail_tunnel(
+                state,
+                &runtime,
                 "activation_failed",
-                error.to_string(),
+                "server could not activate SSH session",
             )
             .await;
         }
     }
 }
 
-pub(super) async fn cancel_tunnel(
+async fn close_from_client(state: &ServerState, session_id: Uuid, user: AuthenticatedUser) {
+    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+    let Some(runtime) = runtime else {
+        return;
+    };
+    if runtime.user_id == user.user_id && runtime.auth_session_id == user.session_id {
+        close_tunnel(state, &runtime, "client closed SSH session").await;
+    }
+}
+
+async fn close_from_target(
     state: &ServerState,
     session_id: Uuid,
-    endpoint: Endpoint,
-    reason: String,
+    target_id: Uuid,
+    connection_id: Uuid,
 ) {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
     let Some(runtime) = runtime else {
-        let _ = close_direct_audit_session(state, session_id, endpoint).await;
         return;
     };
-    let authorized = match endpoint {
-        Endpoint::Client(user) => {
-            runtime.user_id == user.user_id && runtime.auth_session_id == user.session_id
-        }
-        Endpoint::Target {
-            target_id,
-            connection_id,
-        } => runtime.target_id == target_id && runtime.target_connection_id == connection_id,
-    };
-    if authorized {
-        close_tunnel(state, &runtime, &reason).await;
+    let active = *runtime.phase.lock().await == TunnelPhase::Active;
+    if runtime.target_id == target_id && (runtime.target_connection_id == connection_id || active) {
+        close_tunnel(state, &runtime, "target closed SSH session").await;
     }
 }
 
-async fn close_direct_audit_session(
+async fn fail_from_target(
     state: &ServerState,
     session_id: Uuid,
-    endpoint: Endpoint,
-) -> Result<(), ApiError> {
-    match endpoint {
-        Endpoint::Client(user) => {
-            sqlx::query(
-                "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
-                 WHERE id = ?2 AND user_id = ?3 AND auth_session_id = ?4 \
-                   AND status = 'active' AND selected_path = 'quic'",
-            )
-            .bind(unix_time())
-            .bind(session_id.to_string())
-            .bind(user.user_id.to_string())
-            .bind(user.session_id.to_string())
-            .execute(&state.inner.db.pool)
-            .await?;
-        }
-        Endpoint::Target { target_id, .. } => {
-            sqlx::query(
-                "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
-                 WHERE id = ?2 AND target_id = ?3 AND status = 'active' AND selected_path = 'quic'",
-            )
-            .bind(unix_time())
-            .bind(session_id.to_string())
-            .bind(target_id.to_string())
-            .execute(&state.inner.db.pool)
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-pub(crate) async fn close_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntime>, reason: &str) {
-    {
-        let mut tunnel_state = runtime.state.lock().await;
-        if tunnel_state.phase == TunnelPhase::Closed {
-            return;
-        }
-        tunnel_state.phase = TunnelPhase::Closed;
-        runtime.phase_tx.send_replace(TunnelPhase::Closed);
-    }
-    let now = unix_time();
-    let _ = sqlx::query(
-        "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
-         WHERE id = ?2 AND status != 'closed'",
-    )
-    .bind(now)
-    .bind(runtime.session_id.to_string())
-    .execute(&state.inner.db.pool)
-    .await;
-    let cancel = ControlMessage::Cancel {
-        session_id: runtime.session_id,
-        reason: reason.to_owned(),
-    };
-    let _ = runtime.client_sender.send(cancel.clone()).await;
-    let _ = runtime.target_sender.send(cancel).await;
-    state
-        .inner
-        .tunnels
-        .write()
-        .await
-        .remove(&runtime.session_id);
-}
-
-pub(super) async fn close_pending_user_tunnels(
-    state: &ServerState,
-    user_id: Uuid,
-    auth_session_id: Uuid,
-    sender: &mpsc::Sender<ControlMessage>,
+    target_id: Uuid,
+    connection_id: Uuid,
+    code: String,
+    message: String,
 ) {
-    let sessions = state
+    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let active = *runtime.phase.lock().await == TunnelPhase::Active;
+    if runtime.target_id == target_id && (runtime.target_connection_id == connection_id || active) {
+        fail_tunnel(state, &runtime, &code, &message).await;
+    }
+}
+
+async fn close_pending_user_tunnels(state: &ServerState, user_id: Uuid, auth_session_id: Uuid) {
+    let runtimes = state
         .inner
         .tunnels
         .read()
         .await
         .values()
+        .filter(|runtime| runtime.user_id == user_id && runtime.auth_session_id == auth_session_id)
         .cloned()
         .collect::<Vec<_>>();
-    for runtime in sessions {
-        if runtime.user_id != user_id
-            || runtime.auth_session_id != auth_session_id
-            || !runtime.client_sender.same_channel(sender)
-        {
-            continue;
+    for runtime in runtimes {
+        if *runtime.phase.lock().await == TunnelPhase::Pending {
+            close_tunnel(state, &runtime, "client control connection closed").await;
         }
-        let phase = runtime.state.lock().await.phase;
-        if matches!(phase, TunnelPhase::Pending | TunnelPhase::RelaySelected) {
-            close_tunnel(state, &runtime, "client control disconnected").await;
+    }
+}
+
+async fn close_pending_target_tunnels(state: &ServerState, target_id: Uuid, connection_id: Uuid) {
+    let runtimes = state
+        .inner
+        .tunnels
+        .read()
+        .await
+        .values()
+        .filter(|runtime| {
+            runtime.target_id == target_id && runtime.target_connection_id == connection_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for runtime in runtimes {
+        if *runtime.phase.lock().await == TunnelPhase::Pending {
+            close_tunnel(state, &runtime, "target control connection closed").await;
         }
     }
 }
 
 async fn unregister_agent(state: &ServerState, target_id: Uuid, connection_id: Uuid) {
+    let mut online = state.inner.online_agents.write().await;
+    if online
+        .get(&target_id)
+        .is_some_and(|agent| agent.connection_id == connection_id)
     {
-        let mut online = state.inner.online_agents.write().await;
-        if online
-            .get(&target_id)
-            .is_some_and(|agent| agent.connection_id == connection_id)
-        {
-            online.remove(&target_id);
-        }
+        online.remove(&target_id);
     }
-    let sessions = state
-        .inner
-        .tunnels
-        .read()
-        .await
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    for runtime in sessions {
-        if runtime.target_id != target_id || runtime.target_connection_id != connection_id {
-            continue;
-        }
-        let phase = runtime.state.lock().await.phase;
-        if matches!(phase, TunnelPhase::Pending | TunnelPhase::RelaySelected) {
-            close_tunnel(state, &runtime, "target control disconnected").await;
-        }
-    }
-}
-
-fn spawn_pending_expiry(state: ServerState, runtime: Arc<TunnelRuntime>) {
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(PENDING_TUNNEL_TTL_SECS)).await;
-        let phase = runtime.state.lock().await.phase;
-        if matches!(phase, TunnelPhase::Pending | TunnelPhase::RelaySelected) {
-            close_tunnel(&state, &runtime, "tunnel establishment expired").await;
-        }
-    });
-}
-
-async fn send_error(
-    sender: &mpsc::Sender<ControlMessage>,
-    session_id: Option<Uuid>,
-    code: &str,
-    message: String,
-) {
-    let _ = sender
-        .send(ControlMessage::Error {
-            session_id,
-            code: code.to_owned(),
-            message,
-        })
-        .await;
+    drop(online);
+    close_pending_target_tunnels(state, target_id, connection_id).await;
 }
 
 async fn send_agent_error(
@@ -1226,63 +813,95 @@ async fn send_agent_error(
         .filter(|agent| agent.connection_id == connection_id)
         .map(|agent| agent.sender.clone());
     if let Some(sender) = sender {
-        send_error(&sender, session_id, code, message.to_owned()).await;
+        send_error(&sender, session_id, code, message).await;
     }
 }
 
-fn valid_candidate(candidate: std::net::SocketAddr) -> bool {
-    if candidate.port() == 0 || candidate.ip().is_unspecified() || candidate.ip().is_multicast() {
-        return false;
-    }
-    match candidate.ip() {
-        std::net::IpAddr::V4(ip) => !ip.is_broadcast(),
-        std::net::IpAddr::V6(_) => true,
-    }
-}
-
-fn validate_certificate_der(der: &[u8]) -> Result<(), ApiError> {
-    let certificate = rustls::pki_types::CertificateDer::from(der.to_vec());
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(certificate)
-        .map_err(|_| ApiError::bad_request("invalid target certificate DER"))
-}
-
-fn certificate_fingerprint(der: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("sha256:{}", URL_SAFE_NO_PAD.encode(Sha256::digest(der)))
-}
-
-impl TunnelRuntime {
-    fn new(
-        session_id: Uuid,
-        user: AuthenticatedUser,
-        target_id: Uuid,
-        target_connection_id: Uuid,
-        client_sender: mpsc::Sender<ControlMessage>,
-        target_sender: mpsc::Sender<ControlMessage>,
-        expires_at: i64,
-    ) -> Self {
-        let (phase_tx, _) = watch::channel(TunnelPhase::Pending);
-        Self {
+async fn send_error(
+    sender: &mpsc::Sender<ControlMessage>,
+    session_id: Option<Uuid>,
+    code: &str,
+    message: &str,
+) {
+    let _ = sender
+        .send(ControlMessage::Error {
             session_id,
-            user_id: user.user_id,
-            auth_session_id: user.session_id,
-            target_id,
-            target_connection_id,
-            client_sender,
-            target_sender,
-            state: Mutex::new(TunnelState {
-                phase: TunnelPhase::Pending,
-                client_quic_ready: false,
-                target_quic_ready: false,
-                client_nat_observation: None,
-                target_nat_observation: None,
-                nat_plan_sent: false,
-            }),
-            phase_tx,
-            relay_slots: Mutex::new(super::relay::RelaySlots::default()),
-            expires_at,
+            code: code.to_owned(),
+            message: message.to_owned(),
+        })
+        .await;
+}
+
+fn spawn_pending_expiry(state: ServerState, runtime: Arc<TunnelRuntime>) {
+    tokio::spawn(async move {
+        let seconds = runtime.expires_at.saturating_sub(unix_time()).max(0) as u64;
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        if *runtime.phase.lock().await == TunnelPhase::Pending {
+            close_tunnel(
+                &state,
+                &runtime,
+                "SSH authorization expired before activation",
+            )
+            .await;
         }
+    });
+}
+
+async fn close_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntime>, reason: &str) {
+    let mut phase = runtime.phase.lock().await;
+    if *phase == TunnelPhase::Closed {
+        return;
+    }
+    *phase = TunnelPhase::Closed;
+    drop(phase);
+    let _ = sqlx::query(
+        "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
+         WHERE id = ?2 AND status IN ('pending', 'active')",
+    )
+    .bind(unix_time())
+    .bind(runtime.session_id.to_string())
+    .execute(&state.inner.db.pool)
+    .await;
+    let message = ControlMessage::Close {
+        session_id: runtime.session_id,
+        reason: reason.to_owned(),
+    };
+    let _ = runtime.client_sender.send(message.clone()).await;
+    let _ = runtime.target_sender.send(message).await;
+    remove_tunnel(state, runtime.session_id, runtime).await;
+}
+
+async fn fail_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntime>, code: &str, message: &str) {
+    let mut phase = runtime.phase.lock().await;
+    if *phase == TunnelPhase::Closed {
+        return;
+    }
+    *phase = TunnelPhase::Closed;
+    drop(phase);
+    let _ = sqlx::query(
+        "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
+         WHERE id = ?2 AND status IN ('pending', 'active')",
+    )
+    .bind(unix_time())
+    .bind(runtime.session_id.to_string())
+    .execute(&state.inner.db.pool)
+    .await;
+    let error = ControlMessage::Error {
+        session_id: Some(runtime.session_id),
+        code: code.to_owned(),
+        message: message.to_owned(),
+    };
+    let _ = runtime.client_sender.send(error.clone()).await;
+    let _ = runtime.target_sender.send(error).await;
+    remove_tunnel(state, runtime.session_id, runtime).await;
+}
+
+async fn remove_tunnel(state: &ServerState, session_id: Uuid, runtime: &Arc<TunnelRuntime>) {
+    let mut tunnels = state.inner.tunnels.write().await;
+    if tunnels
+        .get(&session_id)
+        .is_some_and(|current| Arc::ptr_eq(current, runtime))
+    {
+        tunnels.remove(&session_id);
     }
 }
