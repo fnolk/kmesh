@@ -17,6 +17,7 @@ TARGET_IP = "10.0.0.4"
 CLIENT_CA = "/Users/example/.cache/kmesh-live/server/ca.pem"
 TARGET_CA = "/opt/kmesh-iroh-verification/ca.pem"
 TIMEOUT = 60
+LOG_FILTER = "warn,iroh::socket=trace"
 PID_MARKER = re.compile(rb"KMESH_AC_REMOTE_PID=([0-9]+)")
 
 
@@ -178,6 +179,7 @@ async def run(args):
 pid=$$
 printf '%s\\n' \"$pid\" > {shlex.quote(pid_file)}
 printf 'KMESH_AC_REMOTE_PID=%s\\n' \"$pid\" >&2
+export RUST_LOG={shlex.quote(LOG_FILTER)}
 exec {shlex.quote(args.target_bin)} --role target --local-ip {TARGET_IP} --ca-file {TARGET_CA} --endpoint-secret-key-file {shlex.quote(args.target_secret_file)}
 """
     queue, events = asyncio.Queue(), {"client": [], "target": []}
@@ -193,7 +195,7 @@ exec {shlex.quote(args.target_bin)} --role target --local-ip {TARGET_IP} --ca-fi
             "--ca-file", CLIENT_CA, "--endpoint-secret-key-file", str(client_secret_file),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+            start_new_session=True, env={**os.environ, "RUST_LOG": LOG_FILTER},
         )
         procs["client"] = client
         target = await asyncio.create_subprocess_exec(
