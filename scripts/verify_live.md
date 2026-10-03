@@ -1,5 +1,13 @@
-# Live verification status
+# Live Iroh verification
 
-The current Iroh-based implementation has not been run against the public server or `target-1`. The historical report in [`verify_live_report.md`](verify_live_report.md) records an earlier STUN/Quinn/WSS-data build and does not validate this implementation.
+`verify_iroh_live.py` separates read-only preflight, side-by-side staging, service transition, binary refresh, and transport checks. Staging creates `/opt/kmesh-iroh-verification`, a fresh SQLite database, two mutually exclusive server units, and one target-agent template. `deploy` is the service transition; `refresh-binary` updates only the new namespace while preserving the current mode, database, and target identity. The original verification server and agent files/data remain available for rollback.
 
-The earlier live-verification program used retired STUN and relay interfaces and has been removed. Reusing that program against the Iroh release would make unsupported protocol and deployment assumptions. A new live verification must follow a separate review of the fresh database directory, server binary and unit, target agent identity, and operator-managed service transition.
+The current deployment uses code revision `548523fc39dffdef84ec9edbd574ac8d944bf38b`. Password and SSHSIG logins both succeeded. OpenSSH connected to `target-1` (`server-1`), verified the Ed25519 host key read through the authenticated management SSH connection, and returned the requested exit code 23. Two fresh PublicDefault SSH connections under the same kmesh login session also succeeded after the control-close fix.
+
+Private-mode extended checks were run against revision `423a4a77fa1ae76540c7403417058f9aa9a84b7d`. They passed the 1 MiB SCP/SFTP hash comparison, local forwarding to the target SSHD banner, strict rejection of a wrong host key, ControlMaster reuse, and the RBAC revoke boundary. The existing master continued after revocation, a fresh connection was denied, and the grant was restored.
+
+In PublicDefault mode, the 548 extended checks passed. The 1 MiB transfer hash matched, the forward returned `SSH-2.0-OpenSSH_7.4`, strict host-key checking rejected a wrong key, ControlMaster reused its kmesh proxy, and the RBAC revoke test passed. Cleanup reported no errors.
+
+Debug probes in both modes captured a target public `EndpointAddr` candidate and the client NetReport with `udp_v4=true` and `global_v4` populated. The private-mode probe selected `relay:https://192.0.2.11:9443/`; the public-mode probe selected `relay:https://aps1-1.relay.n0.iroh.link./`. Neither 8-second probe emitted a selected direct-path event. The observed candidates and QAD results are evidence for those sessions; they do not establish direct P2P success or explain the relay selection.
+
+The combined sanitized report and raw probe logs are stored under `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/`. See [`verify_iroh_live_report.md`](verify_iroh_live_report.md) for report paths, hashes, target identifiers, and the observed candidate and NetReport values. [`verify_iroh_ssh.py`](verify_iroh_ssh.py) runs the extended SSH checks. The old STUN-era report in [`verify_live_report.md`](verify_live_report.md) describes a different implementation. No long-duration test was run.
