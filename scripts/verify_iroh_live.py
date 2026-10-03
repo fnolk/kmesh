@@ -48,6 +48,9 @@ PATH_EVENT_RE = re.compile(
 NO_SELECTED_PATH_RE = re.compile(
     r"(?:连接已建立；Iroh 正在选择网络路径|当前没有已选网络路径；Iroh 正在重新选择)。"
 )
+LOG_TIMESTAMP_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\b"
+)
 QUIC_PATH_SAMPLE_RE = re.compile(
     r"QUIC path UDP (?P<sample>baseline|interval) \((?P<address>[^)]+)\) "
     r"kind=(?P<kind>Direct|Relay) selected=(?P<selected>true|false) "
@@ -1329,7 +1332,8 @@ def path_state_observations(stderr: bytes) -> list[dict[str, Any]]:
     observations: list[dict[str, Any]] = []
     for line_number, raw_line in enumerate(stderr.splitlines(), start=1):
         text = raw_line.decode("utf-8", "replace")
-        timestamp = text.split(" ", 1)[0] if " " in text else None
+        timestamp_match = LOG_TIMESTAMP_RE.match(text)
+        timestamp = timestamp_match.group("timestamp") if timestamp_match else None
         for path_event in selected_paths(raw_line):
             observations.append(
                 {
