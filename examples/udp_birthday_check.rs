@@ -35,7 +35,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const B_RELAY_URL: &str = "https://192.0.2.11:9443";
+const B_RELAY_URL: &str = "https://192.0.2.11:9443/";
 const B_QAD_PORT: u16 = 3478;
 const ALPN: &[u8] = b"kmesh/udp-birthday-check/1";
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
