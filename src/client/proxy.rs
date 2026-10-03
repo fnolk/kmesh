@@ -9,11 +9,14 @@ use uuid::Uuid;
 
 use crate::{
     identity::{TUNNEL_TICKET_AUDIENCE, decode_tunnel_ticket},
-    protocol::{ControlMessage, RelayMode, TransportInfo, TunnelTicketClaims},
+    protocol::{
+        ControlMessage, DiscoveryResult, NativePlan, RelayMode, TransportInfo, TunnelTicketClaims,
+    },
     transport::{
-        IrohByteStream, IrohEndpointOptions, IrohPathKind, IrohPathStats, IrohSelectedPath,
-        RelayChoice, TransportError, accept_peer, create_endpoint, is_auth_failure_source,
-        snapshot_iroh_paths, wait_endpoint_ready,
+        DiscoveredUdpSocket, HandoffOptions, IrohByteStream, IrohEndpointOptions, IrohPathKind,
+        IrohPathStats, IrohSelectedPath, MappingDiscovery, PreparedPunch, PunchError,
+        PunchIdentity, PunchRole, RelayChoice, TransportError, accept_peer, create_endpoint,
+        discover_ipv4_mappings, is_auth_failure_source, snapshot_iroh_paths, wait_endpoint_ready,
     },
 };
 
@@ -32,6 +35,7 @@ struct TunnelOffer {
     ticket: String,
     target_endpoint_id: String,
     relay_mode: RelayMode,
+    expires_at: u64,
 }
 
 struct OpenSshSession {
@@ -276,9 +280,10 @@ async fn open_ssh_session(
     secret_key: SecretKey,
     relay_mode: RelayMode,
 ) -> Result<OpenSshSession> {
+    let mut deadline = tokio::time::Instant::now() + SESSION_SETUP_TIMEOUT;
     let relay_choice = endpoint_relay_choice(context, transport_info, relay_mode)?;
     let client_endpoint_id = secret_key.public().to_string();
-    Api::send_control(
+    send_setup_control(
         control,
         &ControlMessage::Open {
             session_id,
@@ -286,10 +291,11 @@ async fn open_ssh_session(
             client_endpoint_id: client_endpoint_id.clone(),
             relay_mode,
         },
+        relay_mode,
     )
     .await?;
-    let offer = match tokio::time::timeout(
-        SESSION_SETUP_TIMEOUT,
+    let offer = tokio::time::timeout_at(
+        deadline,
         next_offer(
             control,
             session_id,
@@ -300,31 +306,150 @@ async fn open_ssh_session(
         ),
     )
     .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(private_network_timeout(
-                relay_mode,
-                "waiting for target Iroh offer",
-            ));
-        }
-    };
+    .map_err(|_| private_network_timeout(relay_mode, "waiting for target Iroh offer"))??;
+    let wall_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let ticket_remaining = offer.expires_at.saturating_sub(wall_now);
+    ensure_auth(ticket_remaining > 0, "ticket expired before Iroh setup")?;
+    deadline = std::cmp::min(
+        deadline,
+        tokio::time::Instant::now() + Duration::from_secs(ticket_remaining),
+    );
     anyhow::ensure!(
         offer.relay_mode == relay_mode,
         "offer relay mode differs from request"
     );
-    let endpoint = create_endpoint(
-        secret_key,
-        true,
-        IrohEndpointOptions {
-            relay_choice: relay_choice.clone(),
-            tls: context.config.tls.clone(),
+
+    let client_id = secret_key.public();
+    let target_id_data = offer
+        .target_endpoint_id
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| {
+            anyhow!(SshAuthenticationFailure(
+                "ticket target EndpointId is invalid".to_owned()
+            ))
+        })?;
+    let discovery_deadline = std::cmp::min(
+        deadline,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    );
+    let discovery = tokio::select! {
+        biased;
+        control_message = next_client_session_message(control, session_id, relay_mode, deadline) => {
+            match control_message? {
+                None => bail!("server closed SSH session during QAD discovery"),
+                Some(_) => bail!("server sent a control message before client QAD discovery completed"),
+            }
+        }
+        result = discover_ipv4_mappings(&relay_choice, &context.config.tls, discovery_deadline) => {
+            result.map_err(|error| classify_transport_error(error, relay_mode))?
+        }
+    };
+    let (discovery_message, mut discovered) = match discovery {
+        MappingDiscovery::Ready(discovered) => (
+            DiscoveryResult::Ready {
+                local_socket: discovered.local_socket,
+                observations: discovered.observations.clone(),
+            },
+            Some(discovered),
+        ),
+        MappingDiscovery::Unavailable { reason } => (DiscoveryResult::Unavailable { reason }, None),
+    };
+    send_setup_control(
+        control,
+        &ControlMessage::CandidatesReady {
+            session_id,
+            relay_mode,
+            discovery: discovery_message,
         },
+        relay_mode,
     )
-    .await
-    .map_err(anyhow::Error::new)
-    .context("create client Iroh endpoint")?;
+    .await?;
+
+    let first_plan = next_client_session_message(control, session_id, relay_mode, deadline)
+        .await?
+        .context("server closed SSH session before native transport plan")?;
+    let (handoff, punch_selection) = match first_plan {
+        ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan: NativePlan::Standard,
+        } if received == session_id && mode == relay_mode => {
+            drop(discovered.take());
+            (None, None)
+        }
+        ControlMessage::PunchPair {
+            session_id: received,
+            relay_mode: mode,
+            target_endpoint_id,
+            client_endpoint_id: paired_client_id,
+            peer_discovery,
+        } if received == session_id && mode == relay_mode => {
+            ensure_auth(
+                target_endpoint_id == offer.target_endpoint_id,
+                "server paired a different target data EndpointId",
+            )?;
+            ensure_auth(
+                paired_client_id == client_endpoint_id,
+                "server paired a different client data EndpointId",
+            )?;
+            let discovered = discovered.take().context(
+                "server requested direct punching without successful client QAD discovery",
+            )?;
+            run_client_punch(
+                discovered,
+                peer_discovery,
+                session_id,
+                target_id_data,
+                client_id,
+                secret_key.clone(),
+                control,
+                relay_mode,
+                deadline,
+            )
+            .await?
+        }
+        _ => bail!("server returned an unexpected response to client QAD candidates"),
+    };
+
+    if let Some(selection) = &punch_selection {
+        tracing::debug!(
+            session = %session_id,
+            index = selection.index,
+            local_socket = %selection.local_socket,
+            peer_observed_addr = %selection.peer_observed_addr,
+            counters = ?selection.counters,
+            native_handoff_selected = handoff.is_some(),
+            "client observed signed target punch selection"
+        );
+    }
+
+    let endpoint = tokio::select! {
+        biased;
+        message = next_client_session_message(control, session_id, relay_mode, deadline) => {
+            match message? {
+                None => bail!("server closed SSH session before client native endpoint bind"),
+                Some(_) => bail!("server sent a control message before client native endpoint bind completed"),
+            }
+        }
+        result = create_endpoint(
+            secret_key,
+            true,
+            IrohEndpointOptions {
+                relay_choice: relay_choice.clone(),
+                tls: context.config.tls.clone(),
+                handoff,
+            }
+        ) => result
+            .map_err(|error| classify_transport_error(error, relay_mode))
+            .context("create per-session client Iroh endpoint")?
+    };
     let mut activated = false;
+    let endpoint_ready_timeout = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(Duration::from_secs(20));
     wait_setup_step(
         control,
         &endpoint,
@@ -333,10 +458,11 @@ async fn open_ssh_session(
         "waiting for client Iroh endpoint readiness",
         &mut activated,
         async {
-            wait_endpoint_ready(&endpoint, Duration::from_secs(20))
+            wait_endpoint_ready(&endpoint, endpoint_ready_timeout)
                 .await
                 .map_err(|error| classify_client_transport_error(&endpoint, error, relay_mode))
         },
+        deadline,
     )
     .await?;
     let client_endpoint_addr = endpoint.addr();
@@ -351,13 +477,14 @@ async fn open_ssh_session(
         client_ip_addrs = ?client_endpoint_addr.ip_addrs().copied().collect::<Vec<_>>(),
         "publishing prepared client Iroh candidates"
     );
-    Api::send_control(
+    send_setup_control(
         control,
         &ControlMessage::ClientReady {
             session_id,
             relay_mode,
             client_endpoint_addr,
         },
+        relay_mode,
     )
     .await?;
 
@@ -373,6 +500,7 @@ async fn open_ssh_session(
                 .await
                 .map_err(|error| classify_client_transport_error(&endpoint, error, relay_mode))
         },
+        deadline,
     )
     .await?;
     ensure_auth(
@@ -391,6 +519,7 @@ async fn open_ssh_session(
                 .await
                 .map_err(|error| classify_client_transport_error(&endpoint, error, relay_mode))
         },
+        deadline,
     )
     .await?;
     let received_ticket = wait_setup_step(
@@ -401,6 +530,7 @@ async fn open_ssh_session(
         "waiting for signed SSH ticket",
         &mut activated,
         async { read_ticket(&mut stream).await },
+        deadline,
     )
     .await?;
     ensure_auth(
@@ -408,22 +538,347 @@ async fn open_ssh_session(
         "Iroh stream ticket differs from the signed client offer",
     )?;
     if !activated {
-        tokio::time::timeout(
-            SESSION_SETUP_TIMEOUT,
-            wait_activated(control, session_id, relay_mode),
-        )
-        .await
-        .map_err(|_| {
-            private_relay_auth_failure(&endpoint, relay_mode).unwrap_or_else(|| {
-                private_network_timeout(relay_mode, "waiting for SSH activation")
-            })
-        })?
-        .map_err(|error| classify_anyhow_network_error(error, relay_mode))?;
+        tokio::time::timeout_at(deadline, wait_activated(control, session_id, relay_mode))
+            .await
+            .map_err(|_| {
+                private_relay_auth_failure(&endpoint, relay_mode).unwrap_or_else(|| {
+                    private_network_timeout(relay_mode, "waiting for SSH activation")
+                })
+            })?
+            .map_err(|error| classify_anyhow_network_error(error, relay_mode))?;
     }
     Ok(OpenSshSession {
         _endpoint: endpoint,
         stream,
     })
+}
+
+async fn run_client_punch(
+    discovered: DiscoveredUdpSocket,
+    peer_discovery: crate::protocol::ReadyDiscovery,
+    session_id: Uuid,
+    target_data_id: iroh::EndpointId,
+    client_id: iroh::EndpointId,
+    secret_key: SecretKey,
+    control: &mut WsStream,
+    relay_mode: RelayMode,
+    deadline: tokio::time::Instant,
+) -> Result<(
+    Option<HandoffOptions>,
+    Option<crate::transport::PunchSelection>,
+)> {
+    let mut punch = match PreparedPunch::prepare(
+        PunchRole::Client,
+        PunchIdentity {
+            session_id,
+            target_id: target_data_id,
+            client_id,
+        },
+        secret_key,
+        discovered,
+        peer_discovery.local_socket,
+        peer_discovery.observations,
+    ) {
+        Ok(punch) => punch,
+        Err(PunchError::Unavailable(reason)) => {
+            return if report_punch_failure(control, session_id, relay_mode, reason, deadline)
+                .await?
+            {
+                Ok((None, None))
+            } else {
+                bail!("server closed SSH session after client punch preparation failed")
+            };
+        }
+        Err(PunchError::Fatal(error)) => {
+            return Err(classify_transport_error(error, relay_mode));
+        }
+    };
+
+    let socket_count = u16::try_from(punch.socket_count())
+        .map_err(|_| anyhow!("client punch socket count exceeds protocol limit"))?;
+    send_setup_control(
+        control,
+        &ControlMessage::PunchReady {
+            session_id,
+            relay_mode,
+            socket_count,
+        },
+        relay_mode,
+    )
+    .await?;
+    match next_client_session_message(control, session_id, relay_mode, deadline).await? {
+        Some(ControlMessage::StartPunch {
+            session_id: received,
+            relay_mode: mode,
+        }) if received == session_id && mode == relay_mode => {}
+        Some(ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan: NativePlan::Standard,
+        }) if received == session_id && mode == relay_mode => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            return Ok((None, None));
+        }
+        None => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            bail!("server closed SSH session before client punching started");
+        }
+        Some(_) => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            return Err(anyhow!(SshAuthenticationFailure(
+                "server sent an unexpected client punch-stage control message".to_owned()
+            )));
+        }
+    }
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let punch_window = remaining.saturating_sub(Duration::from_secs(20));
+    if punch_window.is_zero() {
+        punch.finish(false).await.map_err(anyhow::Error::new)?;
+        return if report_punch_failure(
+            control,
+            session_id,
+            relay_mode,
+            "remaining session time is reserved for native relay setup".to_owned(),
+            deadline,
+        )
+        .await?
+        {
+            Ok((None, None))
+        } else {
+            bail!("server closed SSH session after the punch window expired")
+        };
+    }
+    let punch_deadline = tokio::time::Instant::now() + punch_window;
+    let selection = tokio::select! {
+        biased;
+        message = next_client_session_message(control, session_id, relay_mode, deadline) => {
+            match message? {
+                None => {
+                    punch.finish(false).await.map_err(anyhow::Error::new)?;
+                    bail!("server closed SSH session during client punching");
+                }
+                Some(ControlMessage::ContinueNative {
+                    session_id: received,
+                    relay_mode: mode,
+                    plan: NativePlan::Standard,
+                }) if received == session_id && mode == relay_mode => {
+                    punch.finish(false).await.map_err(anyhow::Error::new)?;
+                    return Ok((None, None));
+                }
+                Some(_) => {
+                    punch.finish(false).await.map_err(anyhow::Error::new)?;
+                    return Err(anyhow!(SshAuthenticationFailure(
+                        "server sent an unexpected control message while client punching".to_owned()
+                    )));
+                }
+            }
+        }
+        result = punch.start(punch_deadline) => match result {
+            Ok(selection) => selection,
+            Err(PunchError::Unavailable(reason)) => {
+                punch.finish(false).await.map_err(anyhow::Error::new)?;
+                return if report_punch_failure(control, session_id, relay_mode, reason, deadline).await? {
+                    Ok((None, None))
+                } else {
+                    bail!("server closed SSH session after client punch failure")
+                };
+            }
+            Err(PunchError::Fatal(error)) => {
+                punch.finish(false).await.map_err(anyhow::Error::new)?;
+                return Err(classify_transport_error(error, relay_mode));
+            }
+        }
+    };
+
+    send_setup_control(
+        control,
+        &ControlMessage::PunchSelected {
+            session_id,
+            relay_mode,
+            index: selection.index,
+            local_socket: selection.local_socket,
+            peer_observed_addr: selection.peer_observed_addr,
+        },
+        relay_mode,
+    )
+    .await?;
+    match next_client_session_message(control, session_id, relay_mode, deadline).await? {
+        Some(ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan:
+                NativePlan::Handoff {
+                    self_observed_addr,
+                    peer_observed_addr,
+                },
+        }) if received == session_id && mode == relay_mode => {
+            ensure_auth(
+                peer_observed_addr == selection.peer_observed_addr,
+                "server handoff peer tuple differs from the confirmed client punch winner",
+            )?;
+            let local = punch
+                .finish(true)
+                .await
+                .map_err(anyhow::Error::new)?
+                .context("selected client punch did not return a local handoff tuple")?;
+            ensure_auth(
+                local.index == selection.index && local.bind_addr == selection.local_socket,
+                "client punch handoff tuple differs from the selected raw socket",
+            )?;
+            Ok((
+                Some(HandoffOptions {
+                    bind_addr: local.bind_addr,
+                    self_observed_addr,
+                }),
+                Some(selection),
+            ))
+        }
+        Some(ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan: NativePlan::Standard,
+        }) if received == session_id && mode == relay_mode => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            Ok((None, Some(selection)))
+        }
+        None => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            bail!("server closed SSH session before client native handoff")
+        }
+        Some(_) => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            Err(anyhow!(SshAuthenticationFailure(
+                "server sent an unexpected client native handoff control message".to_owned()
+            )))
+        }
+    }
+}
+
+async fn send_setup_control(
+    control: &mut WsStream,
+    message: &ControlMessage,
+    relay_mode: RelayMode,
+) -> Result<()> {
+    Api::send_control(control, message)
+        .await
+        .map_err(|error| classify_anyhow_network_error(error, relay_mode))
+}
+
+async fn report_punch_failure(
+    control: &mut WsStream,
+    session_id: Uuid,
+    relay_mode: RelayMode,
+    reason: String,
+    deadline: tokio::time::Instant,
+) -> Result<bool> {
+    send_setup_control(
+        control,
+        &ControlMessage::PunchFailed {
+            session_id,
+            relay_mode,
+            reason,
+        },
+        relay_mode,
+    )
+    .await?;
+    match next_client_session_message(control, session_id, relay_mode, deadline).await? {
+        Some(ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan: NativePlan::Standard,
+        }) if received == session_id && mode == relay_mode => Ok(true),
+        None => Ok(false),
+        Some(_) => Err(anyhow!(SshAuthenticationFailure(
+            "server sent a nonstandard native plan after punch failure".to_owned()
+        ))),
+    }
+}
+
+async fn next_client_session_message(
+    control: &mut WsStream,
+    session_id: Uuid,
+    relay_mode: RelayMode,
+    deadline: tokio::time::Instant,
+) -> Result<Option<ControlMessage>> {
+    loop {
+        let message = tokio::time::timeout_at(deadline, control.next())
+            .await
+            .map_err(|_| private_network_timeout(relay_mode, "waiting for SSH setup control"))?;
+        let Some(message) = message else {
+            return Err(classify_anyhow_network_error(
+                anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "control WebSocket ended during SSH setup",
+                )),
+                relay_mode,
+            ));
+        };
+        let message =
+            message.map_err(|error| classify_anyhow_network_error(error.into(), relay_mode))?;
+        if matches!(message, Message::Ping(_) | Message::Pong(_)) {
+            continue;
+        }
+        if matches!(message, Message::Close(_)) {
+            return Err(classify_anyhow_network_error(
+                anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "control WebSocket closed during SSH setup",
+                )),
+                relay_mode,
+            ));
+        }
+        let message = Api::control_message(message)?;
+        match message {
+            ControlMessage::Error {
+                session_id: Some(received),
+                code,
+                message,
+            } if received == session_id => {
+                return Err(server_setup_error(code, message, relay_mode));
+            }
+            ControlMessage::Error {
+                session_id: None,
+                code,
+                message,
+            } => return Err(server_setup_error(code, message, relay_mode)),
+            ControlMessage::Close {
+                session_id: received,
+                ..
+            } if received == session_id => return Ok(None),
+            message => {
+                ensure_auth(
+                    client_message_session_id(&message) == Some(session_id),
+                    "server control message belongs to a different SSH session",
+                )?;
+                return Ok(Some(message));
+            }
+        }
+    }
+}
+
+fn client_message_session_id(message: &ControlMessage) -> Option<Uuid> {
+    match message {
+        ControlMessage::Open { session_id, .. }
+        | ControlMessage::ClientOffer { session_id, .. }
+        | ControlMessage::Prepare { session_id, .. }
+        | ControlMessage::AgentIdentity { session_id, .. }
+        | ControlMessage::IdentityAccepted { session_id, .. }
+        | ControlMessage::CandidatesReady { session_id, .. }
+        | ControlMessage::PunchPair { session_id, .. }
+        | ControlMessage::PunchReady { session_id, .. }
+        | ControlMessage::StartPunch { session_id, .. }
+        | ControlMessage::PunchSelected { session_id, .. }
+        | ControlMessage::PunchFailed { session_id, .. }
+        | ControlMessage::ContinueNative { session_id, .. }
+        | ControlMessage::AgentReady { session_id, .. }
+        | ControlMessage::ClientReady { session_id, .. }
+        | ControlMessage::DialOffer { session_id, .. }
+        | ControlMessage::IrohReady { session_id, .. }
+        | ControlMessage::Activated { session_id }
+        | ControlMessage::Close { session_id, .. } => Some(*session_id),
+        ControlMessage::Error { session_id, .. } => *session_id,
+    }
 }
 
 async fn wait_setup_step<T>(
@@ -434,6 +889,7 @@ async fn wait_setup_step<T>(
     stage: &'static str,
     activated: &mut bool,
     operation: impl Future<Output = Result<T>>,
+    deadline: tokio::time::Instant,
 ) -> Result<T> {
     let mut operation = Box::pin(operation);
     let wait = async {
@@ -465,12 +921,10 @@ async fn wait_setup_step<T>(
             }
         }
     };
-    tokio::time::timeout(SESSION_SETUP_TIMEOUT, wait)
-        .await
-        .map_err(|_| {
-            private_relay_auth_failure(endpoint, relay_mode)
-                .unwrap_or_else(|| private_network_timeout(relay_mode, stage))
-        })?
+    tokio::time::timeout_at(deadline, wait).await.map_err(|_| {
+        private_relay_auth_failure(endpoint, relay_mode)
+            .unwrap_or_else(|| private_network_timeout(relay_mode, stage))
+    })?
 }
 
 fn endpoint_relay_choice(
@@ -644,6 +1098,7 @@ async fn next_offer(
                     ticket,
                     target_endpoint_id,
                     relay_mode,
+                    expires_at: claims.exp,
                 });
             }
             ControlMessage::Error {
@@ -850,7 +1305,7 @@ async fn copy_stdio(stream: &mut IrohByteStream) -> Result<(u64, u64, Option<Iro
 mod tests {
     use super::*;
     use crate::{
-        protocol::RelayMode,
+        protocol::{RelayMode, TunnelTicketClaims},
         transport::{TransportError, connect_peer},
     };
     use iroh::{Endpoint, SecretKey, endpoint::presets};
@@ -940,6 +1395,24 @@ mod tests {
                 .downcast_ref::<PrivateNetworkFailure>()
                 .is_none()
         );
+        let private_tls = classify_transport_error(
+            TransportError::Tls("certificate rejected".to_owned()),
+            RelayMode::Private,
+        );
+        assert!(
+            private_tls
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_none()
+        );
+        let private_protocol = classify_transport_error(
+            TransportError::ProtocolViolation("wrong session identity".to_owned()),
+            RelayMode::Private,
+        );
+        assert!(
+            private_protocol
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_none()
+        );
 
         let public_network =
             classify_transport_error(TransportError::Timeout("relay"), RelayMode::PublicDefault);
@@ -956,6 +1429,42 @@ mod tests {
         );
         assert!(
             server_auth
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_session_ticket_is_authentication_not_private_network_fallback() {
+        let session_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let client_endpoint_id = SecretKey::generate().public().to_string();
+        let target_endpoint_id = SecretKey::generate().public().to_string();
+        let claims = TunnelTicketClaims {
+            session_id,
+            user_id: Uuid::new_v4(),
+            login_session_id: Uuid::new_v4(),
+            target_id,
+            client_endpoint_id: client_endpoint_id.clone(),
+            target_endpoint_id: target_endpoint_id.clone(),
+            relay_mode: RelayMode::Private,
+            iss: "https://kmesh.test:9443".to_owned(),
+            aud: TUNNEL_TICKET_AUDIENCE.to_owned(),
+            iat: 1,
+            exp: 1,
+        };
+        let error = validate_offer(
+            &claims,
+            session_id,
+            target_id,
+            &client_endpoint_id,
+            &target_endpoint_id,
+            RelayMode::Private,
+        )
+        .expect_err("expired session ticket must be rejected");
+        assert!(error.downcast_ref::<SshAuthenticationFailure>().is_some());
+        assert!(
+            classify_anyhow_network_error(error, RelayMode::Private)
                 .downcast_ref::<PrivateNetworkFailure>()
                 .is_none()
         );

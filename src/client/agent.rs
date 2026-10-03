@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,7 +14,7 @@ use tokio::{
     net::TcpStream,
     sync::{Mutex, mpsc},
     task::JoinSet,
-    time::sleep,
+    time::{Instant, sleep, timeout_at},
 };
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -22,12 +22,14 @@ use uuid::Uuid;
 use crate::{
     identity::{TUNNEL_TICKET_AUDIENCE, decode_tunnel_ticket},
     protocol::{
-        AgentCredentials, AgentEnrollmentRequest, ControlMessage, RelayMode, TransportInfo,
-        TunnelTicketClaims,
+        AgentCredentials, AgentEnrollmentRequest, ControlMessage, DiscoveryResult, NativePlan,
+        RelayMode, TransportInfo, TunnelTicketClaims,
     },
     transport::{
-        IrohByteStream, IrohEndpointOptions, RelayChoice, TransportError, connect_peer,
-        create_endpoint, snapshot_iroh_paths, validate_endpoint_addr, wait_endpoint_ready,
+        HandoffOptions, IrohByteStream, IrohEndpointOptions, MappingDiscovery, PreparedPunch,
+        PunchError, PunchIdentity, PunchRole, RelayChoice, TransportError, connect_peer,
+        create_endpoint, discover_ipv4_mappings, snapshot_iroh_paths, validate_endpoint_addr,
+        wait_endpoint_ready,
     },
 };
 
@@ -58,12 +60,9 @@ struct TunnelOffer {
     relay_mode: RelayMode,
 }
 
-type EndpointMap = Arc<Mutex<HashMap<RelayMode, Endpoint>>>;
-
 struct AgentRuntime {
-    endpoint_secret_key: SecretKey,
+    stable_device_secret_key: SecretKey,
     transport_info: TransportInfo,
-    endpoints: EndpointMap,
     active_sessions: JoinSet<()>,
     completed_sessions: Arc<StdMutex<Vec<Uuid>>>,
 }
@@ -130,9 +129,8 @@ pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &
 pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let credentials = profile::load_agent_credentials(&context.config.data_dir, target_id)?;
     let mut runtime = AgentRuntime {
-        endpoint_secret_key: decode_secret_key(&credentials.endpoint_secret_key)?,
+        stable_device_secret_key: decode_secret_key(&credentials.endpoint_secret_key)?,
         transport_info: context.api.transport_info().await?,
-        endpoints: Arc::new(Mutex::new(HashMap::new())),
         active_sessions: JoinSet::new(),
         completed_sessions: Arc::new(StdMutex::new(Vec::new())),
     };
@@ -162,6 +160,7 @@ fn endpoint_options(
     context: &ClientContext,
     info: &TransportInfo,
     relay_mode: RelayMode,
+    handoff: Option<HandoffOptions>,
 ) -> Result<IrohEndpointOptions> {
     let relay_choice = match relay_mode {
         RelayMode::Private => {
@@ -187,6 +186,7 @@ fn endpoint_options(
     Ok(IrohEndpointOptions {
         relay_choice,
         tls: context.config.tls.clone(),
+        handoff,
     })
 }
 
@@ -215,27 +215,585 @@ async fn send_control_sink(
         .context("send agent control message")
 }
 
-async fn prepare_endpoint(
+async fn run_agent_session(
     context: &ClientContext,
-    endpoint_secret_key: &SecretKey,
-    transport_info: &TransportInfo,
+    credentials: &AgentCredentials,
+    stable_device_key: SecretKey,
+    transport_info: TransportInfo,
+    session_id: Uuid,
+    target_id: Uuid,
+    client_endpoint_id: String,
     relay_mode: RelayMode,
-    endpoints: &EndpointMap,
-) -> std::result::Result<EndpointAddr, TransportError> {
-    let endpoint = {
-        let mut endpoints = endpoints.lock().await;
-        if let Some(endpoint) = endpoints.get(&relay_mode).cloned() {
-            endpoint
-        } else {
-            let options = endpoint_options(context, transport_info, relay_mode)
-                .map_err(|error| TransportError::Configuration(error.to_string()))?;
-            let endpoint = create_endpoint(endpoint_secret_key.clone(), false, options).await?;
-            endpoints.insert(relay_mode, endpoint.clone());
-            endpoint
+    expires_at: i64,
+    mut control_rx: mpsc::Receiver<ControlMessage>,
+    outbound: mpsc::Sender<ControlMessage>,
+) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs() as i64;
+    let remaining_secs = expires_at.saturating_sub(now);
+    ensure_auth(remaining_secs > 0, "agent session preparation has expired")?;
+    let deadline =
+        Instant::now() + Duration::from_secs(remaining_secs as u64).min(SESSION_SETUP_TIMEOUT);
+    let client_id = client_endpoint_id
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| {
+            anyhow!(AgentAuthenticationFailure(
+                "prepared client EndpointId is invalid".to_owned()
+            ))
+        })?;
+    let data_key = SecretKey::generate();
+    let data_id = data_key.public();
+    let signature = stable_device_key
+        .sign(&crate::identity::agent_session_identity_payload(
+            session_id, target_id, relay_mode, &data_id, expires_at,
+        ))
+        .to_bytes()
+        .to_vec();
+    outbound
+        .send(ControlMessage::AgentIdentity {
+            session_id,
+            relay_mode,
+            target_data_endpoint_id: data_id.to_string(),
+            signature,
+        })
+        .await
+        .context("register per-session target data identity")?;
+
+    match next_session_message(&mut control_rx, session_id, deadline).await? {
+        None => return Ok(()),
+        Some(ControlMessage::IdentityAccepted {
+            session_id: accepted,
+            relay_mode: accepted_mode,
+        }) if accepted == session_id && accepted_mode == relay_mode => {}
+        Some(_) => {
+            return Err(anyhow!(AgentAuthenticationFailure(
+                "server returned an unexpected response to the signed target identity".to_owned()
+            )));
+        }
+    }
+
+    let relay_choice = endpoint_options(context, &transport_info, relay_mode, None)
+        .map_err(|error| TransportError::Configuration(error.to_string()))?
+        .relay_choice;
+    let discovery_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_secs(2));
+    let discovery = tokio::select! {
+        biased;
+        control = next_session_message(&mut control_rx, session_id, deadline) => {
+            match control? {
+                None => return Ok(()),
+                Some(_) => return Err(anyhow!(AgentAuthenticationFailure(
+                    "server sent a control message before target candidate discovery completed".to_owned()
+                ))),
+            }
+        }
+        result = discover_ipv4_mappings(&relay_choice, &context.config.tls, discovery_deadline) => {
+            result.map_err(anyhow::Error::new)?
         }
     };
-    wait_endpoint_ready(&endpoint, RELAY_ENDPOINT_TIMEOUT).await?;
-    Ok(endpoint.addr())
+    let (discovery_message, mut discovered) = match discovery {
+        MappingDiscovery::Ready(discovered) => (
+            DiscoveryResult::Ready {
+                local_socket: discovered.local_socket,
+                observations: discovered.observations.clone(),
+            },
+            Some(discovered),
+        ),
+        MappingDiscovery::Unavailable { reason } => (DiscoveryResult::Unavailable { reason }, None),
+    };
+    outbound
+        .send(ControlMessage::CandidatesReady {
+            session_id,
+            relay_mode,
+            discovery: discovery_message,
+        })
+        .await
+        .context("report target QAD candidate discovery")?;
+
+    let first_native_message =
+        match next_session_message(&mut control_rx, session_id, deadline).await? {
+            None => return Ok(()),
+            Some(message) => message,
+        };
+    let (handoff, selection) = match first_native_message {
+        ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan: NativePlan::Standard,
+        } if received == session_id && mode == relay_mode => {
+            drop(discovered.take());
+            (None, None)
+        }
+        ControlMessage::PunchPair {
+            session_id: received,
+            relay_mode: mode,
+            target_endpoint_id,
+            client_endpoint_id: paired_client_id,
+            peer_discovery,
+        } if received == session_id && mode == relay_mode => {
+            ensure_auth(
+                target_endpoint_id == data_id.to_string(),
+                "server paired a different per-session target EndpointId",
+            )?;
+            ensure_auth(
+                paired_client_id == client_endpoint_id,
+                "server paired a different client EndpointId",
+            )?;
+            let discovered = discovered.take().ok_or_else(|| {
+                anyhow!(AgentAuthenticationFailure(
+                    "server requested UDP punching without successful QAD discovery".to_owned()
+                ))
+            })?;
+            let Some(native) = run_target_punch(
+                session_id,
+                target_id,
+                relay_mode,
+                data_id,
+                client_id,
+                data_key.clone(),
+                discovered,
+                peer_discovery,
+                &mut control_rx,
+                &outbound,
+                deadline,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            native
+        }
+        Some(_) => {
+            return Err(anyhow!(AgentAuthenticationFailure(
+                "server sent an unexpected response to target QAD candidates".to_owned()
+            )));
+        }
+    };
+
+    let options = endpoint_options(context, &transport_info, relay_mode, handoff)
+        .map_err(|error| TransportError::Configuration(error.to_string()))?;
+    let relay_choice = options.relay_choice.clone();
+    let endpoint = tokio::select! {
+        biased;
+        control = next_session_message(&mut control_rx, session_id, deadline) => {
+            match control? {
+                None => return Ok(()),
+                Some(_) => return Err(anyhow!(AgentAuthenticationFailure(
+                    "server sent a control message before target Endpoint creation completed".to_owned()
+                ))),
+            }
+        }
+        result = timeout_at(deadline, create_endpoint(data_key, false, options)) => {
+            result
+                .context("create per-session target Iroh endpoint before expiry")?
+                .map_err(anyhow::Error::new)?
+        }
+    };
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .min(RELAY_ENDPOINT_TIMEOUT);
+    tokio::select! {
+        biased;
+        control = next_session_message(&mut control_rx, session_id, deadline) => {
+            match control? {
+                None => return Ok(()),
+                Some(_) => return Err(anyhow!(AgentAuthenticationFailure(
+                    "server sent a control message before target Endpoint readiness".to_owned()
+                ))),
+            }
+        }
+        result = timeout_at(deadline, wait_endpoint_ready(&endpoint, remaining)) => {
+            result
+                .context("wait for per-session target relay and address readiness")?
+                .map_err(anyhow::Error::new)?;
+        }
+    }
+    let target_data_endpoint_id = endpoint.id().to_string();
+    outbound
+        .send(ControlMessage::AgentReady {
+            session_id,
+            relay_mode,
+            endpoint_addr: endpoint.addr(),
+        })
+        .await
+        .context("publish per-session target Iroh endpoint")?;
+
+    let offer = match next_session_message(&mut control_rx, session_id, deadline).await? {
+        None => return Ok(()),
+        Some(ControlMessage::DialOffer {
+            session_id: received,
+            target_id: offered_target_id,
+            ticket,
+            client_endpoint_id,
+            client_endpoint_addr,
+            ticket_public_key_pem,
+            relay_mode: offered_mode,
+        }) if received == session_id && offered_mode == relay_mode => TunnelOffer {
+            session_id,
+            target_id: offered_target_id,
+            ticket,
+            client_endpoint_id,
+            client_endpoint_addr,
+            ticket_public_key_pem,
+            relay_mode,
+        },
+        Some(_) => {
+            return Err(anyhow!(AgentAuthenticationFailure(
+                "server sent an unexpected control message before target dial offer".to_owned()
+            )));
+        }
+    };
+    ensure_auth(
+        offer.target_id == target_id,
+        "dial offer target ID differs from Prepare",
+    )?;
+    let claims = decode_tunnel_ticket(
+        &offer.ticket,
+        &offer.ticket_public_key_pem,
+        context.api.issuer(),
+    )
+    .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
+    validate_ticket(&claims, &offer, credentials, endpoint.id())?;
+    ensure_auth(
+        offer.client_endpoint_addr.ip_addrs().count() <= 32
+            && offer.client_endpoint_addr.relay_urls().next().is_some(),
+        "client EndpointAddr exceeds address limits or lacks relay candidates",
+    )?;
+    validate_endpoint_addr(&offer.client_endpoint_addr, &relay_choice)
+        .map_err(anyhow::Error::new)
+        .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
+
+    tracing::debug!(
+        session = %session_id,
+        target_data_endpoint_id,
+        raw_selected = selection.is_some(),
+        native_handoff_selected = handoff.is_some(),
+        endpoint_addr = ?endpoint.addr(),
+        "per-session target endpoint ready"
+    );
+    handle_dial_offer(context, offer, endpoint, relay_choice, control_rx, outbound).await
+}
+
+async fn run_target_punch(
+    session_id: Uuid,
+    target_id: Uuid,
+    relay_mode: RelayMode,
+    target_data_id: iroh::EndpointId,
+    client_id: iroh::EndpointId,
+    data_key: SecretKey,
+    discovered: crate::transport::DiscoveredUdpSocket,
+    peer_discovery: crate::protocol::ReadyDiscovery,
+    control_rx: &mut mpsc::Receiver<ControlMessage>,
+    outbound: &mpsc::Sender<ControlMessage>,
+    deadline: Instant,
+) -> Result<
+    Option<(
+        Option<HandoffOptions>,
+        Option<crate::transport::PunchSelection>,
+    )>,
+> {
+    let mut punch = match PreparedPunch::prepare(
+        PunchRole::Target,
+        PunchIdentity {
+            session_id,
+            target_id: target_data_id,
+            client_id,
+        },
+        data_key,
+        discovered,
+        peer_discovery.local_socket,
+        peer_discovery.observations,
+    ) {
+        Ok(punch) => punch,
+        Err(PunchError::Unavailable(reason)) => {
+            return if report_target_punch_failure(
+                outbound, control_rx, session_id, relay_mode, reason, deadline,
+            )
+            .await?
+            {
+                Ok(Some((None, None)))
+            } else {
+                Ok(None)
+            };
+        }
+        Err(PunchError::Fatal(error)) => return Err(anyhow::Error::new(error)),
+    };
+
+    let socket_count = u16::try_from(punch.socket_count())
+        .map_err(|_| anyhow!("target punch socket count exceeds protocol limit"))?;
+    outbound
+        .send(ControlMessage::PunchReady {
+            session_id,
+            relay_mode,
+            socket_count,
+        })
+        .await
+        .context("report target punch socket readiness")?;
+    let start = match next_session_message(control_rx, session_id, deadline).await? {
+        None => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            return Ok(None);
+        }
+        Some(ControlMessage::StartPunch {
+            session_id: received,
+            relay_mode: mode,
+        }) if received == session_id && mode == relay_mode => true,
+        Some(ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan: NativePlan::Standard,
+        }) if received == session_id && mode == relay_mode => false,
+        Some(_) => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            return Err(anyhow!(AgentAuthenticationFailure(
+                "server sent an unexpected target punch-stage control message".to_owned()
+            )));
+        }
+    };
+    if !start {
+        punch.finish(false).await.map_err(anyhow::Error::new)?;
+        return Ok(Some((None, None)));
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let punch_window = remaining
+        .saturating_sub(RELAY_ENDPOINT_TIMEOUT)
+        .min(Duration::from_secs(38));
+    if punch_window.is_zero() {
+        punch.finish(false).await.map_err(anyhow::Error::new)?;
+        return if report_target_punch_failure(
+            outbound,
+            control_rx,
+            session_id,
+            relay_mode,
+            "remaining session time is reserved for native relay setup".to_owned(),
+            deadline,
+        )
+        .await?
+        {
+            Ok(Some((None, None)))
+        } else {
+            Ok(None)
+        };
+    }
+    let punch_deadline = Instant::now() + punch_window;
+    let selection = tokio::select! {
+        biased;
+        control = next_session_message(control_rx, session_id, deadline) => {
+            match control? {
+                None => {
+                    punch.finish(false).await.map_err(anyhow::Error::new)?;
+                    return Ok(None);
+                }
+                Some(ControlMessage::ContinueNative {
+                    session_id: received,
+                    relay_mode: mode,
+                    plan: NativePlan::Standard,
+                }) if received == session_id && mode == relay_mode => {
+                    punch.finish(false).await.map_err(anyhow::Error::new)?;
+                    return Ok(Some((None, None)));
+                }
+                Some(_) => {
+                    punch.finish(false).await.map_err(anyhow::Error::new)?;
+                    return Err(anyhow!(AgentAuthenticationFailure(
+                        "server sent an unexpected control event while target punch was active".to_owned()
+                    )));
+                }
+            }
+        }
+        result = punch.start(punch_deadline) => match result {
+            Ok(selection) => selection,
+            Err(PunchError::Unavailable(reason)) => {
+                punch.finish(false).await.map_err(anyhow::Error::new)?;
+                return if report_target_punch_failure(
+                    outbound,
+                    control_rx,
+                    session_id,
+                    relay_mode,
+                    reason,
+                    deadline,
+                )
+                .await?
+                {
+                    Ok(Some((None, None)))
+                } else {
+                    Ok(None)
+                };
+            }
+            Err(PunchError::Fatal(error)) => {
+                punch.finish(false).await.map_err(anyhow::Error::new)?;
+                return Err(anyhow::Error::new(error));
+            }
+        }
+    };
+
+    outbound
+        .send(ControlMessage::PunchSelected {
+            session_id,
+            relay_mode,
+            index: selection.index,
+            local_socket: selection.local_socket,
+            peer_observed_addr: selection.peer_observed_addr,
+        })
+        .await
+        .context("report target raw UDP winner")?;
+    match next_session_message(control_rx, session_id, deadline).await? {
+        None => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            Ok(None)
+        }
+        Some(ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan:
+                NativePlan::Handoff {
+                    self_observed_addr,
+                    peer_observed_addr,
+                },
+        }) if received == session_id && mode == relay_mode => {
+            ensure_auth(
+                peer_observed_addr == selection.peer_observed_addr,
+                "server handoff peer tuple differs from the confirmed target punch winner",
+            )?;
+            let local = punch
+                .finish(true)
+                .await
+                .map_err(anyhow::Error::new)?
+                .context("selected target punch did not return a local handoff tuple")?;
+            ensure_auth(
+                local.index == selection.index && local.bind_addr == selection.local_socket,
+                "target punch handoff tuple differs from the selected raw socket",
+            )?;
+            Ok(Some((
+                Some(HandoffOptions {
+                    bind_addr: local.bind_addr,
+                    self_observed_addr,
+                }),
+                Some(selection),
+            )))
+        }
+        Some(ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan: NativePlan::Standard,
+        }) if received == session_id && mode == relay_mode => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            Ok(Some((None, Some(selection))))
+        }
+        Some(_) => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            Err(anyhow!(AgentAuthenticationFailure(
+                "server sent an unexpected target native handoff control message".to_owned()
+            )))
+        }
+    }
+}
+
+async fn report_target_punch_failure(
+    outbound: &mpsc::Sender<ControlMessage>,
+    control_rx: &mut mpsc::Receiver<ControlMessage>,
+    session_id: Uuid,
+    relay_mode: RelayMode,
+    reason: String,
+    deadline: Instant,
+) -> Result<bool> {
+    outbound
+        .send(ControlMessage::PunchFailed {
+            session_id,
+            relay_mode,
+            reason,
+        })
+        .await
+        .context("report target punch network failure")?;
+    match next_session_message(control_rx, session_id, deadline).await? {
+        Some(ControlMessage::ContinueNative {
+            session_id: received,
+            relay_mode: mode,
+            plan: NativePlan::Standard,
+        }) if received == session_id && mode == relay_mode => Ok(true),
+        None => Ok(false),
+        Some(_) => Err(anyhow!(AgentAuthenticationFailure(
+            "server sent a nonstandard native plan after target punch failure".to_owned()
+        ))),
+    }
+}
+
+async fn next_session_message(
+    receiver: &mut mpsc::Receiver<ControlMessage>,
+    session_id: Uuid,
+    deadline: Instant,
+) -> Result<Option<ControlMessage>> {
+    let message = timeout_at(deadline, receiver.recv())
+        .await
+        .map_err(|_| anyhow::Error::new(TransportError::Timeout("agent session setup")))?;
+    let Some(message) = message else {
+        return Ok(None);
+    };
+    match &message {
+        ControlMessage::Close {
+            session_id: received,
+            ..
+        } if *received == session_id => return Ok(None),
+        ControlMessage::Error {
+            session_id: Some(received),
+            code,
+            message,
+        } if *received == session_id => {
+            return Err(match code.as_str() {
+                "authentication" | "authorization" => {
+                    anyhow!(AgentAuthenticationFailure(message.clone()))
+                }
+                "network" => anyhow::Error::new(TransportError::Network(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    message.clone(),
+                ))),
+                "configuration" => {
+                    anyhow::Error::new(TransportError::Configuration(message.clone()))
+                }
+                _ => anyhow!("server rejected agent session: {message}"),
+            });
+        }
+        _ => {}
+    }
+    ensure_auth(
+        message_session_id(&message) == Some(session_id),
+        "server sent a control message for a different agent session",
+    )?;
+    Ok(Some(message))
+}
+
+fn agent_session_error_code(error: &anyhow::Error) -> &'static str {
+    if is_authentication_error(error)
+        || error.chain().any(|source| {
+            source
+                .downcast_ref::<TransportError>()
+                .is_some_and(|error| {
+                    error.is_auth_failure()
+                        || matches!(
+                            error,
+                            TransportError::Authentication(_)
+                                | TransportError::Tls(_)
+                                | TransportError::ProtocolViolation(_)
+                        )
+                })
+        })
+    {
+        "authentication"
+    } else if error.chain().any(|source| {
+        source
+            .downcast_ref::<TransportError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    TransportError::Configuration(_) | TransportError::Iroh(_)
+                )
+            })
+    }) {
+        "configuration"
+    } else {
+        "network"
+    }
 }
 
 async fn control_session(
@@ -291,152 +849,56 @@ async fn control_session(
                     continue;
                 }
                 match Api::control_message(incoming)? {
-                    ControlMessage::Prepare { session_id, relay_mode } => {
-                        match prepare_endpoint(
-                            context,
-                            &runtime.endpoint_secret_key,
-                            &runtime.transport_info,
-                            relay_mode,
-                            &runtime.endpoints,
-                        ).await {
-                            Ok(endpoint_addr) => {
-                                tracing::debug!(
-                                    session = %session_id,
-                                    relay_mode = ?relay_mode,
-                                    target_endpoint_id = %endpoint_addr.id,
-                                    target_ip_addrs = ?endpoint_addr.ip_addrs().copied().collect::<Vec<_>>(),
-                                    "prepared target Iroh dial endpoint"
-                                );
-                                send_control_sink(&mut writer, &ControlMessage::AgentReady {
-                                    session_id: Some(session_id),
-                                    relay_mode,
-                                    endpoint_addr,
-                                }).await.context("publish prepared Iroh endpoint to server")?;
-                            }
-                            Err(error) => {
-                                let code = if error.is_security_failure() || error.is_auth_failure() {
-                                    "authentication"
-                                } else if matches!(error, TransportError::Configuration(_) | TransportError::Tls(_)) {
-                                    "configuration"
-                                } else if error.is_network_failure() {
-                                    "network"
-                                } else {
-                                    "configuration"
-                                };
-                                outbound_tx.send(ControlMessage::Error {
-                                    session_id: Some(session_id),
-                                    code: code.to_owned(),
-                                    message: error.to_string(),
-                                }).await.context("report target relay preparation failure")?;
-                            }
-                        }
-                    }
-                    ControlMessage::DialOffer {
+                    ControlMessage::Prepare {
                         session_id,
-                        target_id,
-                        ticket,
-                        client_endpoint_id,
-                        client_endpoint_addr,
-                        ticket_public_key_pem,
                         relay_mode,
+                        client_endpoint_id,
+                        expires_at,
                     } => {
-                        let offer = TunnelOffer {
-                            session_id,
-                            target_id,
-                            ticket,
-                            client_endpoint_id,
-                            client_endpoint_addr,
-                            ticket_public_key_pem,
-                            relay_mode,
-                        };
-                        let claims = match decode_tunnel_ticket(
-                            &offer.ticket,
-                            &offer.ticket_public_key_pem,
-                            context.api.issuer(),
-                        ) {
-                            Ok(claims) => claims,
-                            Err(error) => {
-                                outbound_tx.send(ControlMessage::Error {
-                                    session_id: Some(session_id),
-                                    code: "authentication".to_owned(),
-                                    message: error.to_string(),
-                                }).await.context("report invalid signed tunnel offer")?;
-                                continue;
-                            }
-                        };
-                        let endpoint = runtime.endpoints.lock().await.get(&relay_mode).cloned()
-                            .context("offer relay endpoint has not been prepared")?;
-                        if let Err(error) = validate_ticket(&claims, &offer, credentials, endpoint.id()) {
-                            outbound_tx.send(ControlMessage::Error {
-                                session_id: Some(session_id),
-                                code: "authentication".to_owned(),
-                                message: error.to_string(),
-                            }).await.context("report invalid signed tunnel offer")?;
-                            continue;
-                        }
-                        let relay_choice = match endpoint_options(context, &runtime.transport_info, relay_mode) {
-                            Ok(options) => options.relay_choice,
-                            Err(error) => {
-                                outbound_tx.send(ControlMessage::Error {
-                                    session_id: Some(session_id),
-                                    code: "configuration".to_owned(),
-                                    message: error.to_string(),
-                                }).await.context("report target relay configuration failure")?;
-                                continue;
-                            }
-                        };
-                        if offer.client_endpoint_addr.id.to_string() != offer.client_endpoint_id
-                            || offer.client_endpoint_addr.ip_addrs().count() > 32
-                            || offer.client_endpoint_addr.relay_urls().next().is_none()
-                        {
-                            outbound_tx.send(ControlMessage::Error {
-                                session_id: Some(session_id),
-                                code: "authentication".to_owned(),
-                                message: "client EndpointAddr differs from the ticket identity or exceeds limits".to_owned(),
-                            }).await.context("reject invalid client EndpointAddr")?;
-                            continue;
-                        }
-                        if let Err(error) = validate_endpoint_addr(
-                            &offer.client_endpoint_addr,
-                            &relay_choice,
-                        ) {
-                            outbound_tx.send(ControlMessage::Error {
-                                session_id: Some(session_id),
-                                code: "authentication".to_owned(),
-                                message: error.to_string(),
-                            }).await.context("reject untrusted client relay address")?;
-                            continue;
-                        }
-                        anyhow::ensure!(!sessions.contains_key(&session_id), "duplicate offer for session {session_id}");
+                        ensure_auth(
+                            !sessions.contains_key(&session_id),
+                            "server reused active SSH session ID {session_id}"
+                        )?;
                         let (session_tx, session_rx) = mpsc::channel(16);
                         sessions.insert(session_id, session_tx);
                         let context = context.clone();
-                        let relay_choice = relay_choice.clone();
-                        let outbound_tx = outbound_tx.clone();
-                        let done_tx = done_tx.clone();
-                        let completed_sessions = runtime.completed_sessions.clone();
+                        let credentials = credentials.clone();
+                        let stable_device_key = runtime.stable_device_secret_key.clone();
+                        let transport_info = runtime.transport_info.clone();
+                        let outbound = outbound_tx.clone();
+                        let done = done_tx.clone();
+                        let completed = runtime.completed_sessions.clone();
                         runtime.active_sessions.spawn(async move {
-                            let result = handle_dial_offer(
+                            if let Err(error) = run_agent_session(
                                 &context,
-                                offer,
-                                endpoint,
-                                relay_choice,
+                                &credentials,
+                                stable_device_key,
+                                transport_info,
+                                session_id,
+                                target_id,
+                                client_endpoint_id,
+                                relay_mode,
+                                expires_at,
                                 session_rx,
-                                outbound_tx.clone(),
+                                outbound.clone(),
                             )
-                            .await;
-                            if let Err(error) = result {
-                                let code = if is_authentication_error(&error) { "authentication" } else { "network" };
-                                tracing::warn!(session = %session_id, error = %error, "target SSH session failed");
-                                if outbound_tx.send(ControlMessage::Error {
-                                    session_id: Some(session_id),
-                                    code: code.to_owned(),
-                                    message: error.to_string(),
-                                }).await.is_err() {
-                                    remember_completed(&completed_sessions, session_id);
+                            .await
+                            {
+                                let code = agent_session_error_code(&error);
+                                tracing::warn!(session = %session_id, error = %error, "agent SSH setup/session failed");
+                                if outbound
+                                    .send(ControlMessage::Error {
+                                        session_id: Some(session_id),
+                                        code: code.to_owned(),
+                                        message: error.to_string(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    remember_completed(&completed, session_id);
                                 }
                             }
-                            let _ = done_tx.send(session_id).await;
+                            let _ = done.send(session_id).await;
                         });
                     }
                     ControlMessage::Error { session_id: None, code, message }
@@ -462,10 +924,11 @@ async fn handle_dial_offer(
     offer: TunnelOffer,
     endpoint: Endpoint,
     relay_choice: RelayChoice,
+    setup_deadline: Instant,
     mut control_rx: mpsc::Receiver<ControlMessage>,
     outbound: mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
-    let connection = tokio::time::timeout(SESSION_SETUP_TIMEOUT, async {
+    let connection = timeout_at(setup_deadline, async {
         tokio::select! {
             biased;
             control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
@@ -477,7 +940,7 @@ async fn handle_dial_offer(
         }
     })
         .await
-        .context("timed out connecting to the client Iroh endpoint")?
+        .context("target connection exceeded the per-session expiry")?
         ?;
     let Some(connection) = connection else {
         return Ok(());
@@ -489,13 +952,14 @@ async fn handle_dial_offer(
     )?;
 
     let mut path_events = connection.path_events();
+    let direct_deadline = std::cmp::min(Instant::now() + Duration::from_secs(2), setup_deadline);
     let direct_selected = tokio::select! {
         biased;
         control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
             control?;
             return Ok(());
         },
-        result = tokio::time::timeout(Duration::from_secs(2), async {
+        result = timeout_at(direct_deadline, async {
             loop {
                 if connection
                     .paths()
@@ -537,11 +1001,18 @@ async fn handle_dial_offer(
         .send(ControlMessage::IrohReady {
             session_id: offer.session_id,
             client_endpoint_id: remote_endpoint_id,
+            target_data_endpoint_id: endpoint.id().to_string(),
             relay_mode: offer.relay_mode,
         })
         .await
         .context("report authenticated Iroh peer to server")?;
-    if !wait_activated(offer.session_id, &mut control_rx).await? {
+    if timeout_at(
+        setup_deadline,
+        wait_activated(offer.session_id, &mut control_rx),
+    )
+    .await
+    .context("target activation exceeded the per-session expiry")??
+    {
         return Ok(());
     }
 
@@ -747,18 +1218,21 @@ fn message_session_id(message: &ControlMessage) -> Option<Uuid> {
         | ControlMessage::IrohReady { session_id, .. }
         | ControlMessage::DialOffer { session_id, .. }
         | ControlMessage::Prepare { session_id, .. }
+        | ControlMessage::AgentIdentity { session_id, .. }
+        | ControlMessage::IdentityAccepted { session_id, .. }
+        | ControlMessage::CandidatesReady { session_id, .. }
+        | ControlMessage::PunchPair { session_id, .. }
+        | ControlMessage::PunchReady { session_id, .. }
+        | ControlMessage::StartPunch { session_id, .. }
+        | ControlMessage::PunchSelected { session_id, .. }
+        | ControlMessage::PunchFailed { session_id, .. }
+        | ControlMessage::ContinueNative { session_id, .. }
+        | ControlMessage::AgentReady { session_id, .. }
+        | ControlMessage::ClientReady { session_id, .. }
+        | ControlMessage::ClientOffer { session_id, .. }
+        | ControlMessage::Open { session_id, .. }
         | ControlMessage::Close { session_id, .. } => Some(*session_id),
         ControlMessage::Error { session_id, .. } => *session_id,
-        ControlMessage::Open { .. }
-        | ControlMessage::ClientOffer { .. }
-        | ControlMessage::ClientReady { .. }
-        | ControlMessage::AgentReady {
-            session_id: None, ..
-        } => None,
-        ControlMessage::AgentReady {
-            session_id: Some(session_id),
-            ..
-        } => Some(*session_id),
     }
 }
 
@@ -796,6 +1270,35 @@ mod tests {
     use super::*;
     use crate::{client::proxy::read_ticket, transport::accept_peer};
     use iroh::{Endpoint, endpoint::presets};
+    use std::io;
+
+    #[test]
+    fn per_session_error_classification_keeps_auth_and_protocol_failures_terminal() {
+        assert_eq!(
+            agent_session_error_code(&anyhow::Error::new(TransportError::Tls(
+                "QAD certificate rejected".to_owned()
+            ))),
+            "authentication"
+        );
+        assert_eq!(
+            agent_session_error_code(&anyhow::Error::new(TransportError::ProtocolViolation(
+                "wrong punch SID".to_owned()
+            ))),
+            "authentication"
+        );
+        assert_eq!(
+            agent_session_error_code(&anyhow::Error::new(TransportError::Configuration(
+                "invalid private relay".to_owned()
+            ))),
+            "configuration"
+        );
+        assert_eq!(
+            agent_session_error_code(&anyhow::Error::new(TransportError::Network(
+                io::Error::from(io::ErrorKind::NetworkUnreachable)
+            ))),
+            "network"
+        );
+    }
 
     async fn context(server_url: &str) -> ClientContext {
         let config = crate::config::Config {
@@ -857,10 +1360,10 @@ mod tests {
             qad_port: 3478,
         };
 
-        let public = endpoint_options(&context, &info, RelayMode::PublicDefault)
+        let public = endpoint_options(&context, &info, RelayMode::PublicDefault, None)
             .expect("public relay mode does not require a private relay");
         assert_eq!(public.relay_choice, RelayChoice::PublicDefault);
-        assert!(endpoint_options(&context, &info, RelayMode::Private).is_err());
+        assert!(endpoint_options(&context, &info, RelayMode::Private, None).is_err());
     }
 
     #[tokio::test]
@@ -870,7 +1373,7 @@ mod tests {
             private_relay_url: Some("https://kmesh.test:9443".to_owned()),
             qad_port: 3478,
         };
-        let options = endpoint_options(&context, &info, RelayMode::Private)
+        let options = endpoint_options(&context, &info, RelayMode::Private, None)
             .expect("server private relay matches the control service");
         assert_eq!(
             options.relay_choice,
@@ -884,7 +1387,7 @@ mod tests {
             private_relay_url: Some("https://untrusted.example".to_owned()),
             qad_port: 3478,
         };
-        assert!(endpoint_options(&context, &malicious, RelayMode::Private).is_err());
+        assert!(endpoint_options(&context, &malicious, RelayMode::Private, None).is_err());
     }
 
     #[tokio::test]
@@ -894,6 +1397,7 @@ mod tests {
         let offer = offer(&client);
         let session_id = offer.session_id;
         let client_endpoint_id = client.id().to_string();
+        let target_data_endpoint_id = target.id().to_string();
         let client_task = tokio::spawn(async move {
             let connection = accept_peer(&client)
                 .await
@@ -911,6 +1415,7 @@ mod tests {
                 offer,
                 target,
                 RelayChoice::PublicDefault,
+                Instant::now() + Duration::from_secs(5),
                 control_rx,
                 outbound,
             )
@@ -922,8 +1427,8 @@ mod tests {
                 .await
                 .expect("target did not report Iroh readiness")
             .expect("target control channel closed"),
-            ControlMessage::IrohReady { session_id: received, client_endpoint_id: reported_id, relay_mode: RelayMode::PublicDefault }
-                if received == session_id && reported_id == client_endpoint_id
+            ControlMessage::IrohReady { session_id: received, client_endpoint_id: reported_id, target_data_endpoint_id: target_data, relay_mode: RelayMode::PublicDefault }
+                if received == session_id && reported_id == client_endpoint_id && target_data == target_data_endpoint_id
         ));
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), client_task)
@@ -956,6 +1461,7 @@ mod tests {
                 offer,
                 target,
                 RelayChoice::PublicDefault,
+                Instant::now() + Duration::from_secs(5),
                 control_rx,
                 outbound,
             )
@@ -986,6 +1492,7 @@ mod tests {
                 offer,
                 target,
                 RelayChoice::PublicDefault,
+                Instant::now() + Duration::from_secs(5),
                 control_rx,
                 outbound,
             )
@@ -993,5 +1500,52 @@ mod tests {
         });
         drop(control_tx);
         assert!(await_offer(task).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn closing_a_second_session_endpoint_keeps_the_first_ssh_stream_alive() {
+        let (client_one, target_one) = local_endpoints().await;
+        let (client_two, target_two) = local_endpoints().await;
+        let session_one_endpoint_id = target_one.id();
+        let session_two_endpoint_id = target_two.id();
+        assert_ne!(session_one_endpoint_id, session_two_endpoint_id);
+        assert_ne!(target_one.bound_sockets(), target_two.bound_sockets());
+
+        let client_one_addr = client_one.addr();
+        let accept_endpoint = client_one.clone();
+        let accept_task = tokio::spawn(async move { accept_peer(&accept_endpoint).await });
+        let connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_peer(&target_one, client_one_addr, &RelayChoice::PublicDefault),
+        )
+        .await
+        .expect("first session connection timed out")
+        .expect("first session target connects");
+        let incoming = tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .expect("first session client did not accept")
+            .expect("first session accept task panicked")
+            .expect("first session client accepts");
+        let mut target_stream = IrohByteStream::open_bi(connection)
+            .await
+            .expect("open first session stream");
+        let mut client_stream = IrohByteStream::accept_bi(incoming)
+            .await
+            .expect("accept first session stream");
+
+        target_two.close().await;
+        target_stream
+            .write_all(b"active session survives")
+            .await
+            .expect("write on first session after closing the second endpoint");
+        let mut received = [0u8; 23];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client_stream.read_exact(&mut received),
+        )
+        .await
+        .expect("first session read timed out")
+        .expect("read first session payload");
+        assert_eq!(&received, b"active session survives");
     }
 }
