@@ -1586,7 +1586,7 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     alias = match.group(1)
     env = {
         "PATH": str(harness.args.client_binary.parent) + os.pathsep + os.environ.get("PATH", ""),
-        "RUST_LOG": "iroh::net_report=debug,iroh::_events::qnt::init=debug,iroh::socket::remote_map::remote_state=trace,noq_proto::connection=trace,noq_proto::connection::paths=trace,kmesh::client::proxy=trace",
+        "RUST_LOG": "iroh::net_report=debug,iroh::_events::qnt::init=debug,iroh::socket::remote_map::remote_state=trace,portmapper=debug,noq_proto::connection=trace,noq_proto::connection::paths=trace,kmesh::client::proxy=trace",
     }
     process = subprocess.Popen(
         [
