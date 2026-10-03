@@ -1427,12 +1427,20 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
         if event["role"] == "target"
         for address in event["ip_addrs"]
     ]
-    udp_transport_by_target_candidate = {}
+    peer_candidate_addresses = sorted(set(target_candidates) | set(nat_probe_tx))
+    udp_transport_by_candidate = {}
     for event in udp_transport_events:
-        matches = [address for address in target_candidates if address in event["source_line"]]
-        event["target_candidate_addresses"] = matches
+        matches = [
+            address
+            for address in peer_candidate_addresses
+            if re.search(
+                rf"(?<![0-9.]){re.escape(address)}(?![0-9])",
+                event["source_line"],
+            )
+        ]
+        event["candidate_destinations"] = matches
         for address in matches:
-            counts = udp_transport_by_target_candidate.setdefault(
+            counts = udp_transport_by_candidate.setdefault(
                 address, {"sent": 0, "send_error": 0, "pending_drop": 0}
             )
             counts[event["result"]] += 1
@@ -1449,7 +1457,7 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
             "validated_path_events": validated_paths,
         },
         "udp_transport_events": udp_transport_events,
-        "udp_transport_by_target_candidate": udp_transport_by_target_candidate,
+        "udp_transport_by_candidate": udp_transport_by_candidate,
         "udp_path_events": udp_path_events,
     }
 
