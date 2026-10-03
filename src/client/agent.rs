@@ -414,38 +414,81 @@ async fn control_session(
                         ticket_public_key_pem,
                         relay_mode,
                     } => {
-                        anyhow::ensure!(target_id == credentials.target_id, "offer target ID differs from this agent");
+                        let offer = TunnelOffer {
+                            session_id,
+                            target_id,
+                            ticket,
+                            client_endpoint_id,
+                            target_endpoint_addr,
+                            ticket_public_key_pem,
+                            relay_mode,
+                        };
+                        let claims = decode_tunnel_ticket(
+                            &offer.ticket,
+                            &offer.ticket_public_key_pem,
+                            context.api.issuer(),
+                        )
+                        .map_err(|error| AgentAuthenticationFailure(error.to_string()));
+                        let validation = claims
+                            .map_err(anyhow::Error::new)
+                            .and_then(|claims| validate_ticket(&claims, &offer, credentials));
+                        if let Err(error) = validation {
+                            outbound_tx.send(ControlMessage::Error {
+                                session_id: Some(session_id),
+                                code: "authentication".to_owned(),
+                                message: error.to_string(),
+                            }).await.context("report invalid signed tunnel offer")?;
+                            continue;
+                        }
                         let endpoint = endpoints.lock().await.get(&relay_mode).cloned()
                             .context("offer relay endpoint has not been prepared")?;
-                        anyhow::ensure!(target_endpoint_addr.id == endpoint.id(), "offer endpoint identity differs from this agent");
+                        let relay_choice = match endpoint_options(context, transport_info, relay_mode) {
+                            Ok(options) => options.relay_choice,
+                            Err(error) => {
+                                outbound_tx.send(ControlMessage::Error {
+                                    session_id: Some(session_id),
+                                    code: "configuration".to_owned(),
+                                    message: error.to_string(),
+                                }).await.context("report target relay configuration failure")?;
+                                continue;
+                            }
+                        };
+                        if let Err(error) = crate::transport::validate_endpoint_addr(
+                            &offer.target_endpoint_addr,
+                            &relay_choice,
+                        ) {
+                            outbound_tx.send(ControlMessage::Error {
+                                session_id: Some(session_id),
+                                code: "authentication".to_owned(),
+                                message: error.to_string(),
+                            }).await.context("reject untrusted target relay address")?;
+                            continue;
+                        }
+                        if offer.target_endpoint_addr.id != endpoint.id() {
+                            outbound_tx.send(ControlMessage::Error {
+                                session_id: Some(session_id),
+                                code: "authentication".to_owned(),
+                                message: "offer EndpointId differs from this agent".to_owned(),
+                            }).await.context("reject offer for another target EndpointId")?;
+                            continue;
+                        }
                         anyhow::ensure!(!sessions.contains_key(&session_id), "duplicate offer for session {session_id}");
                         let (peer_tx, peer_rx) = mpsc::channel(1);
                         {
                             let mut peers = pending_peers.lock().await;
-                            anyhow::ensure!(peers.insert((relay_mode, client_endpoint_id.clone()), peer_tx).is_none(), "client EndpointId already has a pending offer");
+                            anyhow::ensure!(peers.insert((relay_mode, offer.client_endpoint_id.clone()), peer_tx).is_none(), "client EndpointId already has a pending offer");
                         }
                         let (session_tx, session_rx) = mpsc::channel(16);
                         sessions.insert(session_id, session_tx);
                         let context = context.clone();
-                        let credentials = credentials.clone();
                         let outbound_tx = outbound_tx.clone();
                         let done_tx = done_tx.clone();
                         let completed_sessions = completed_sessions.clone();
                         let pending_peers = pending_peers.clone();
                         active_sessions.spawn(async move {
-                            let offer = TunnelOffer {
-                                session_id,
-                                target_id,
-                                ticket,
-                                client_endpoint_id,
-                                target_endpoint_addr,
-                                ticket_public_key_pem,
-                                relay_mode,
-                            };
                             let peer_endpoint_id = offer.client_endpoint_id.clone();
                             let result = handle_offer(
                                 &context,
-                                &credentials,
                                 offer,
                                 peer_rx,
                                 session_rx,
@@ -492,19 +535,11 @@ async fn control_session(
 
 async fn handle_offer(
     context: &ClientContext,
-    credentials: &AgentCredentials,
     offer: TunnelOffer,
     mut peer_rx: mpsc::Receiver<Connection>,
     mut control_rx: mpsc::Receiver<ControlMessage>,
     outbound: mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
-    let claims = decode_tunnel_ticket(
-        &offer.ticket,
-        &offer.ticket_public_key_pem,
-        context.api.issuer(),
-    )
-    .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
-    validate_ticket(&claims, &offer, credentials)?;
     let connection = tokio::time::timeout(SESSION_SETUP_TIMEOUT, peer_rx.recv())
         .await
         .context("timed out waiting for the authenticated Iroh peer")?
