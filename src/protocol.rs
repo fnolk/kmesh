@@ -275,21 +275,6 @@ pub enum DiscoveryResult {
     },
 }
 
-impl DiscoveryResult {
-    pub fn ready(&self) -> Option<ReadyDiscovery> {
-        match self {
-            Self::Ready {
-                local_socket,
-                observations,
-            } => Some(ReadyDiscovery {
-                local_socket: *local_socket,
-                observations: observations.clone(),
-            }),
-            Self::Unavailable { .. } => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
 pub enum NativePlan {

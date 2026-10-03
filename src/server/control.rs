@@ -454,8 +454,18 @@ pub(super) async fn handle_client_message(
             session_id,
             relay_mode,
             reason,
-        } if reason.len() <= 512 => {
-            if let Err(error) = fail_punch_to_native(
+        } => {
+            if reason.len() > 512 {
+                fail_from_client(
+                    state,
+                    user,
+                    sender,
+                    session_id,
+                    "client_punch_rejected",
+                    "punch failure reason is too long",
+                )
+                .await;
+            } else if let Err(error) = fail_punch_to_native(
                 state,
                 PunchSide::Client,
                 session_id,
@@ -476,6 +486,21 @@ pub(super) async fn handle_client_message(
                 )
                 .await;
             }
+        }
+        ControlMessage::Error {
+            session_id: Some(session_id),
+            code,
+            message,
+        } => {
+            let (code, message) = if code.len() <= 128 && message.len() <= 1024 {
+                (code, message)
+            } else {
+                (
+                    "invalid_error".to_owned(),
+                    "client error report exceeds the control protocol limit".to_owned(),
+                )
+            };
+            fail_from_client(state, user, sender, session_id, &code, &message).await;
         }
         ControlMessage::ClientReady {
             session_id,
@@ -554,7 +579,7 @@ pub(super) async fn handle_agent_message(
             )
             .await
             {
-                fail_from_target(
+                fail_pending_from_target(
                     state,
                     session_id,
                     target_id,
@@ -600,7 +625,7 @@ pub(super) async fn handle_agent_message(
             )
             .await
             {
-                fail_from_target(
+                fail_pending_from_target(
                     state,
                     session_id,
                     target_id,
@@ -627,7 +652,7 @@ pub(super) async fn handle_agent_message(
             )
             .await
             {
-                fail_from_target(
+                fail_pending_from_target(
                     state,
                     session_id,
                     target_id,
@@ -660,7 +685,7 @@ pub(super) async fn handle_agent_message(
             )
             .await
             {
-                fail_from_target(
+                fail_pending_from_target(
                     state,
                     session_id,
                     target_id,
@@ -675,8 +700,18 @@ pub(super) async fn handle_agent_message(
             session_id,
             relay_mode,
             reason,
-        } if reason.len() <= 512 => {
-            if let Err(error) = fail_punch_to_native(
+        } => {
+            if reason.len() > 512 {
+                fail_pending_from_target(
+                    state,
+                    session_id,
+                    target_id,
+                    connection_id,
+                    "agent_punch_rejected".to_owned(),
+                    "punch failure reason is too long".to_owned(),
+                )
+                .await;
+            } else if let Err(error) = fail_punch_to_native(
                 state,
                 PunchSide::Target,
                 session_id,
@@ -687,7 +722,7 @@ pub(super) async fn handle_agent_message(
             )
             .await
             {
-                fail_from_target(
+                fail_pending_from_target(
                     state,
                     session_id,
                     target_id,
@@ -713,7 +748,7 @@ pub(super) async fn handle_agent_message(
             )
             .await
             {
-                fail_from_target(
+                fail_pending_from_target(
                     state,
                     session_id,
                     target_id,
@@ -727,7 +762,7 @@ pub(super) async fn handle_agent_message(
             let runtime = { state.inner.tunnels.read().await.get(&session_id).cloned() };
             if let Some(runtime) = runtime {
                 if let Err(error) = maybe_send_dial_offer(state, &runtime).await {
-                    fail_from_target(
+                    fail_pending_from_target(
                         state,
                         session_id,
                         target_id,
@@ -1505,13 +1540,6 @@ async fn register_punch_ready(
             }
         }
     }
-    let expected_count = match side {
-        PunchSide::Target => 257,
-        PunchSide::Client => 1,
-    };
-    if socket_count != expected_count {
-        return Err(ApiError::bad_request("punch socket count is invalid"));
-    }
     let start = {
         let mut setup = runtime.setup.lock().await;
         if setup.punch_stage == PunchStage::NativePlanned {
@@ -1519,6 +1547,13 @@ async fn register_punch_ready(
         }
         if setup.punch_stage != PunchStage::PairSent {
             return Err(ApiError::conflict("punch pair is not ready"));
+        }
+        let expected_count = match side {
+            PunchSide::Target => 257,
+            PunchSide::Client => 1,
+        };
+        if socket_count != expected_count {
+            return Err(ApiError::bad_request("punch socket count is invalid"));
         }
         match side {
             PunchSide::Target if setup.target_punch_ready => {
@@ -1603,12 +1638,6 @@ async fn register_punch_selection(
     if runtime.relay_mode != relay_mode || *runtime.phase.lock().await != TunnelPhase::Pending {
         return Err(ApiError::conflict("SSH session is not pending"));
     }
-    if selection.local_socket.port() == 0
-        || selection.peer_observed_addr.port() == 0
-        || selection.peer_observed_addr.ip().is_unspecified()
-    {
-        return Err(ApiError::bad_request("selected punch tuple is invalid"));
-    }
     match side {
         PunchSide::Client => {
             let Some((user, sender)) = client else {
@@ -1638,6 +1667,37 @@ async fn register_punch_selection(
         if setup.punch_stage != PunchStage::Punching {
             return Err(ApiError::conflict("punch has not started"));
         }
+        if selection.index >= 257
+            || selection.local_socket.port() == 0
+            || selection.peer_observed_addr.port() == 0
+            || selection.peer_observed_addr.ip().is_unspecified()
+        {
+            return Err(ApiError::bad_request("selected punch tuple is invalid"));
+        }
+        match side {
+            PunchSide::Target => {
+                let Some(discovery) = setup.target_discovery.as_ref() else {
+                    return Err(ApiError::conflict("target QAD result is missing"));
+                };
+                if selection.local_socket.ip() != discovery.local_socket.ip()
+                    || (selection.index == 0 && selection.local_socket != discovery.local_socket)
+                {
+                    return Err(ApiError::bad_request(
+                        "target punch socket does not match its QAD-bound address",
+                    ));
+                }
+            }
+            PunchSide::Client => {
+                let Some(discovery) = setup.client_discovery.as_ref() else {
+                    return Err(ApiError::conflict("client QAD result is missing"));
+                };
+                if selection.local_socket != discovery.local_socket {
+                    return Err(ApiError::bad_request(
+                        "client punch socket differs from its QAD-bound socket",
+                    ));
+                }
+            }
+        }
         let slot = match side {
             PunchSide::Target => &mut setup.target_selection,
             PunchSide::Client => &mut setup.client_selection,
@@ -1651,21 +1711,22 @@ async fn register_punch_selection(
         else {
             return Ok(());
         };
-        setup.punch_stage = PunchStage::NativePlanned;
         if target_selection.index != client_selection.index {
-            (NativePlan::Standard, NativePlan::Standard)
-        } else {
-            (
-                NativePlan::Handoff {
-                    self_observed_addr: client_selection.peer_observed_addr,
-                    peer_observed_addr: target_selection.peer_observed_addr,
-                },
-                NativePlan::Handoff {
-                    self_observed_addr: target_selection.peer_observed_addr,
-                    peer_observed_addr: client_selection.peer_observed_addr,
-                },
-            )
+            return Err(ApiError::bad_request(
+                "target and client selected different punch indexes",
+            ));
         }
+        setup.punch_stage = PunchStage::NativePlanned;
+        (
+            NativePlan::Handoff {
+                self_observed_addr: client_selection.peer_observed_addr,
+                peer_observed_addr: target_selection.peer_observed_addr,
+            },
+            NativePlan::Handoff {
+                self_observed_addr: target_selection.peer_observed_addr,
+                peer_observed_addr: client_selection.peer_observed_addr,
+            },
+        )
     };
     send_native_plans(state, &runtime, plans.0, plans.1).await
 }
@@ -1980,6 +2041,35 @@ async fn fail_from_target(
     }
 }
 
+async fn fail_pending_from_target(
+    state: &ServerState,
+    session_id: Uuid,
+    target_id: Uuid,
+    connection_id: Uuid,
+    code: String,
+    message: String,
+) {
+    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+    let Some(runtime) = runtime else {
+        send_agent_error(
+            state,
+            target_id,
+            connection_id,
+            Some(session_id),
+            &code,
+            &message,
+        )
+        .await;
+        return;
+    };
+    if runtime.target_id == target_id
+        && runtime.target_connection_id == connection_id
+        && *runtime.phase.lock().await == TunnelPhase::Pending
+    {
+        fail_tunnel(state, &runtime, &code, &message).await;
+    }
+}
+
 pub(super) async fn close_pending_client_tunnels(
     state: &ServerState,
     client_sender: &mpsc::Sender<ControlMessage>,
@@ -2015,7 +2105,7 @@ async fn close_pending_target_tunnels(state: &ServerState, target_id: Uuid, conn
     }
 }
 
-async fn unregister_agent(state: &ServerState, target_id: Uuid, connection_id: Uuid) {
+pub(super) async fn unregister_agent(state: &ServerState, target_id: Uuid, connection_id: Uuid) {
     let mut online = state.inner.online_agents.write().await;
     if online
         .get(&target_id)

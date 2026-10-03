@@ -432,6 +432,185 @@ async fn exchange_test_client_candidates(
     (client_offer, dial_offer, target_data_endpoint_id)
 }
 
+fn test_qad_ready(
+    local_socket: SocketAddrV4,
+    observed_addrs: [SocketAddrV4; 2],
+) -> DiscoveryResult {
+    DiscoveryResult::Ready {
+        local_socket,
+        observations: [
+            QadObservation {
+                reflector: QadReflector {
+                    addr: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 3478),
+                    server_name: "private-reflector".to_owned(),
+                },
+                local_socket,
+                observed_addr: observed_addrs[0],
+                handshake_confirmed: true,
+                udp_tx_datagrams: 5,
+                udp_rx_datagrams: 5,
+                udp_tx_bytes: 500,
+                udp_rx_bytes: 500,
+            },
+            QadObservation {
+                reflector: QadReflector {
+                    addr: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 2), 7842),
+                    server_name: "official-reflector".to_owned(),
+                },
+                local_socket,
+                observed_addr: observed_addrs[1],
+                handshake_confirmed: true,
+                udp_tx_datagrams: 5,
+                udp_rx_datagrams: 5,
+                udp_tx_bytes: 500,
+                udp_rx_bytes: 500,
+            },
+        ]
+        .into(),
+    }
+}
+
+async fn start_test_birthday_punch(
+    state: &ServerState,
+    user: super::auth::AuthenticatedUser,
+    target_id: Uuid,
+    connection_id: Uuid,
+    device_key: &SecretKey,
+    target_receiver: &mut mpsc::Receiver<ControlMessage>,
+    client_sender: &mpsc::Sender<ControlMessage>,
+    client_receiver: &mut mpsc::Receiver<ControlMessage>,
+    session_id: Uuid,
+    client_key: &SecretKey,
+    target_local: SocketAddrV4,
+    target_observed: [SocketAddrV4; 2],
+    client_local: SocketAddrV4,
+    client_observed: [SocketAddrV4; 2],
+) -> String {
+    control::open_tunnel(
+        state,
+        user,
+        client_sender,
+        session_id,
+        target_id,
+        client_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open test birthday punch session");
+    let expires_at = match target_receiver.recv().await.expect("target Prepare") {
+        ControlMessage::Prepare {
+            session_id: received,
+            expires_at,
+            ..
+        } if received == session_id => expires_at,
+        other => panic!("unexpected target control message: {other:?}"),
+    };
+    let target_data_key = SecretKey::generate();
+    let signature = device_key
+        .sign(&identity::agent_session_identity_payload(
+            session_id,
+            target_id,
+            RelayMode::Private,
+            &target_data_key.public(),
+            expires_at,
+        ))
+        .to_bytes()
+        .to_vec();
+    control::handle_agent_message(
+        state,
+        target_id,
+        connection_id,
+        ControlMessage::AgentIdentity {
+            session_id,
+            relay_mode: RelayMode::Private,
+            target_data_endpoint_id: target_data_key.public().to_string(),
+            signature,
+        },
+    )
+    .await;
+    assert!(matches!(
+        target_receiver.recv().await.expect("target identity acceptance"),
+        ControlMessage::IdentityAccepted { session_id: received, .. }
+            if received == session_id
+    ));
+    control::handle_agent_message(
+        state,
+        target_id,
+        connection_id,
+        ControlMessage::CandidatesReady {
+            session_id,
+            relay_mode: RelayMode::Private,
+            discovery: test_qad_ready(target_local, target_observed),
+        },
+    )
+    .await;
+    control::handle_client_message(
+        state,
+        user,
+        client_sender,
+        ControlMessage::CandidatesReady {
+            session_id,
+            relay_mode: RelayMode::Private,
+            discovery: test_qad_ready(client_local, client_observed),
+        },
+    )
+    .await;
+    assert!(matches!(
+        client_receiver.recv().await.expect("client offer"),
+        ControlMessage::ClientOffer { session_id: received, .. }
+            if received == session_id
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("target punch pair"),
+        ControlMessage::PunchPair { session_id: received, .. }
+            if received == session_id
+    ));
+    assert!(matches!(
+        client_receiver.recv().await.expect("client punch pair"),
+        ControlMessage::PunchPair { session_id: received, .. }
+            if received == session_id
+    ));
+    control::handle_agent_message(
+        state,
+        target_id,
+        connection_id,
+        ControlMessage::PunchReady {
+            session_id,
+            relay_mode: RelayMode::Private,
+            socket_count: 257,
+        },
+    )
+    .await;
+    control::handle_client_message(
+        state,
+        user,
+        client_sender,
+        ControlMessage::PunchReady {
+            session_id,
+            relay_mode: RelayMode::Private,
+            socket_count: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        timeout(Duration::from_secs(2), target_receiver.recv())
+            .await
+            .expect("target StartPunch timed out")
+            .expect("target control channel closed"),
+        ControlMessage::StartPunch { session_id: received, .. }
+            if received == session_id
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(2), client_receiver.recv())
+            .await
+            .expect("client StartPunch timed out")
+            .expect("client control channel closed"),
+        ControlMessage::StartPunch { session_id: received, .. }
+            if received == session_id
+    ));
+    target_data_key.public().to_string()
+}
+
 fn endpoint_connect_request(endpoint_id: iroh::EndpointId) -> ClientRequest {
     let request = hyper::Request::builder()
         .uri("https://kmesh.test/relay")
@@ -1288,7 +1467,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
             session_id,
             relay_mode: RelayMode::Private,
             index: 7,
-            local_socket: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 42001),
+            local_socket: client_local,
             peer_observed_addr: SocketAddrV4::new(target_ip, 2110),
         },
     )
@@ -1314,6 +1493,184 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
             && peer_observed_addr == SocketAddrV4::new(target_ip, 2110)
     ));
     control::close_pending_client_tunnels(state, &client_sender).await;
+}
+
+#[tokio::test]
+async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatched_index() {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    let login = login_password(state).await;
+    let user = auth::authenticate(state, &bearer(&login.access_token))
+        .await
+        .expect("authenticate punch selection test user");
+    let device_key = SecretKey::generate();
+    let (target_id, _) = create_enrolled_target(state, "punch-selection-target", &device_key).await;
+    grant_target(state, target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    let target_local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 41000);
+    let target_ip = Ipv4Addr::new(203, 0, 113, 10);
+    let target_mappings = [
+        SocketAddrV4::new(target_ip, 2100),
+        SocketAddrV4::new(target_ip, 2110),
+    ];
+    let client_local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 42000);
+    let client_mapping = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 32000);
+    let client_mappings = [client_mapping, client_mapping];
+
+    let (client_sender, mut client_receiver) = mpsc::channel(16);
+    let client_key = SecretKey::generate();
+    let session_id = Uuid::new_v4();
+    start_test_birthday_punch(
+        state,
+        user,
+        target_id,
+        connection_id,
+        &device_key,
+        &mut target_receiver,
+        &client_sender,
+        &mut client_receiver,
+        session_id,
+        &client_key,
+        target_local,
+        target_mappings,
+        client_local,
+        client_mappings,
+    )
+    .await;
+    control::handle_agent_message(
+        state,
+        target_id,
+        connection_id,
+        ControlMessage::PunchSelected {
+            session_id,
+            relay_mode: RelayMode::Private,
+            index: 0,
+            local_socket: target_local,
+            peer_observed_addr: client_mapping,
+        },
+    )
+    .await;
+    control::handle_client_message(
+        state,
+        user,
+        &client_sender,
+        ControlMessage::PunchSelected {
+            session_id,
+            relay_mode: RelayMode::Private,
+            index: 0,
+            local_socket: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, client_local.port() + 1),
+            peer_observed_addr: SocketAddrV4::new(target_ip, 2110),
+        },
+    )
+    .await;
+    assert!(matches!(
+        client_receiver.recv().await.expect("reject changed client tuple"),
+        ControlMessage::Error { session_id: Some(id), code, .. }
+            if id == session_id && code == "client_punch_rejected"
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("notify target of bad client tuple"),
+        ControlMessage::Error { session_id: Some(id), .. } if id == session_id
+    ));
+
+    let (client_sender, mut client_receiver) = mpsc::channel(16);
+    let client_key = SecretKey::generate();
+    let session_id = Uuid::new_v4();
+    start_test_birthday_punch(
+        state,
+        user,
+        target_id,
+        connection_id,
+        &device_key,
+        &mut target_receiver,
+        &client_sender,
+        &mut client_receiver,
+        session_id,
+        &client_key,
+        target_local,
+        target_mappings,
+        client_local,
+        client_mappings,
+    )
+    .await;
+    control::handle_agent_message(
+        state,
+        target_id,
+        connection_id,
+        ControlMessage::PunchSelected {
+            session_id,
+            relay_mode: RelayMode::Private,
+            index: 257,
+            local_socket: target_local,
+            peer_observed_addr: client_mapping,
+        },
+    )
+    .await;
+    assert!(matches!(
+        target_receiver.recv().await.expect("reject out-of-range target index"),
+        ControlMessage::Error { session_id: Some(id), code, .. }
+            if id == session_id && code == "agent_punch_rejected"
+    ));
+    assert!(matches!(
+        client_receiver.recv().await.expect("notify client of bad target index"),
+        ControlMessage::Error { session_id: Some(id), .. } if id == session_id
+    ));
+
+    let (client_sender, mut client_receiver) = mpsc::channel(16);
+    let client_key = SecretKey::generate();
+    let session_id = Uuid::new_v4();
+    start_test_birthday_punch(
+        state,
+        user,
+        target_id,
+        connection_id,
+        &device_key,
+        &mut target_receiver,
+        &client_sender,
+        &mut client_receiver,
+        session_id,
+        &client_key,
+        target_local,
+        target_mappings,
+        client_local,
+        client_mappings,
+    )
+    .await;
+    control::handle_agent_message(
+        state,
+        target_id,
+        connection_id,
+        ControlMessage::PunchSelected {
+            session_id,
+            relay_mode: RelayMode::Private,
+            index: 7,
+            local_socket: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, target_local.port() + 1),
+            peer_observed_addr: client_mapping,
+        },
+    )
+    .await;
+    control::handle_client_message(
+        state,
+        user,
+        &client_sender,
+        ControlMessage::PunchSelected {
+            session_id,
+            relay_mode: RelayMode::Private,
+            index: 8,
+            local_socket: client_local,
+            peer_observed_addr: SocketAddrV4::new(target_ip, 2110),
+        },
+    )
+    .await;
+    assert!(matches!(
+        client_receiver.recv().await.expect("reject mismatched punch index"),
+        ControlMessage::Error { session_id: Some(id), code, .. }
+            if id == session_id && code == "client_punch_rejected"
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("notify target of mismatched index"),
+        ControlMessage::Error { session_id: Some(id), .. } if id == session_id
+    ));
 }
 
 #[tokio::test]
@@ -1797,6 +2154,153 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
 }
 
 #[tokio::test]
+async fn target_control_disconnect_only_closes_its_pending_sessions() {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    let login = login_password(state).await;
+    let user = auth::authenticate(state, &bearer(&login.access_token))
+        .await
+        .expect("authenticate target disconnect test user");
+    let device_key = SecretKey::generate();
+    let (target_id, _) = create_enrolled_target(state, "target-control-owner", &device_key).await;
+    grant_target(state, target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    let relay_url: RelayUrl = reqwest::Url::parse(&state.inner.issuer)
+        .expect("parse private relay URL")
+        .into();
+
+    let (pending_sender, mut pending_receiver) = mpsc::channel(32);
+    let pending_client_key = SecretKey::generate();
+    let pending_session = Uuid::new_v4();
+    control::open_tunnel(
+        state,
+        user,
+        &pending_sender,
+        pending_session,
+        target_id,
+        pending_client_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open pending session");
+    assert!(matches!(
+        target_receiver.recv().await.expect("pending Prepare"),
+        ControlMessage::Prepare { session_id, .. } if session_id == pending_session
+    ));
+
+    let (active_sender, mut active_receiver) = mpsc::channel(32);
+    let active_client_key = SecretKey::generate();
+    let active_session = Uuid::new_v4();
+    control::open_tunnel(
+        state,
+        user,
+        &active_sender,
+        active_session,
+        target_id,
+        active_client_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open active session");
+    assert!(matches!(
+        target_receiver.recv().await.expect("active Prepare"),
+        ControlMessage::Prepare { session_id, .. } if session_id == active_session
+    ));
+    let _active_data_key = send_agent_ready_for_session(
+        state,
+        target_id,
+        connection_id,
+        active_session,
+        RelayMode::Private,
+        &device_key,
+        &mut target_receiver,
+    )
+    .await;
+    let (_, _, active_target_data_endpoint_id) = exchange_test_client_candidates(
+        state,
+        &mut active_receiver,
+        &mut target_receiver,
+        active_session,
+        &active_client_key,
+        RelayMode::Private,
+        relay_url,
+    )
+    .await;
+    control::activate_tunnel(
+        state,
+        target_id,
+        connection_id,
+        active_session,
+        active_client_key.public().to_string(),
+        active_target_data_endpoint_id.clone(),
+        RelayMode::Private,
+    )
+    .await;
+    assert!(matches!(
+        active_receiver.recv().await.expect("active client activation"),
+        ControlMessage::Activated { session_id } if session_id == active_session
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("active target activation"),
+        ControlMessage::Activated { session_id } if session_id == active_session
+    ));
+
+    control::unregister_agent(state, target_id, connection_id).await;
+    assert!(matches!(
+        pending_receiver.recv().await.expect("pending client close"),
+        ControlMessage::Close { session_id, .. } if session_id == pending_session
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("pending target close"),
+        ControlMessage::Close { session_id, .. } if session_id == pending_session
+    ));
+    assert!(active_receiver.try_recv().is_err());
+
+    let pending_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(pending_session.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read pending session status");
+    let active_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(active_session.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read active session status");
+    assert_eq!(pending_status, "closed");
+    assert_eq!(active_status, "active");
+    assert_eq!(
+        state
+            .on_connect(&endpoint_connect_request(active_client_key.public()))
+            .await,
+        Access::Allow
+    );
+    assert_eq!(
+        state
+            .on_connect(&endpoint_connect_request(
+                active_target_data_endpoint_id
+                    .parse()
+                    .expect("parse active target data EndpointId"),
+            ))
+            .await,
+        Access::Allow
+    );
+    assert_eq!(
+        state
+            .on_connect(&endpoint_connect_request(pending_client_key.public()))
+            .await,
+        Access::Deny { .. }
+    );
+    assert_eq!(
+        state
+            .on_connect(&endpoint_connect_request(device_key.public()))
+            .await,
+        Access::Deny { .. }
+    );
+}
+
+#[tokio::test]
 async fn public_default_mode_works_without_a_private_relay() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
@@ -2271,6 +2775,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     let endpoint_options = IrohEndpointOptions {
         relay_choice: relay_choice.clone(),
         tls: tls.clone(),
+        handoff: None,
     };
     let mut agent_control = connect_control_ws(&issuer, "agent/control", &agent_token, &tls).await;
 
