@@ -43,7 +43,7 @@ impl Database {
                     .await?;
             if let Some(version) = version {
                 anyhow::ensure!(
-                    version == 2,
+                    version == 3,
                     "server database schema version {version} requires a fresh data directory"
                 );
             }

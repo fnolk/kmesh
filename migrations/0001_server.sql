@@ -122,4 +122,16 @@ CREATE INDEX IF NOT EXISTS tunnel_sessions_client_endpoint_idx ON tunnel_session
 CREATE INDEX IF NOT EXISTS tunnel_sessions_target_endpoint_idx ON tunnel_sessions(target_endpoint_id, status, expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS tunnel_sessions_client_live_idx ON tunnel_sessions(client_endpoint_id) WHERE status IN ('pending', 'active');
 
-INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, unixepoch());
+CREATE TABLE IF NOT EXISTS admin_audit (
+    id TEXT PRIMARY KEY,
+    occurred_at INTEGER NOT NULL,
+    actor_user_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    object_type TEXT NOT NULL,
+    object_id TEXT,
+    context_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admin_audit_actor_time_idx ON admin_audit(actor_user_id, occurred_at);
+CREATE INDEX IF NOT EXISTS admin_audit_object_idx ON admin_audit(object_type, object_id, occurred_at);
+
+INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, unixepoch());

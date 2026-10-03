@@ -19,6 +19,7 @@ use iroh_relay::{
     server::{Access, AccessControl, ClientRequest},
 };
 use rcgen::generate_simple_self_signed;
+use sqlx::Row;
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -130,6 +131,15 @@ async fn admin_role_id(state: &ServerState) -> Uuid {
         .expect("parse admin role ID")
 }
 
+async fn admin_user_id(state: &ServerState) -> Uuid {
+    sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&state.inner.db.pool)
+        .await
+        .expect("read initial admin")
+        .parse()
+        .expect("parse admin user ID")
+}
+
 async fn create_enrolled_target(
     state: &ServerState,
     name: &str,
@@ -137,6 +147,7 @@ async fn create_enrolled_target(
 ) -> (Uuid, String) {
     let created = super::admin::apply_operation(
         state,
+        admin_user_id(state).await,
         AdminOperation::CreateTarget {
             name: name.to_owned(),
         },
@@ -191,6 +202,7 @@ async fn grant_target(state: &ServerState, target_id: Uuid) {
     let role_id = admin_role_id(state).await;
     super::admin::apply_operation(
         state,
+        admin_user_id(state).await,
         AdminOperation::GrantTarget {
             role_id,
             target_id,
@@ -205,6 +217,7 @@ async fn revoke_target(state: &ServerState, target_id: Uuid) {
     let role_id = admin_role_id(state).await;
     super::admin::apply_operation(
         state,
+        admin_user_id(state).await,
         AdminOperation::RevokeTarget {
             role_id,
             target_id,
@@ -246,6 +259,291 @@ fn endpoint_connect_request(endpoint_id: iroh::EndpointId) -> ClientRequest {
         .expect("build relay request");
     let (parts, _) = request.into_parts();
     ClientRequest::new(endpoint_id, ProtocolVersion::V2, parts)
+}
+
+#[tokio::test]
+async fn schema_v2_requires_a_fresh_data_directory() {
+    let data_dir = std::env::temp_dir().join(format!("kmesh-schema-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&data_dir).expect("create schema test directory");
+    let db = Database::open(data_dir.join("server.sqlite3"))
+        .await
+        .expect("open schema test database");
+    sqlx::query(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("create previous schema marker");
+    sqlx::query("INSERT INTO schema_migrations(version, applied_at) VALUES (2, 0)")
+        .execute(&db.pool)
+        .await
+        .expect("record previous schema version");
+
+    let error = db
+        .apply_schema()
+        .await
+        .expect_err("schema version 2 must fail before applying schema 3");
+    assert!(
+        error
+            .to_string()
+            .contains("requires a fresh data directory")
+    );
+
+    db.pool.close().await;
+    std::fs::remove_dir_all(data_dir).expect("remove schema test directory");
+}
+
+#[tokio::test]
+async fn admin_audit_commits_with_mutations_and_failed_audit_rolls_back() {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    let actor_id = admin_user_id(state).await;
+
+    sqlx::query(
+        "CREATE TRIGGER reject_admin_audit BEFORE INSERT ON admin_audit \
+         BEGIN SELECT RAISE(ABORT, 'test audit insert failure'); END",
+    )
+    .execute(&state.inner.db.pool)
+    .await
+    .expect("install audit failure trigger");
+    let result = super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::CreateTarget {
+            name: "rolled-back-target".to_owned(),
+        },
+    )
+    .await;
+    assert!(result.is_err(), "audit failure must fail the operation");
+    let target_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM targets WHERE name = 'rolled-back-target'",
+    )
+    .fetch_one(&state.inner.db.pool)
+    .await
+    .expect("read rolled-back target count");
+    assert_eq!(
+        target_count, 0,
+        "the target mutation shares the audit transaction"
+    );
+
+    sqlx::query("DROP TRIGGER reject_admin_audit")
+        .execute(&state.inner.db.pool)
+        .await
+        .expect("remove audit failure trigger");
+    let result = super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::RenameTarget {
+            target_id: Uuid::new_v4(),
+            name: "missing-target".to_owned(),
+        },
+    )
+    .await;
+    assert!(result.is_err(), "a missing target operation must fail");
+    let audit_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM admin_audit")
+        .fetch_one(&state.inner.db.pool)
+        .await
+        .expect("read audit count after failures");
+    assert_eq!(audit_count, 0, "failed operations leave no success record");
+
+    let created = super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::CreateTarget {
+            name: "audited-target".to_owned(),
+        },
+    )
+    .await
+    .expect("create target with audit");
+    let AdminResponse::TargetCreated { target, .. } = created else {
+        panic!("target creation returned an unexpected result");
+    };
+    let row = sqlx::query(
+        "SELECT actor_user_id, operation, object_type, object_id, context_json \
+         FROM admin_audit WHERE operation = 'create_target'",
+    )
+    .fetch_one(&state.inner.db.pool)
+    .await
+    .expect("read target creation audit");
+    assert_eq!(
+        row.try_get::<String, _>("actor_user_id").unwrap(),
+        actor_id.to_string()
+    );
+    assert_eq!(
+        row.try_get::<String, _>("operation").unwrap(),
+        "create_target"
+    );
+    assert_eq!(row.try_get::<String, _>("object_type").unwrap(), "target");
+    assert_eq!(
+        row.try_get::<String, _>("object_id").unwrap(),
+        target.target_id.to_string()
+    );
+    let context: serde_json::Value =
+        serde_json::from_str(&row.try_get::<String, _>("context_json").unwrap())
+            .expect("decode audit context");
+    assert_eq!(context["name"], "audited-target");
+}
+
+#[tokio::test]
+async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    let actor_id = admin_user_id(state).await;
+    let password = "audit-user-password-secret";
+    let created_user = super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::CreateUser {
+            username: "audit-user".to_owned(),
+            password: password.to_owned(),
+        },
+    )
+    .await
+    .expect("create audited user");
+    let AdminResponse::User(user) = created_user else {
+        panic!("user creation returned an unexpected result");
+    };
+
+    let created_target = super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::CreateTarget {
+            name: "audit-target".to_owned(),
+        },
+    )
+    .await
+    .expect("create audited target");
+    let AdminResponse::TargetCreated {
+        target,
+        enrollment_token,
+    } = created_target
+    else {
+        panic!("target creation returned an unexpected result");
+    };
+
+    let private = PrivateKey::from_openssh(TEST_PRIVATE_KEY).expect("parse test SSH key");
+    let public_key = private
+        .public_key()
+        .to_openssh()
+        .expect("encode test public key")
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::AddUserKey {
+            user_id: user.user_id,
+            public_key: public_key.clone(),
+            label: "audit-test-key".to_owned(),
+        },
+    )
+    .await
+    .expect("register audited SSH key");
+    super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::ResetPassword {
+            user_id: user.user_id,
+            password: "replacement-password-secret".to_owned(),
+        },
+    )
+    .await
+    .expect("reset password");
+
+    let created_role = super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::CreateRole {
+            name: "audit-role".to_owned(),
+        },
+    )
+    .await
+    .expect("create audited role");
+    let AdminResponse::Role(role) = created_role else {
+        panic!("role creation returned an unexpected result");
+    };
+    super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::SetUserRoles {
+            user_id: user.user_id,
+            role_ids: vec![role.role_id, role.role_id],
+        },
+    )
+    .await
+    .expect("assign audited role");
+    super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::GrantTarget {
+            role_id: role.role_id,
+            target_id: target.target_id,
+            permission: TargetPermission::SshConnect,
+        },
+    )
+    .await
+    .expect("grant audited target");
+    super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::DeleteRole {
+            role_id: role.role_id,
+        },
+    )
+    .await
+    .expect("delete audited role");
+
+    let audit_rows = sqlx::query(
+        "SELECT operation, object_id, context_json FROM admin_audit ORDER BY occurred_at, id",
+    )
+    .fetch_all(&state.inner.db.pool)
+    .await
+    .expect("read admin audit rows");
+    let contexts = audit_rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("context_json").unwrap())
+        .collect::<Vec<_>>();
+    let audit_dump = contexts.join("\n");
+    let password_hash =
+        sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE id = ?1")
+            .bind(user.user_id.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read stored password hash");
+    assert!(!audit_dump.contains(password));
+    assert!(!audit_dump.contains("replacement-password-secret"));
+    assert!(!audit_dump.contains(&password_hash));
+    assert!(!audit_dump.contains(&enrollment_token));
+    assert!(!audit_dump.contains(&public_key));
+
+    let delete_row = audit_rows
+        .iter()
+        .find(|row| row.try_get::<String, _>("operation").unwrap() == "delete_role")
+        .expect("deleted role audit row");
+    assert_eq!(
+        delete_row.try_get::<String, _>("object_id").unwrap(),
+        role.role_id.to_string()
+    );
+    let context: serde_json::Value =
+        serde_json::from_str(&delete_row.try_get::<String, _>("context_json").unwrap())
+            .expect("decode deleted role context");
+    assert_eq!(context["role_name"], "audit-role");
+    assert_eq!(context["user_ids"][0], user.user_id.to_string());
+    assert_eq!(
+        context["grants"][0]["target_id"],
+        target.target_id.to_string()
+    );
+    assert_eq!(context["grants"][0]["permission"], "ssh_connect");
+
+    let role_exists =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM roles WHERE id = ?1)")
+            .bind(role.role_id.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("verify role deletion");
+    assert_eq!(role_exists, 0);
 }
 
 #[tokio::test]
@@ -577,14 +875,10 @@ async fn sshsig_comment_canonicalization_and_challenge_replay() {
         auth::canonical_ssh_key(&with_comment).expect("canonical key with comment"),
         auth::canonical_ssh_key(&no_comment).expect("canonical key without comment")
     );
-    let admin_id = sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE username = 'admin'")
-        .fetch_one(&state.inner.db.pool)
-        .await
-        .expect("read initial admin")
-        .parse::<Uuid>()
-        .expect("parse user id");
+    let admin_id = admin_user_id(state).await;
     super::admin::apply_operation(
         state,
+        admin_id,
         AdminOperation::AddUserKey {
             user_id: admin_id,
             public_key: with_comment.clone(),

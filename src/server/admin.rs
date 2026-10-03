@@ -69,19 +69,89 @@ pub(crate) async fn operation(
     if !state.inner.db.is_admin(actor.user_id).await? {
         return Err(ApiError::forbidden());
     }
-    Ok(Json(apply_operation(&state, request.operation).await?))
+    Ok(Json(
+        apply_operation(&state, actor.user_id, request.operation).await?,
+    ))
 }
 
 pub(crate) async fn apply_operation(
     state: &ServerState,
+    actor_user_id: Uuid,
+    operation: AdminOperation,
+) -> Result<AdminResponse, ApiError> {
+    use AdminOperation as Op;
+
+    match &operation {
+        Op::ListUsers => return Ok(AdminResponse::Users(list_users(state).await?)),
+        Op::ListKeys { user_id } => {
+            return Ok(AdminResponse::Keys(list_keys(state, *user_id).await?));
+        }
+        Op::ListRoles => return Ok(AdminResponse::Roles(list_roles(state).await?)),
+        Op::ListUserRoles { user_id } => {
+            return Ok(AdminResponse::UserRoles(
+                list_user_roles(state, *user_id).await?,
+            ));
+        }
+        Op::ListRoleGrants { role_id } => {
+            return Ok(AdminResponse::Grants(
+                list_role_grants(state, *role_id).await?,
+            ));
+        }
+        Op::ListTargets => return Ok(AdminResponse::Targets(list_targets(state).await?)),
+        _ => {}
+    }
+
+    let mut operation = operation;
+    let password_hash = match &mut operation {
+        Op::CreateUser { password, .. } | Op::ResetPassword { password, .. } => {
+            validate_password(password)?;
+            Some(
+                password_hash_limited(std::mem::take(password))
+                    .await
+                    .map_err(ApiError::from)?,
+            )
+        }
+        _ => None,
+    };
+    let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut audit = prepare_audit_event(actor_user_id, &operation, &mut tx).await?;
+    let response = apply_operation_write(&mut tx, password_hash, operation).await?;
+    complete_audit_event(&mut audit, &response);
+    sqlx::query(
+        "INSERT INTO admin_audit(id, occurred_at, actor_user_id, operation, object_type, object_id, context_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(audit.id.to_string())
+    .bind(audit.occurred_at)
+    .bind(audit.actor_user_id.to_string())
+    .bind(audit.operation)
+    .bind(audit.object_type)
+    .bind(audit.object_id.map(|id| id.to_string()))
+    .bind(serde_json::to_string(&audit.context).map_err(ApiError::internal)?)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(response)
+}
+
+async fn apply_operation_write(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    password_hash: Option<String>,
     operation: AdminOperation,
 ) -> Result<AdminResponse, ApiError> {
     use AdminOperation as Op;
     match operation {
-        Op::ListUsers => Ok(AdminResponse::Users(list_users(state).await?)),
-        Op::CreateUser { username, password } => {
+        Op::ListUsers
+        | Op::ListKeys { .. }
+        | Op::ListRoles
+        | Op::ListUserRoles { .. }
+        | Op::ListRoleGrants { .. }
+        | Op::ListTargets => unreachable!("read operations are dispatched before the transaction"),
+        Op::CreateUser {
+            username,
+            password: _,
+        } => {
             let username = normalize_username(&username)?;
-            validate_password(&password)?;
             let id = Uuid::new_v4();
             let now = unix_time();
             sqlx::query(
@@ -90,13 +160,9 @@ pub(crate) async fn apply_operation(
             )
             .bind(id.to_string())
             .bind(&username)
-            .bind(
-                password_hash_limited(password)
-                    .await
-                    .map_err(ApiError::from)?,
-            )
+            .bind(password_hash.expect("password hash was prepared before opening transaction"))
             .bind(now)
-            .execute(&state.inner.db.pool)
+            .execute(&mut **tx)
             .await
             .map_err(map_constraint)?;
             Ok(AdminResponse::User(UserView {
@@ -107,43 +173,40 @@ pub(crate) async fn apply_operation(
         }
         Op::SetUserEnabled { user_id, enabled } => {
             let now = unix_time();
-            let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
             let changed =
                 sqlx::query("UPDATE users SET enabled = ?1, updated_at = ?2 WHERE id = ?3")
                     .bind(i64::from(enabled))
                     .bind(now)
                     .bind(user_id.to_string())
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
             if changed.rows_affected() == 0 {
                 return Err(ApiError::not_found("user does not exist"));
             }
             if !enabled {
-                revoke_user_sessions(&mut tx, user_id, now).await?;
+                revoke_user_sessions(tx, user_id, now).await?;
             }
-            ensure_admin_remains(&mut tx).await?;
-            tx.commit().await?;
+            ensure_admin_remains(tx).await?;
             Ok(AdminResponse::Ok)
         }
-        Op::ResetPassword { user_id, password } => {
-            validate_password(&password)?;
-            let password_hash = password_hash_limited(password)
-                .await
-                .map_err(ApiError::from)?;
+        Op::ResetPassword {
+            user_id,
+            password: _,
+        } => {
+            let password_hash =
+                password_hash.expect("password hash was prepared before opening transaction");
             let now = unix_time();
-            let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
             let changed =
                 sqlx::query("UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3")
                     .bind(password_hash)
                     .bind(now)
                     .bind(user_id.to_string())
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
             if changed.rows_affected() == 0 {
                 return Err(ApiError::not_found("user does not exist"));
             }
-            revoke_user_sessions(&mut tx, user_id, now).await?;
-            tx.commit().await?;
+            revoke_user_sessions(tx, user_id, now).await?;
             Ok(AdminResponse::Ok)
         }
         Op::AddUserKey {
@@ -168,7 +231,7 @@ pub(crate) async fn apply_operation(
             .bind(fingerprint)
             .bind(label.trim())
             .bind(now)
-            .execute(&state.inner.db.pool)
+            .execute(&mut **tx)
             .await
             .map_err(map_constraint)?;
             if inserted.rows_affected() != 1 {
@@ -184,15 +247,13 @@ pub(crate) async fn apply_operation(
         Op::RemoveUserKey { key_id } => {
             let result = sqlx::query("UPDATE user_keys SET enabled = 0 WHERE id = ?1")
                 .bind(key_id.to_string())
-                .execute(&state.inner.db.pool)
+                .execute(&mut **tx)
                 .await?;
             if result.rows_affected() == 0 {
                 return Err(ApiError::not_found("SSH key does not exist"));
             }
             Ok(AdminResponse::Ok)
         }
-        Op::ListKeys { user_id } => Ok(AdminResponse::Keys(list_keys(state, user_id).await?)),
-        Op::ListRoles => Ok(AdminResponse::Roles(list_roles(state).await?)),
         Op::CreateRole { name } => {
             let name = normalize_name(&name, "role")?;
             let role_id = Uuid::new_v4();
@@ -200,16 +261,15 @@ pub(crate) async fn apply_operation(
                 .bind(role_id.to_string())
                 .bind(&name)
                 .bind(unix_time())
-                .execute(&state.inner.db.pool)
+                .execute(&mut **tx)
                 .await
                 .map_err(map_constraint)?;
             Ok(AdminResponse::Role(RoleView { role_id, name }))
         }
         Op::DeleteRole { role_id } => {
-            let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
             let built_in = sqlx::query_scalar::<_, i64>("SELECT built_in FROM roles WHERE id = ?1")
                 .bind(role_id.to_string())
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?
                 .ok_or_else(|| ApiError::not_found("role does not exist"))?;
             if built_in != 0 {
@@ -217,44 +277,38 @@ pub(crate) async fn apply_operation(
             }
             sqlx::query("DELETE FROM roles WHERE id = ?1")
                 .bind(role_id.to_string())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
-            ensure_admin_remains(&mut tx).await?;
-            tx.commit().await?;
+            ensure_admin_remains(tx).await?;
             Ok(AdminResponse::Ok)
         }
         Op::SetUserRoles { user_id, role_ids } => {
-            let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
             let user_exists =
                 sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)")
                     .bind(user_id.to_string())
-                    .fetch_one(&mut *tx)
+                    .fetch_one(&mut **tx)
                     .await?;
             if user_exists == 0 {
                 return Err(ApiError::not_found("user does not exist"));
             }
             sqlx::query("DELETE FROM user_roles WHERE user_id = ?1")
                 .bind(user_id.to_string())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             for role_id in role_ids.iter().collect::<std::collections::BTreeSet<_>>() {
                 let inserted = sqlx::query("INSERT INTO user_roles(user_id, role_id) SELECT ?1, id FROM roles WHERE id = ?2")
                     .bind(user_id.to_string())
                     .bind(role_id.to_string())
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
                 if inserted.rows_affected() != 1 {
                     return Err(ApiError::not_found("role does not exist"));
                 }
             }
-            ensure_admin_remains(&mut tx).await?;
-            let roles = list_user_roles_tx(&mut tx, user_id).await?;
-            tx.commit().await?;
+            ensure_admin_remains(tx).await?;
+            let roles = list_user_roles_tx(tx, user_id).await?;
             Ok(AdminResponse::UserRoles(roles))
         }
-        Op::ListUserRoles { user_id } => Ok(AdminResponse::UserRoles(
-            list_user_roles(state, user_id).await?,
-        )),
         Op::GrantTarget {
             role_id,
             target_id,
@@ -268,7 +322,7 @@ pub(crate) async fn apply_operation(
             )
             .bind(role_id.to_string())
             .bind(target_id.to_string())
-            .execute(&state.inner.db.pool)
+            .execute(&mut **tx)
             .await
             .map_err(map_constraint)?;
             if inserted.rows_affected() != 1 {
@@ -285,14 +339,10 @@ pub(crate) async fn apply_operation(
             sqlx::query("DELETE FROM target_permissions WHERE role_id = ?1 AND target_id = ?2 AND permission = 'ssh_connect'")
                 .bind(role_id.to_string())
                 .bind(target_id.to_string())
-                .execute(&state.inner.db.pool)
+                .execute(&mut **tx)
                 .await?;
             Ok(AdminResponse::Ok)
         }
-        Op::ListRoleGrants { role_id } => Ok(AdminResponse::Grants(
-            list_role_grants(state, role_id).await?,
-        )),
-        Op::ListTargets => Ok(AdminResponse::Targets(list_targets(state).await?)),
         Op::CreateTarget { name } => {
             let name = normalize_name(&name, "target")?;
             let target_id = Uuid::new_v4();
@@ -307,7 +357,7 @@ pub(crate) async fn apply_operation(
             .bind(hash_secret(&enrollment_token))
             .bind(now + 10 * 60)
             .bind(now)
-            .execute(&state.inner.db.pool)
+            .execute(&mut **tx)
             .await
             .map_err(map_constraint)?;
             Ok(AdminResponse::TargetCreated {
@@ -326,7 +376,7 @@ pub(crate) async fn apply_operation(
                 .bind(name)
                 .bind(unix_time())
                 .bind(target_id.to_string())
-                .execute(&state.inner.db.pool)
+                .execute(&mut **tx)
                 .await
                 .map_err(map_constraint)?;
             if changed.rows_affected() == 0 {
@@ -339,7 +389,7 @@ pub(crate) async fn apply_operation(
                 .bind(i64::from(enabled))
                 .bind(unix_time())
                 .bind(target_id.to_string())
-                .execute(&state.inner.db.pool)
+                .execute(&mut **tx)
                 .await?;
             if changed.rows_affected() == 0 {
                 return Err(ApiError::not_found("target does not exist"));
@@ -350,7 +400,7 @@ pub(crate) async fn apply_operation(
             let changed = sqlx::query("UPDATE targets SET enabled = 0, deleted_at = COALESCE(deleted_at, ?1), updated_at = ?1 WHERE id = ?2")
                 .bind(unix_time())
                 .bind(target_id.to_string())
-                .execute(&state.inner.db.pool)
+                .execute(&mut **tx)
                 .await?;
             if changed.rows_affected() == 0 {
                 return Err(ApiError::not_found("target does not exist"));
@@ -368,7 +418,7 @@ pub(crate) async fn apply_operation(
             .bind(now + 10 * 60)
             .bind(now)
             .bind(target_id.to_string())
-            .execute(&state.inner.db.pool)
+            .execute(&mut **tx)
             .await?;
             if changed.rows_affected() == 0 {
                 return Err(ApiError::not_found("target does not exist"));
@@ -378,6 +428,274 @@ pub(crate) async fn apply_operation(
                 enrollment_token,
             })
         }
+    }
+}
+
+struct AuditEvent {
+    id: Uuid,
+    occurred_at: i64,
+    actor_user_id: Uuid,
+    operation: &'static str,
+    object_type: &'static str,
+    object_id: Option<Uuid>,
+    context: serde_json::Value,
+}
+
+async fn prepare_audit_event(
+    actor_user_id: Uuid,
+    operation: &AdminOperation,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<AuditEvent, ApiError> {
+    use AdminOperation as Op;
+
+    let (name, object_type, object_id, context) = match operation {
+        Op::CreateUser { username, .. } => (
+            "create_user",
+            "user",
+            None,
+            serde_json::json!({ "username": username }),
+        ),
+        Op::SetUserEnabled { user_id, enabled } => ("set_user_enabled", "user", Some(*user_id), {
+            let row = sqlx::query("SELECT username, enabled FROM users WHERE id = ?1")
+                .bind(user_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+            serde_json::json!({
+                "user_id": user_id,
+                "username": row.as_ref().map(|row| row.try_get::<String, _>("username")).transpose()?,
+                "previous_enabled": row.as_ref().map(|row| row.try_get::<i64, _>("enabled").map(|enabled| enabled == 1)).transpose()?,
+                "enabled": enabled,
+            })
+        }),
+        Op::ResetPassword { user_id, .. } => (
+            "reset_password",
+            "user",
+            Some(*user_id),
+            serde_json::json!({ "user_id": user_id }),
+        ),
+        Op::AddUserKey { user_id, label, .. } => (
+            "add_user_key",
+            "ssh_key",
+            None,
+            serde_json::json!({ "user_id": user_id, "label": label.trim() }),
+        ),
+        Op::RemoveUserKey { key_id } => {
+            let details = sqlx::query("SELECT user_id, label FROM user_keys WHERE id = ?1")
+                .bind(key_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|row| -> Result<serde_json::Value, sqlx::Error> {
+                    Ok(serde_json::json!({
+                        "key_id": key_id,
+                        "user_id": row.try_get::<String, _>("user_id")?,
+                        "label": row.try_get::<String, _>("label")?,
+                    }))
+                })
+                .transpose()?;
+            (
+                "remove_user_key",
+                "ssh_key",
+                Some(*key_id),
+                details.unwrap_or_else(|| serde_json::json!({ "key_id": key_id })),
+            )
+        }
+        Op::CreateRole { name } => (
+            "create_role",
+            "role",
+            None,
+            serde_json::json!({ "name": name }),
+        ),
+        Op::DeleteRole { role_id } => {
+            let role_name = sqlx::query_scalar::<_, String>("SELECT name FROM roles WHERE id = ?1")
+                .bind(role_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+            let user_ids = sqlx::query_scalar::<_, String>(
+                "SELECT user_id FROM user_roles WHERE role_id = ?1 ORDER BY user_id",
+            )
+            .bind(role_id.to_string())
+            .fetch_all(&mut **tx)
+            .await?;
+            let grant_rows = sqlx::query(
+                "SELECT target_id, permission FROM target_permissions WHERE role_id = ?1 ORDER BY target_id, permission",
+            )
+            .bind(role_id.to_string())
+            .fetch_all(&mut **tx)
+            .await?;
+            let grants = grant_rows
+                .into_iter()
+                .map(|row| {
+                    Ok(serde_json::json!({
+                        "target_id": row.try_get::<String, _>("target_id")?,
+                        "permission": row.try_get::<String, _>("permission")?,
+                    }))
+                })
+                .collect::<Result<Vec<_>, sqlx::Error>>()?;
+            (
+                "delete_role",
+                "role",
+                Some(*role_id),
+                serde_json::json!({
+                    "role_id": role_id,
+                    "role_name": role_name,
+                    "user_ids": user_ids,
+                    "grants": grants,
+                }),
+            )
+        }
+        Op::SetUserRoles { user_id, role_ids } => {
+            let previous_role_ids = sqlx::query_scalar::<_, String>(
+                "SELECT role_id FROM user_roles WHERE user_id = ?1 ORDER BY role_id",
+            )
+            .bind(user_id.to_string())
+            .fetch_all(&mut **tx)
+            .await?;
+            let next_role_ids = role_ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
+            (
+                "set_user_roles",
+                "user",
+                Some(*user_id),
+                serde_json::json!({
+                    "user_id": user_id,
+                    "previous_role_ids": previous_role_ids,
+                    "requested_role_ids": next_role_ids,
+                }),
+            )
+        }
+        Op::GrantTarget {
+            role_id,
+            target_id,
+            permission,
+        } => (
+            "grant_target",
+            "role_target_permission",
+            Some(*target_id),
+            serde_json::json!({
+                "role_id": role_id,
+                "target_id": target_id,
+                "permission": permission_name(*permission),
+            }),
+        ),
+        Op::RevokeTarget {
+            role_id,
+            target_id,
+            permission,
+        } => (
+            "revoke_target",
+            "role_target_permission",
+            Some(*target_id),
+            serde_json::json!({
+                "role_id": role_id,
+                "target_id": target_id,
+                "permission": permission_name(*permission),
+            }),
+        ),
+        Op::CreateTarget { name } => (
+            "create_target",
+            "target",
+            None,
+            serde_json::json!({ "name": name }),
+        ),
+        Op::RenameTarget { target_id, name } => ("rename_target", "target", Some(*target_id), {
+            let previous_name = sqlx::query_scalar::<_, String>(
+                "SELECT name FROM targets WHERE id = ?1 AND deleted_at IS NULL",
+            )
+            .bind(target_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?;
+            serde_json::json!({
+                "target_id": target_id,
+                "previous_name": previous_name,
+                "name": normalize_name(name, "target")?,
+            })
+        }),
+        Op::SetTargetEnabled { target_id, enabled } => {
+            ("set_target_enabled", "target", Some(*target_id), {
+                let previous_enabled = sqlx::query_scalar::<_, i64>(
+                    "SELECT enabled FROM targets WHERE id = ?1 AND deleted_at IS NULL",
+                )
+                .bind(target_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|enabled| enabled == 1);
+                serde_json::json!({
+                    "target_id": target_id,
+                    "previous_enabled": previous_enabled,
+                    "enabled": enabled,
+                })
+            })
+        }
+        Op::DeleteTarget { target_id } => {
+            let row = sqlx::query("SELECT name, enabled FROM targets WHERE id = ?1")
+                .bind(target_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+            (
+                "delete_target",
+                "target",
+                Some(*target_id),
+                serde_json::json!({
+                    "target_id": target_id,
+                    "name": row.as_ref().map(|row| row.try_get::<String, _>("name")).transpose()?,
+                    "previous_enabled": row.as_ref().map(|row| row.try_get::<i64, _>("enabled").map(|enabled| enabled == 1)).transpose()?,
+                }),
+            )
+        }
+        Op::IssueEnrollment { target_id } => (
+            "issue_enrollment",
+            "target",
+            Some(*target_id),
+            serde_json::json!({ "target_id": target_id }),
+        ),
+        Op::ListUsers
+        | Op::ListKeys { .. }
+        | Op::ListRoles
+        | Op::ListUserRoles { .. }
+        | Op::ListRoleGrants { .. }
+        | Op::ListTargets => unreachable!("read operations are dispatched before the transaction"),
+    };
+
+    Ok(AuditEvent {
+        id: Uuid::new_v4(),
+        occurred_at: unix_time(),
+        actor_user_id,
+        operation: name,
+        object_type,
+        object_id,
+        context,
+    })
+}
+
+fn complete_audit_event(event: &mut AuditEvent, response: &AdminResponse) {
+    match (event.operation, response) {
+        ("create_user", AdminResponse::User(user)) => {
+            event.object_id = Some(user.user_id);
+            event.context["username"] = serde_json::json!(user.username);
+        }
+        ("add_user_key", AdminResponse::Keys(keys)) => {
+            let key = keys.first().expect("adding one key returns that key");
+            event.object_id = Some(key.key_id);
+            event.context["key_id"] = serde_json::json!(key.key_id);
+        }
+        ("create_role", AdminResponse::Role(role)) => {
+            event.object_id = Some(role.role_id);
+            event.context["name"] = serde_json::json!(role.name);
+        }
+        ("create_target", AdminResponse::TargetCreated { target, .. }) => {
+            event.object_id = Some(target.target_id);
+            event.context["name"] = serde_json::json!(target.name);
+        }
+        ("set_user_roles", AdminResponse::UserRoles(roles)) => {
+            event.context["role_ids"] =
+                serde_json::json!(roles.iter().map(|role| role.role_id).collect::<Vec<_>>());
+        }
+        _ => {}
+    }
+}
+
+fn permission_name(permission: TargetPermission) -> &'static str {
+    match permission {
+        TargetPermission::SshConnect => "ssh_connect",
     }
 }
 
