@@ -55,6 +55,31 @@ Read-only host inspection found iptables INPUT/FORWARD policies `ACCEPT`, no mat
 
 After the run, the private server and new agent were active, the public server was inactive, the agent environment was empty, and server B retained its 763 binary. The latest report is `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-private-ens1f0-gated/report.json`; its client stderr and `target-1-ens1f0-39278.txt` capture are mode `0600` beside it. Capture SHA-256: `5779f7c0c3ae8ecb4c3f078714743aff27a33f1e18841a24029e554eb08de82c`. The prior portmapper and br0 evidence is under `runs/run-20261003-private-socket-send/`.
 
+## Direct-first same-connection SSH attempt
+
+The target agent binary was built from worker commit `0f5949d8676708b83677bf74d271f76569dd74b9`; its tree `150ae6d08301ffd5f212cf9e6203f76ec15faa5f` matches primary commit `d96a103220aa077818933a803977a4552629cba6`. Linux x86_64 musl artifact SHA-256 is `f1324d606f10b4c4d6459d7b9313e782f8a786e1d43101ab76162fe99bf59c92`; the prior target binary `45b6c9dd8b6a1c92b6385860978925c84e535b92625382fd2b31aecf897040b8` remains as a SHA-named backup. The macOS ARM64 client remained `bac2df1e0afbe128f961d0d480dfb8108c536ccc9b24dd961cbffb85ac6800bb`; server B remained on binary SHA `32dbb6d670ab7b425b04d8229d36c8191bfd46237be78e0bd5706297f8439c9a`. The existing schema 3 data, target UUID, credentials, and device identity were reused.
+
+Two bounded SSH samples used the existing OpenSSH `ProxyCommand`. The client waited up to 8 seconds for a selected Direct path before sending `hostname`, a completion marker, and expected exit 23. The agent waited up to 2 seconds for a selected IP path on that same QUIC connection before opening its bidirectional stream and writing the ticket.
+
+| Relay mode | SSH result | Client path result | Agent path before ticket | P2P result |
+|---|---|---|---|---|
+| Private | `server-1`, marker observed, exit 23 | 8.057-second wait; selected path remained `relay:https://192.0.2.11:9443/` | `direct_selected=false`; only the selected private relay appeared in the path snapshot | Failed; no Direct path selected |
+| PublicDefault | `server-1`, marker observed, exit 23 | 8.086-second wait; selected path remained `relay:https://aps1-1.relay.n0.iroh.link./` | `direct_selected=false`; only the selected public relay appeared in the path snapshot | Failed; no Direct path selected |
+
+The agent snapshots show only relay paths before ticket setup and before SSH byte forwarding. When `copy_bidirectional` later returned `connection lost`, the private relay counters changed from TX/RX `10904/8504` to `15980/12736` (delta `+5076/+4232`); the PublicDefault relay counters changed from `10894/8453` to `15948/12733` (delta `+5054/+4280`). These are aggregate QUIC path counters, not SSH-only byte counts. The client-side end-of-stream SSH byte summary was absent in both reports, so no SSH-only counter is claimed. Both SSH commands succeeded over their observed relay path; both P2P checks failed. The experiments do not establish why direct paths were not selected, or that the 2-second observation window ends SDK path discovery.
+
+Raw evidence is mode `0600` at these exact paths:
+
+- Private C stderr: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-private/path-probe-private.stderr`
+- Private A snapshots: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-private/agent-path-probe-private-late.log`
+- Private report JSON: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-private/report.json`
+- Public C stderr: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-public/path-probe-public-default.stderr`
+- Public A snapshots: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-public/agent-path-probe-public.log`
+- Public report JSON: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-public/report.json`
+- Private restore report: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-restore/report.json`
+
+After the PublicDefault comparison, Private mode was restored. Server B's private unit and target A's agent are active, the public server unit is inactive, server B still has binary SHA `32dbb6d670ab7b425b04d8229d36c8191bfd46237be78e0bd5706297f8439c9a`, target A runs binary SHA `f1324d606f10b4c4d6459d7b9313e782f8a786e1d43101ab76162fe99bf59c92`, the old target binary remains backed up under SHA `45b6c9dd8b6a1c92b6385860978925c84e535b92625382fd2b31aecf897040b8`, and the target is online. The temporary agent `RUST_LOG` override was removed; the active agent reports an empty environment. No third SSH sample was run.
+
 ## Evidence files
 
 The preflight, stage, 423 baseline, login, and 548 refresh reports are under `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/`. The 548 public extended report is `runs/run-20261003-iroh-upgrade-548523f/public-extended/ssh-public-default-20261003T033346Z-9cb0e000/report.json`. The 548 public and private debug reports are `runs/run-20261003-public548-debugprobe-2/report.json` and `runs/run-20261003-private548-debugprobe/report.json`. Their original stderr files are mode `0600` beside each report. Reports contain no password, refresh token, enrollment token, or private-key contents.
