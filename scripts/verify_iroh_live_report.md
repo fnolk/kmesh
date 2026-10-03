@@ -11,7 +11,7 @@ The deployment refresh used code revision `548523fc39dffdef84ec9edbd574ac8d944bf
 | macOS ARM64 client | `8006a171094a97407feca3143eaf38db47f037b394e7ea987a95d07bb080c56b` |
 | Linux x86_64 musl server/agent | `3b4ae4f4a4c29fec9a62ef29f66b3db8e40d007ffcbd5a25ad589df084d3bb87` |
 
-Both binaries were installed only in `/opt/kmesh-iroh-verification`. The Linux artifact SHA-256 was verified on the server and target before the two new services were stopped and atomically refreshed. The schema 3 SQLite database, user/role/target records, target UUID, and persistent agent identity were reused. The original verification binary, database, TLS files, and units remain intact for rollback.
+The Linux x86_64 musl artifact was installed on the server and target under `/opt/kmesh-iroh-verification`; its SHA-256 was verified on both hosts before the new services were stopped and atomically refreshed. The macOS ARM64 client ran locally from `/Users/example/GitHub/kmesh/target/aarch64-apple-darwin/release/kmesh`. The schema 3 SQLite database, user/role/target records, target UUID, and persistent agent identity were reused. The original verification binary, database, TLS files, and units remain intact for rollback.
 
 The target is `target-1-iroh-e423a4a7`, UUID `00000000-0000-4000-8000-000000000006`. Test user `kmesh-verify-e423a4a7` has role UUID `00000000-0000-4000-8000-000000000005`. Its agent config points to `127.0.0.1:22`, verified from the existing target configuration. At the end of the checks, the new private server and its target agent were active; the old verification units remained stopped.
 
@@ -36,7 +36,7 @@ Both 548 probes kept SSH active for 8 seconds and recorded the selected path plu
 The private-mode probe reported:
 
 - Target candidate addresses: `10.0.0.1:59997`, `10.0.0.4:59997`, `10.0.0.5:59997`, and public QAD address `192.0.2.19:4182`.
-- Client QAD report: `udp_v4=true`, `global_v4=192.0.2.12:11462`; mapping variation was unknown because this mode reported through one relay.
+- Client QAD report: `udp_v4=true`, `global_v4=192.0.2.12:11462`, `mapping_varies_by_dest_ipv4=None`. This private-mode report used one configured relay; no conclusion about mapping variation beyond that report is recorded.
 - Selected path: `relay:https://192.0.2.11:9443/`; no direct-path selection event appeared during the 8-second session.
 
 These observations confirm that this run exchanged public target candidates and the client obtained a QAD IPv4 mapping. They show the paths selected for these SSH streams; they do not establish direct P2P success or the cause of relay selection. The target-side NetReport value was not captured separately.
