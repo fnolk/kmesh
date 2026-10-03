@@ -502,7 +502,7 @@ pub(super) async fn open_tunnel(
     Ok(())
 }
 
-async fn send_offer_to_client(
+pub(super) async fn send_offer_to_client(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,
@@ -604,7 +604,7 @@ async fn register_agent_endpoint(
     Ok(())
 }
 
-async fn activate_tunnel(
+pub(super) async fn activate_tunnel(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,

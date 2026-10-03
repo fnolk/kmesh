@@ -1,27 +1,55 @@
-use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use axum::Json;
-use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::SigningKey;
-use ssh_key::{HashAlg, LineEnding, PrivateKey};
-use tokio::sync::{RwLock, mpsc};
-use uuid::Uuid;
-
-use crate::identity;
-use crate::protocol::{
-    AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, LocalCandidate,
-    LoginTokens, NatObservation, PasswordLoginRequest, PublicKeyChallengeRequest,
-    PublicKeyLoginRequest, RefreshRequest, SelectedPath, StunMapping, TargetPermission,
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 
-use super::control::{self, OnlineAgent, TunnelPhase};
-use super::{PersistedKeys, ServerInner, ServerState, auth, db::Database};
+use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+use axum::{
+    Json,
+    extract::{ConnectInfo, State},
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::{SinkExt, StreamExt};
+use iroh::Watcher as _;
+use iroh::{EndpointAddr, RelayUrl, SecretKey};
+use iroh_relay::{
+    http::ProtocolVersion,
+    server::{Access, AccessControl, ClientRequest},
+};
+use rcgen::generate_simple_self_signed;
+use ssh_key::{HashAlg, LineEnding, PrivateKey};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::{RwLock, mpsc},
+    time::timeout,
+};
+use tokio_tungstenite::tungstenite::{
+    Message, client::IntoClientRequest, http::HeaderValue as WsHeaderValue,
+};
+use uuid::Uuid;
+
+use crate::{
+    config::TlsConfig,
+    identity,
+    protocol::{
+        AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, LoginTokens,
+        PasswordLoginRequest, PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest,
+        TargetPermission, TunnelTicketClaims,
+    },
+    transport::{
+        IrohByteStream, IrohEndpointOptions, accept_peer, connect_peer, create_endpoint,
+        http_client,
+    },
+};
+
+use super::{
+    PersistedKeys, ServerInner, ServerState, auth,
+    control::{self, OnlineAgent},
+    db::Database,
+};
 
 struct Fixture {
     state: ServerState,
@@ -34,50 +62,32 @@ impl Drop for Fixture {
     }
 }
 
-async fn fixture() -> Fixture {
+async fn fixture(issuer: &str) -> Fixture {
     let data_dir = std::env::temp_dir().join(format!("kmesh-server-test-{}", Uuid::new_v4()));
-    super::initialize(
-        &data_dir,
-        "Admin",
-        "initial-admin-password",
-        "https://kmesh.test",
-    )
-    .await
-    .expect("initialize test server");
-    let first_key_bytes =
-        std::fs::read(data_dir.join("token-keys.json")).expect("read generated keys");
-    super::initialize(&data_dir, "other", "ignored-password", "https://kmesh.test")
+    super::initialize(&data_dir, "Admin", "initial-admin-password", issuer)
         .await
-        .expect("repeat server initialization");
-    let second_key_bytes =
-        std::fs::read(data_dir.join("token-keys.json")).expect("read persistent keys");
-    assert_eq!(first_key_bytes, second_key_bytes);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(data_dir.join("token-keys.json"))
-            .expect("stat key file")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-    }
+        .expect("initialize test server");
+    let key_bytes = std::fs::read(data_dir.join("token-keys.json")).expect("read generated keys");
     let db = Database::open(data_dir.join("server.sqlite3"))
         .await
         .expect("open test DB");
     db.apply_schema().await.expect("apply test schema");
-    let keys = PersistedKeys::from_slice(&first_key_bytes)
+    let keys = PersistedKeys::from_slice(&key_bytes)
         .expect("decode generated keys")
         .into_token_keys();
     Fixture {
         state: ServerState {
             inner: Arc::new(ServerInner {
                 db,
-                issuer: "https://kmesh.test".to_owned(),
+                issuer: issuer.to_owned(),
                 keys,
                 auth_rate_limiter: auth::AuthRateLimiter::default(),
                 online_agents: RwLock::new(std::collections::HashMap::new()),
                 tunnels: RwLock::new(std::collections::HashMap::new()),
+                transport_info: RwLock::new(crate::protocol::TransportInfo {
+                    relay_url: issuer.to_owned(),
+                    qad_port: 3478,
+                }),
             }),
         },
         data_dir,
@@ -111,283 +121,6 @@ async fn login_password(state: &ServerState) -> LoginTokens {
     .0
 }
 
-#[test]
-fn nat_plan_samples_only_the_measured_stable_same_ip_interval() {
-    let client = NatObservation {
-        local_candidates: vec![LocalCandidate {
-            address: "10.0.0.6:51304"
-                .parse()
-                .expect("client local address"),
-            prefix_len: 24,
-        }],
-        stun_mappings: [
-            ("192.0.2.11:3478", Some("192.0.2.12:11326")),
-            ("192.0.2.13:3478", Some("192.0.2.12:11326")),
-            ("192.0.2.11:3478", Some("192.0.2.12:11326")),
-        ]
-        .map(|(server, mapped)| StunMapping {
-            server: server.parse().expect("STUN server address"),
-            mapped: mapped.map(|address| address.parse().expect("mapped address")),
-        })
-        .into(),
-    };
-    let target = NatObservation {
-        local_candidates: vec![LocalCandidate {
-            address: "10.0.0.4:43709"
-                .parse()
-                .expect("target local address"),
-            prefix_len: 23,
-        }],
-        stun_mappings: [
-            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
-            ("192.0.2.13:3478", Some("192.0.2.19:4148")),
-            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
-        ]
-        .map(|(server, mapped)| StunMapping {
-            server: server.parse().expect("STUN server address"),
-            mapped: mapped.map(|address| address.parse().expect("mapped address")),
-        })
-        .into(),
-    };
-
-    let plan = control::build_nat_plan(&client, &target);
-    assert_eq!(plan.client_remote_candidates.len(), 8);
-    assert_eq!(
-        &plan.client_remote_candidates[..2],
-        &[
-            "192.0.2.19:4164".parse().expect("A mapping"),
-            "192.0.2.19:4148".parse().expect("B mapping"),
-        ]
-    );
-    assert!(plan.client_remote_candidates.iter().all(|candidate| {
-        candidate.ip() == "192.0.2.19".parse::<IpAddr>().expect("public IP")
-            && (4148..=4164).contains(&candidate.port())
-    }));
-    assert_eq!(
-        plan.target_remote_candidates,
-        vec!["192.0.2.12:11326".parse().expect("client mapping")]
-    );
-    assert_eq!(
-        plan.client_remote_candidates
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        plan.client_remote_candidates.len(),
-        "candidate order is stable and entries are unique"
-    );
-}
-
-#[test]
-fn nat_plan_adds_lan_candidates_only_for_overlapping_prefixes() {
-    let client = NatObservation {
-        local_candidates: vec![LocalCandidate {
-            address: "10.0.0.3:5000".parse().expect("client local address"),
-            prefix_len: 24,
-        }],
-        stun_mappings: vec![],
-    };
-    let target = NatObservation {
-        local_candidates: vec![LocalCandidate {
-            address: "10.0.0.4:5001".parse().expect("target local address"),
-            prefix_len: 23,
-        }],
-        stun_mappings: vec![],
-    };
-    let plan = control::build_nat_plan(&client, &target);
-    assert_eq!(
-        plan.client_remote_candidates,
-        vec!["10.0.0.4:5001".parse().unwrap()]
-    );
-    assert_eq!(
-        plan.target_remote_candidates,
-        vec!["10.0.0.3:5000".parse().unwrap()]
-    );
-
-    let non_overlapping_client = NatObservation {
-        local_candidates: vec![LocalCandidate {
-            address: "10.0.0.6:5000".parse().expect("client local address"),
-            prefix_len: 24,
-        }],
-        stun_mappings: vec![],
-    };
-    let plan = control::build_nat_plan(&non_overlapping_client, &target);
-    assert!(plan.client_remote_candidates.is_empty());
-    assert!(plan.target_remote_candidates.is_empty());
-}
-
-#[test]
-fn nat_plan_does_not_interpolate_unstable_or_cross_ip_observations() {
-    let client = NatObservation {
-        local_candidates: vec![],
-        stun_mappings: vec![],
-    };
-    let target = NatObservation {
-        local_candidates: vec![],
-        stun_mappings: [
-            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
-            ("192.0.2.13:3478", Some("192.0.2.19:4148")),
-            ("192.0.2.11:3478", Some("192.0.2.19:4163")),
-        ]
-        .map(|(server, mapped)| StunMapping {
-            server: server.parse().expect("STUN server address"),
-            mapped: mapped.map(|address| address.parse().expect("mapped address")),
-        })
-        .into(),
-    };
-
-    let plan = control::build_nat_plan(&client, &target);
-    assert_eq!(
-        plan.client_remote_candidates,
-        vec![
-            "192.0.2.19:4164".parse().unwrap(),
-            "192.0.2.19:4148".parse().unwrap(),
-            "192.0.2.19:4163".parse().unwrap(),
-        ]
-    );
-
-    let stable_a_cross_ip_b = NatObservation {
-        local_candidates: vec![],
-        stun_mappings: [
-            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
-            ("192.0.2.13:3478", Some("198.51.100.2:4148")),
-            ("192.0.2.11:3478", Some("192.0.2.19:4164")),
-        ]
-        .map(|(server, mapped)| StunMapping {
-            server: server.parse().expect("STUN server address"),
-            mapped: mapped.map(|address| address.parse().expect("mapped address")),
-        })
-        .into(),
-    };
-    let plan = control::build_nat_plan(&client, &stable_a_cross_ip_b);
-    assert_eq!(
-        plan.client_remote_candidates,
-        vec![
-            "192.0.2.19:4164".parse().unwrap(),
-            "198.51.100.2:4148".parse().unwrap(),
-        ]
-    );
-}
-
-#[test]
-fn nat_observation_validation_bounds_network_input() {
-    assert!(control::valid_nat_observation(&NatObservation {
-        local_candidates: vec![LocalCandidate {
-            address: "10.0.0.2:1234".parse().unwrap(),
-            prefix_len: 24,
-        }],
-        stun_mappings: vec![],
-    }));
-    assert!(!control::valid_nat_observation(&NatObservation {
-        local_candidates: vec![LocalCandidate {
-            address: "10.0.0.2:1234".parse().unwrap(),
-            prefix_len: 33,
-        }],
-        stun_mappings: vec![],
-    }));
-    assert!(!control::valid_nat_observation(&NatObservation {
-        local_candidates: vec![],
-        stun_mappings: vec![],
-    }));
-}
-
-#[tokio::test]
-async fn control_sends_nat_plan_only_after_both_endpoints_report() {
-    let fixture = fixture().await;
-    let state = &fixture.state;
-    let login = login_password(state).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
-        .await
-        .expect("authenticate admin");
-    let (target_id, _) = create_enrolled_target(state, "nat-plan-target").await;
-    grant_target(state, target_id).await;
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
-    let (client_sender, mut client_receiver) = mpsc::channel(16);
-    let session_id = Uuid::new_v4();
-    open_test_tunnel(
-        state,
-        user,
-        session_id,
-        target_id,
-        target_connection_id,
-        client_sender.clone(),
-    )
-    .await;
-    let _ = target_receiver.recv().await.expect("target offer");
-    let _ = client_receiver.recv().await.expect("client offer");
-
-    let client_observation = NatObservation {
-        local_candidates: vec![],
-        stun_mappings: vec![StunMapping {
-            server: "192.0.2.11:3478".parse().expect("STUN server address"),
-            mapped: Some("198.51.100.10:5000".parse().expect("client mapped address")),
-        }],
-    };
-    let target_observation = NatObservation {
-        local_candidates: vec![],
-        stun_mappings: vec![StunMapping {
-            server: "192.0.2.11:3478".parse().expect("STUN server address"),
-            mapped: Some("203.0.113.20:6000".parse().expect("target mapped address")),
-        }],
-    };
-    control::submit_nat_observation(
-        state,
-        session_id,
-        control::Endpoint::Client(user),
-        Some(&client_sender),
-        client_observation,
-    )
-    .await
-    .expect("accept client observation");
-    assert!(client_receiver.try_recv().is_err());
-    assert!(target_receiver.try_recv().is_err());
-
-    control::submit_nat_observation(
-        state,
-        session_id,
-        control::Endpoint::Target {
-            target_id,
-            connection_id: target_connection_id,
-        },
-        None,
-        target_observation,
-    )
-    .await
-    .expect("accept target observation");
-
-    let ControlMessage::NatPlan {
-        session_id: client_session,
-        plan: client_plan,
-    } = client_receiver.recv().await.expect("client NAT plan")
-    else {
-        panic!("client receives NAT plan after both reports");
-    };
-    let ControlMessage::NatPlan {
-        session_id: target_session,
-        plan: target_plan,
-    } = target_receiver.recv().await.expect("target NAT plan")
-    else {
-        panic!("target receives NAT plan after both reports");
-    };
-    assert_eq!(client_session, session_id);
-    assert_eq!(target_session, session_id);
-    assert_eq!(
-        client_plan.client_remote_candidates,
-        vec!["203.0.113.20:6000".parse().expect("target candidate")]
-    );
-    assert_eq!(
-        client_plan.target_remote_candidates,
-        vec!["198.51.100.10:5000".parse().expect("client candidate")]
-    );
-    assert_eq!(
-        target_plan.client_remote_candidates,
-        client_plan.client_remote_candidates
-    );
-    assert_eq!(
-        target_plan.target_remote_candidates,
-        client_plan.target_remote_candidates
-    );
-}
-
 async fn admin_role_id(state: &ServerState) -> Uuid {
     sqlx::query_scalar::<_, String>("SELECT id FROM roles WHERE name = 'admin'")
         .fetch_one(&state.inner.db.pool)
@@ -397,7 +130,11 @@ async fn admin_role_id(state: &ServerState) -> Uuid {
         .expect("parse admin role ID")
 }
 
-async fn create_enrolled_target(state: &ServerState, name: &str) -> (Uuid, String) {
+async fn create_enrolled_target(
+    state: &ServerState,
+    name: &str,
+    endpoint_secret_key: &SecretKey,
+) -> (Uuid, String) {
     let created = super::admin::apply_operation(
         state,
         AdminOperation::CreateTarget {
@@ -413,25 +150,16 @@ async fn create_enrolled_target(state: &ServerState, name: &str) -> (Uuid, Strin
     else {
         panic!("target creation returned an unexpected result");
     };
-    let target_certificate = identity::generate_target_certificate(target.target_id)
-        .expect("generate test target certificate");
-    let mut pem = Cursor::new(target_certificate.certificate_pem.as_bytes());
-    let certificate_der = rustls_pemfile::certs(&mut pem)
-        .next()
-        .expect("target certificate exists")
-        .expect("parse target certificate")
-        .as_ref()
-        .to_vec();
     let enrolled = control::enroll(
         State(state.clone()),
         Json(AgentEnrollmentRequest {
             target_id: target.target_id,
             enrollment_token: enrollment_token.clone(),
-            certificate_der: certificate_der.clone(),
+            agent_endpoint_id: endpoint_secret_key.public().to_string(),
         }),
     )
     .await
-    .expect("enroll target agent")
+    .expect("enroll target Iroh endpoint")
     .0;
     assert_eq!(enrolled.target_id, target.target_id);
     assert_eq!(
@@ -451,7 +179,7 @@ async fn create_enrolled_target(state: &ServerState, name: &str) -> (Uuid, Strin
         Json(AgentEnrollmentRequest {
             target_id: target.target_id,
             enrollment_token,
-            certificate_der,
+            agent_endpoint_id: endpoint_secret_key.public().to_string(),
         }),
     )
     .await;
@@ -490,53 +218,199 @@ async fn revoke_target(state: &ServerState, target_id: Uuid) {
 async fn online_target(
     state: &ServerState,
     target_id: Uuid,
-) -> (Uuid, mpsc::Receiver<crate::protocol::ControlMessage>) {
+    endpoint_secret_key: &SecretKey,
+) -> (Uuid, mpsc::Receiver<ControlMessage>) {
     let connection_id = Uuid::new_v4();
     let (sender, receiver) = mpsc::channel(64);
+    let relay_url: RelayUrl = reqwest::Url::parse(&state.inner.issuer)
+        .expect("valid test issuer")
+        .into();
     state.inner.online_agents.write().await.insert(
         target_id,
         OnlineAgent {
             connection_id,
             sender,
+            endpoint_addr: Some(
+                EndpointAddr::new(endpoint_secret_key.public()).with_relay_url(relay_url),
+            ),
         },
     );
     (connection_id, receiver)
 }
 
-async fn open_test_tunnel(
-    state: &ServerState,
-    user: auth::AuthenticatedUser,
-    session_id: Uuid,
-    target_id: Uuid,
-    target_connection_id: Uuid,
-    client_sender: mpsc::Sender<crate::protocol::ControlMessage>,
-) {
-    control::open_tunnel(
-        state,
-        user,
-        &client_sender,
-        session_id,
-        target_id,
-        URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()),
-    )
-    .await
-    .expect("open tunnel");
+fn endpoint_connect_request(endpoint_id: iroh::EndpointId) -> ClientRequest {
+    let request = hyper::Request::builder()
+        .uri("https://kmesh.test/relay")
+        .body(())
+        .expect("build relay request");
+    let (parts, _) = request.into_parts();
+    ClientRequest::new(endpoint_id, ProtocolVersion::V2, parts)
+}
+
+#[tokio::test]
+async fn relay_access_denies_unknown_endpoint_and_allows_registered_target() {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    let unknown = SecretKey::generate().public();
+    assert!(matches!(
+        state.on_connect(&endpoint_connect_request(unknown)).await,
+        Access::Deny { .. }
+    ));
+
+    let target_secret = SecretKey::generate();
+    let (target_id, agent_token) =
+        create_enrolled_target(state, "relay-target", &target_secret).await;
+    assert_eq!(
+        control::authenticate_agent(state, &bearer(&agent_token))
+            .await
+            .expect("authenticate enrolled target"),
+        target_id
+    );
     assert_eq!(
         state
-            .inner
-            .tunnels
-            .read()
-            .await
-            .get(&session_id)
-            .expect("tunnel runtime inserted")
-            .target_connection_id,
-        target_connection_id
+            .on_connect(&endpoint_connect_request(target_secret.public()))
+            .await,
+        Access::Allow
     );
 }
 
 #[tokio::test]
+async fn pending_endpoint_access_is_revoked_before_activation_and_active_session_survives_rbac_change()
+ {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    let login = login_password(state).await;
+    let user = auth::authenticate(state, &bearer(&login.access_token))
+        .await
+        .expect("authenticate admin");
+    let target_secret = SecretKey::generate();
+    let (target_id, _) = create_enrolled_target(state, "activation-target", &target_secret).await;
+    grant_target(state, target_id).await;
+    let (target_connection_id, mut target_receiver) =
+        online_target(state, target_id, &target_secret).await;
+    let (client_sender, mut client_receiver) = mpsc::channel(64);
+
+    let denied_client_key = SecretKey::generate();
+    let denied_session_id = Uuid::new_v4();
+    control::open_tunnel(
+        state,
+        user,
+        &client_sender,
+        denied_session_id,
+        target_id,
+        denied_client_key.public().to_string(),
+    )
+    .await
+    .expect("open pending SSH session");
+    let ControlMessage::Offer { ticket, .. } = target_receiver.recv().await.expect("target offer")
+    else {
+        panic!("target received another control message");
+    };
+    let claims: TunnelTicketClaims = identity::decode_tunnel_ticket(
+        &ticket,
+        &state.inner.keys.tunnel_ticket.public_key_pem,
+        &state.inner.issuer,
+    )
+    .expect("decode signed ticket");
+    assert_eq!(
+        claims.client_endpoint_id,
+        denied_client_key.public().to_string()
+    );
+    assert_eq!(
+        claims.target_endpoint_id,
+        target_secret.public().to_string()
+    );
+    control::send_offer_to_client(state, target_id, target_connection_id, denied_session_id).await;
+    let _ = client_receiver.recv().await.expect("client offer");
+    assert_eq!(
+        state
+            .on_connect(&endpoint_connect_request(denied_client_key.public()))
+            .await,
+        Access::Allow
+    );
+    revoke_target(state, target_id).await;
+    control::activate_tunnel(
+        state,
+        target_id,
+        target_connection_id,
+        denied_session_id,
+        denied_client_key.public().to_string(),
+    )
+    .await;
+    let denied_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(denied_session_id.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read denied pending status");
+    assert_eq!(denied_status, "closed");
+    assert!(matches!(
+        client_receiver.recv().await.expect("activation denial to client"),
+        ControlMessage::Error { session_id: Some(id), .. } if id == denied_session_id
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("activation denial to target"),
+        ControlMessage::Error { session_id: Some(id), .. } if id == denied_session_id
+    ));
+    assert!(matches!(
+        state
+            .on_connect(&endpoint_connect_request(denied_client_key.public()))
+            .await,
+        Access::Deny { .. }
+    ));
+
+    grant_target(state, target_id).await;
+    let active_client_key = SecretKey::generate();
+    let active_session_id = Uuid::new_v4();
+    control::open_tunnel(
+        state,
+        user,
+        &client_sender,
+        active_session_id,
+        target_id,
+        active_client_key.public().to_string(),
+    )
+    .await
+    .expect("open second pending SSH session");
+    let _ = target_receiver.recv().await.expect("second target offer");
+    control::send_offer_to_client(state, target_id, target_connection_id, active_session_id).await;
+    let _ = client_receiver.recv().await.expect("second client offer");
+    control::activate_tunnel(
+        state,
+        target_id,
+        target_connection_id,
+        active_session_id,
+        active_client_key.public().to_string(),
+    )
+    .await;
+    let active_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(active_session_id.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read active session status");
+    assert_eq!(active_status, "active");
+    revoke_target(state, target_id).await;
+    auth::logout(State(state.clone()), bearer(&login.access_token))
+        .await
+        .expect("logout");
+    assert_eq!(
+        state
+            .on_connect(&endpoint_connect_request(active_client_key.public()))
+            .await,
+        Access::Allow
+    );
+    let retained: String = sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+        .bind(active_session_id.to_string())
+        .fetch_one(&state.inner.db.pool)
+        .await
+        .expect("read retained session");
+    assert_eq!(retained, "active");
+}
+
+#[tokio::test]
 async fn sshsig_comment_canonicalization_and_challenge_replay() {
-    let fixture = fixture().await;
+    let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
     let private = PrivateKey::from_openssh(TEST_PRIVATE_KEY).expect("parse test SSH key");
     let with_comment = format!(
@@ -609,7 +483,7 @@ async fn sshsig_comment_canonicalization_and_challenge_replay() {
 
 #[tokio::test]
 async fn rotated_refresh_replay_revokes_the_session() {
-    let fixture = fixture().await;
+    let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
     let tokens = login_password(state).await;
     let request = RefreshRequest {
@@ -633,295 +507,427 @@ async fn rotated_refresh_replay_revokes_the_session() {
 }
 
 #[tokio::test]
-async fn enrollment_rbac_activation_and_quic_retention() {
-    let fixture = fixture().await;
+async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
+    let port_probe = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve HTTPS test port");
+    let https_port = port_probe.local_addr().expect("read test port").port();
+    drop(port_probe);
+    let issuer = format!("https://localhost:{https_port}");
+    let fixture = fixture(&issuer).await;
     let state = &fixture.state;
-    let login = login_password(state).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
-        .await
-        .expect("authenticate admin");
-    let (target_id, agent_token) = create_enrolled_target(state, "machine-a").await;
-    let auth_headers = bearer(&agent_token);
-    assert_eq!(
-        control::authenticate_agent(state, &auth_headers)
-            .await
-            .expect("device token"),
-        target_id
-    );
-    grant_target(state, target_id).await;
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
-    let (client_sender, mut client_receiver) = mpsc::channel(64);
 
-    let denied_session = Uuid::new_v4();
-    open_test_tunnel(
-        state,
-        user,
-        denied_session,
-        target_id,
-        target_connection_id,
-        client_sender.clone(),
+    let server_cert = generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("generate local relay certificate");
+    let cert_path = fixture.data_dir.join("relay-cert.pem");
+    let key_path = fixture.data_dir.join("relay-key.pem");
+    std::fs::write(&cert_path, server_cert.cert.pem()).expect("write local relay certificate");
+    std::fs::write(&key_path, server_cert.signing_key.serialize_pem())
+        .expect("write local relay key");
+    let tls = TlsConfig {
+        ca_certificates: vec![cert_path.clone()],
+        ..TlsConfig::default()
+    };
+
+    let relay_server = super::iroh::listen_and_serve(
+        super::router(state.clone()),
+        Arc::new(state.clone()),
+        SocketAddr::from(([127, 0, 0, 1], https_port)),
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        &cert_path,
+        &key_path,
     )
-    .await;
-    let _ = target_receiver.recv().await.expect("target offer");
-    let _ = client_receiver.recv().await.expect("client offer");
-    let pending_runtime = state
-        .inner
-        .tunnels
-        .read()
+    .await
+    .expect("start local HTTPS relay and QAD");
+    state.inner.transport_info.write().await.qad_port = relay_server.qad_addr().port();
+
+    let http = http_client(&tls).expect("build TLS-verified HTTP client");
+    let ping = http
+        .get(format!("{issuer}/ping"))
+        .send()
         .await
-        .get(&denied_session)
-        .cloned()
-        .expect("pending tunnel runtime");
-    {
-        let mut pending_state = pending_runtime.state.lock().await;
-        pending_state.client_quic_ready = true;
-        pending_state.target_quic_ready = true;
-    }
-    revoke_target(state, target_id).await;
-    control::activate_path(
-        state,
-        target_id,
-        target_connection_id,
-        denied_session,
-        SelectedPath::Quic,
+        .expect("probe local Iroh relay");
+    assert_eq!(ping.status(), reqwest::StatusCode::OK);
+    let health = http
+        .get(format!("{issuer}/health"))
+        .send()
+        .await
+        .expect("probe kmesh HTTP API");
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+    let published_transport: crate::protocol::TransportInfo = http
+        .get(format!("{issuer}/v1/transport"))
+        .send()
+        .await
+        .expect("read private transport settings")
+        .json()
+        .await
+        .expect("decode private transport settings");
+    assert_eq!(published_transport.relay_url, issuer);
+    assert_eq!(published_transport.qad_port, relay_server.qad_addr().port());
+
+    let target_secret = SecretKey::generate();
+    let (target_id, agent_token) =
+        create_enrolled_target(state, "self-hosted-target", &target_secret).await;
+    grant_target(state, target_id).await;
+    let relay_url: RelayUrl = reqwest::Url::parse(&issuer)
+        .expect("parse private relay URL")
+        .into();
+    let endpoint_options = IrohEndpointOptions {
+        relay_url: reqwest::Url::parse(&issuer).expect("parse private relay URL"),
+        qad_port: relay_server.qad_addr().port(),
+        tls: tls.clone(),
+    };
+    let target_endpoint = create_endpoint(target_secret.clone(), true, endpoint_options.clone())
+        .await
+        .expect("create target endpoint");
+    timeout(Duration::from_secs(15), target_endpoint.online())
+        .await
+        .expect("target did not connect to the private relay");
+    let report = timeout(
+        Duration::from_secs(15),
+        target_endpoint.net_report().initialized(),
     )
-    .await;
-    let denied_status =
-        sqlx::query_scalar::<_, String>("SELECT status FROM tunnel_sessions WHERE id = ?1")
-            .bind(denied_session.to_string())
-            .fetch_one(&state.inner.db.pool)
-            .await
-            .expect("read denied path status");
-    assert_eq!(denied_status, "closed");
+    .await
+    .expect("target QAD network report timed out");
     assert!(
-        !state
-            .inner
-            .tunnels
-            .read()
-            .await
-            .contains_key(&denied_session)
+        report.udp_v4,
+        "target QAD did not complete an IPv4 round trip"
     );
-
-    grant_target(state, target_id).await;
-    let active_session = Uuid::new_v4();
-    open_test_tunnel(
-        state,
-        user,
-        active_session,
-        target_id,
-        target_connection_id,
-        client_sender.clone(),
-    )
-    .await;
-    let _ = target_receiver.recv().await.expect("target offer");
-    let _ = client_receiver.recv().await.expect("client offer");
-    let runtime = state
-        .inner
-        .tunnels
-        .read()
-        .await
-        .get(&active_session)
-        .cloned()
-        .expect("pending runtime");
-    {
-        let mut status = runtime.state.lock().await;
-        status.client_quic_ready = true;
-        status.target_quic_ready = true;
-    }
-    control::activate_path(
-        state,
-        target_id,
-        target_connection_id,
-        active_session,
-        SelectedPath::Quic,
-    )
-    .await;
     assert!(
-        !state
-            .inner
-            .tunnels
-            .read()
-            .await
-            .contains_key(&active_session),
-        "direct active state leaves coordination memory"
+        report.global_v4.is_some(),
+        "target QAD did not report its observed IPv4 address"
     );
-    let (status, path): (String, Option<String>) =
-        sqlx::query_as("SELECT status, selected_path FROM tunnel_sessions WHERE id = ?1")
-            .bind(active_session.to_string())
-            .fetch_one(&state.inner.db.pool)
-            .await
-            .expect("read active direct audit record");
-    assert_eq!(status, "active");
-    assert_eq!(path.as_deref(), Some("quic"));
+    assert_eq!(report.preferred_relay.as_ref(), Some(&relay_url));
 
-    revoke_target(state, target_id).await;
-    auth::logout(State(state.clone()), bearer(&login.access_token))
-        .await
-        .expect("logout");
-    let retained: String = sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
-        .bind(active_session.to_string())
-        .fetch_one(&state.inner.db.pool)
-        .await
-        .expect("read retained direct session");
-    assert_eq!(
-        retained, "active",
-        "RBAC revoke and logout preserve activated SSH sessions"
-    );
-}
+    let mut agent_control = connect_control_ws(&issuer, "agent/control", &agent_token, &tls).await;
+    let relay_only_target_addr = EndpointAddr::new(target_endpoint.id()).with_relay_url(relay_url);
+    send_control(
+        &mut agent_control,
+        &ControlMessage::AgentReady {
+            endpoint_addr: relay_only_target_addr.clone(),
+        },
+    )
+    .await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let ready = state
+                .inner
+                .online_agents
+                .read()
+                .await
+                .get(&target_id)
+                .is_some_and(|agent| agent.endpoint_addr.is_some());
+            if ready {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server did not register target endpoint address");
 
-#[tokio::test]
-async fn relay_selection_and_direct_activation_have_one_path_winner() {
-    let fixture = fixture().await;
-    let state = &fixture.state;
     let login = login_password(state).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
-        .await
-        .expect("authenticate admin");
-    let (target_id, _) = create_enrolled_target(state, "machine-race").await;
-    grant_target(state, target_id).await;
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
-    let (client_sender, mut client_receiver) = mpsc::channel(64);
+    let mut client_control =
+        connect_control_ws(&issuer, "connect", &login.access_token, &tls).await;
+    let client_secret = SecretKey::generate();
     let session_id = Uuid::new_v4();
-    open_test_tunnel(
-        state,
-        user,
-        session_id,
-        target_id,
-        target_connection_id,
-        client_sender,
+    send_control(
+        &mut client_control,
+        &ControlMessage::Open {
+            session_id,
+            target_id,
+            client_endpoint_id: client_secret.public().to_string(),
+        },
     )
     .await;
-    let _ = target_receiver.recv().await.expect("target offer");
-    let _ = client_receiver.recv().await.expect("client offer");
-    if let Some(runtime) = state.inner.tunnels.read().await.get(&session_id).cloned() {
-        let mut status = runtime.state.lock().await;
-        status.client_quic_ready = true;
-        status.target_quic_ready = true;
-    }
-    let (activate, relay) = tokio::join!(
-        control::activate_path(
-            state,
-            target_id,
-            target_connection_id,
-            session_id,
-            SelectedPath::Quic
-        ),
-        control::select_relay(state, session_id, control::Endpoint::Client(user)),
+    let ControlMessage::Offer {
+        session_id: target_offer_id,
+        ticket,
+        target_endpoint_addr,
+        ticket_public_key_pem,
+        ..
+    } = timeout(Duration::from_secs(10), receive_control(&mut agent_control))
+        .await
+        .expect("timed out waiting for target offer")
+    else {
+        panic!("target received a non-offer control message");
+    };
+    assert_eq!(target_offer_id, session_id);
+    assert_eq!(target_endpoint_addr, relay_only_target_addr);
+    let client_accept = {
+        let endpoint = target_endpoint.clone();
+        tokio::spawn(async move { accept_peer(&endpoint).await })
+    };
+    send_control(
+        &mut agent_control,
+        &ControlMessage::OfferReady { session_id },
+    )
+    .await;
+    let ControlMessage::Offer {
+        session_id: client_offer_id,
+        ticket: client_ticket,
+        client_endpoint_id,
+        target_endpoint_addr: client_target_addr,
+        ..
+    } = timeout(
+        Duration::from_secs(10),
+        receive_control(&mut client_control),
+    )
+    .await
+    .expect("timed out waiting for client offer")
+    else {
+        panic!("client received a non-offer control message");
+    };
+    assert_eq!(client_offer_id, session_id);
+    assert_eq!(client_ticket, ticket);
+    assert_eq!(client_target_addr, relay_only_target_addr);
+    let claims: TunnelTicketClaims =
+        identity::decode_tunnel_ticket(&ticket, &ticket_public_key_pem, &issuer)
+            .expect("verify server ticket");
+    assert_eq!(claims.client_endpoint_id, client_endpoint_id);
+    assert_eq!(claims.target_endpoint_id, target_endpoint.id().to_string());
+
+    let client_endpoint = create_endpoint(client_secret, false, endpoint_options)
+        .await
+        .expect("create SSH client Iroh endpoint");
+    timeout(Duration::from_secs(15), client_endpoint.online())
+        .await
+        .expect("client did not connect to the private relay");
+    let connection = timeout(
+        Duration::from_secs(15),
+        connect_peer(&client_endpoint, client_target_addr),
+    )
+    .await
+    .expect("Iroh peer connection timed out")
+    .expect("connect through the self-hosted relay");
+    let mut client_stream = IrohByteStream::open_bi(connection)
+        .await
+        .expect("open client SSH stream");
+    client_stream
+        .write_u32(ticket.len() as u32)
+        .await
+        .expect("write ticket frame length");
+    client_stream
+        .write_all(ticket.as_bytes())
+        .await
+        .expect("write signed ticket");
+
+    let accepted = timeout(Duration::from_secs(15), client_accept)
+        .await
+        .expect("target did not accept client endpoint")
+        .expect("target accept task panicked")
+        .expect("accept Iroh peer");
+    let mut target_stream = IrohByteStream::accept_bi(accepted)
+        .await
+        .expect("accept SSH stream");
+    let received_ticket_size = target_stream
+        .read_u32()
+        .await
+        .expect("read target ticket length") as usize;
+    let mut received_ticket = vec![0; received_ticket_size];
+    target_stream
+        .read_exact(&mut received_ticket)
+        .await
+        .expect("read target ticket");
+    assert_eq!(received_ticket, ticket.as_bytes());
+    assert_eq!(
+        target_stream.connection().remote_id().to_string(),
+        client_endpoint_id
     );
-    let _ = (activate, relay);
-    if let Some(runtime) = state.inner.tunnels.read().await.get(&session_id).cloned()
-        && runtime.state.lock().await.phase == TunnelPhase::RelaySelected
-    {
-        control::activate_path(
-            state,
-            target_id,
-            target_connection_id,
+    send_control(
+        &mut agent_control,
+        &ControlMessage::IrohReady {
             session_id,
-            SelectedPath::Relay,
-        )
-        .await;
-    }
-    let (status, path): (String, Option<String>) =
-        sqlx::query_as("SELECT status, selected_path FROM tunnel_sessions WHERE id = ?1")
-            .bind(session_id.to_string())
-            .fetch_one(&state.inner.db.pool)
+            client_endpoint_id,
+        },
+    )
+    .await;
+    assert!(matches!(
+        timeout(Duration::from_secs(10), receive_control(&mut client_control))
             .await
-            .expect("read raced path record");
-    assert_eq!(status, "active");
-    assert!(matches!(path.as_deref(), Some("quic" | "relay")));
-    if let Some(runtime) = state.inner.tunnels.read().await.get(&session_id).cloned() {
-        assert_eq!(
-            runtime.state.lock().await.phase,
-            TunnelPhase::Active(SelectedPath::Relay)
+            .expect("client activation timed out"),
+        ControlMessage::Activated { session_id: received } if received == session_id
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(10), receive_control(&mut agent_control))
+            .await
+            .expect("target activation timed out"),
+        ControlMessage::Activated { session_id: received } if received == session_id
+    ));
+
+    let ssh_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock sshd");
+    let ssh_addr = ssh_listener.local_addr().expect("read mock sshd address");
+    let echo_task = tokio::spawn(async move {
+        let (mut ssh, _) = ssh_listener.accept().await.expect("accept mock ssh client");
+        let mut buffer = [0; 4096];
+        loop {
+            let count = ssh.read(&mut buffer).await.expect("read mock SSH bytes");
+            if count == 0 {
+                break;
+            }
+            ssh.write_all(&buffer[..count])
+                .await
+                .expect("echo mock SSH bytes");
+        }
+        ssh.shutdown().await.expect("close mock SSH output");
+    });
+    let target_bridge = tokio::spawn(async move {
+        let mut ssh = TcpStream::connect(ssh_addr)
+            .await
+            .expect("connect mock sshd");
+        let copied = tokio::io::copy_bidirectional(&mut ssh, &mut target_stream)
+            .await
+            .expect("bridge mock SSH and Iroh");
+        target_stream
+            .finish_send_and_wait()
+            .await
+            .expect("target waits for final SSH bytes acknowledgement");
+        target_stream.connection().close(
+            iroh::endpoint::VarInt::from_u32(0),
+            b"self-hosted test complete",
         );
-    } else {
-        assert_eq!(path.as_deref(), Some("quic"));
-    }
+        copied
+    });
+    let payload = b"kmesh ssh bytes through self-hosted iroh relay";
+    client_stream
+        .write_all(payload)
+        .await
+        .expect("write SSH test payload");
+    client_stream
+        .shutdown()
+        .await
+        .expect("half-close client SSH input");
+    let mut echoed = vec![0; payload.len()];
+    timeout(
+        Duration::from_secs(10),
+        client_stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("SSH echo timed out")
+    .expect("read SSH echo");
+    assert_eq!(echoed, payload);
+    let mut trailing = Vec::new();
+    timeout(
+        Duration::from_secs(10),
+        client_stream.read_to_end(&mut trailing),
+    )
+    .await
+    .expect("SSH close timed out")
+    .expect("read final SSH EOF");
+    assert!(trailing.is_empty());
+    client_stream
+        .finish_send_and_wait()
+        .await
+        .expect("client waits for final SSH bytes acknowledgement");
+    client_stream.connection().close(
+        iroh::endpoint::VarInt::from_u32(0),
+        b"self-hosted test complete",
+    );
+    timeout(Duration::from_secs(10), target_bridge)
+        .await
+        .expect("target bridge timed out")
+        .expect("target bridge panicked");
+    timeout(Duration::from_secs(10), echo_task)
+        .await
+        .expect("mock sshd timed out")
+        .expect("mock sshd panicked");
+
+    send_control(
+        &mut client_control,
+        &ControlMessage::Close {
+            session_id,
+            reason: "self_hosted_test_complete".to_owned(),
+        },
+    )
+    .await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+                    .bind(session_id.to_string())
+                    .fetch_one(&state.inner.db.pool)
+                    .await
+                    .expect("read completed session status");
+            if status == "closed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server did not close completed session");
+    assert!(
+        state
+            .on_connect(&endpoint_connect_request(
+                claims.client_endpoint_id.parse().unwrap()
+            ))
+            .await
+            .eq(&Access::Deny {
+                reason: Some("EndpointId is not registered for kmesh".to_owned())
+            })
+    );
+
+    client_endpoint.close().await;
+    target_endpoint.close().await;
+    relay_server
+        .shutdown()
+        .await
+        .expect("stop local relay and QAD");
 }
 
-#[tokio::test]
-async fn closing_one_control_socket_keeps_another_same_session_socket_alive() {
-    let fixture = fixture().await;
-    let state = &fixture.state;
-    let login = login_password(state).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+async fn connect_control_ws(
+    issuer: &str,
+    path: &str,
+    token: &str,
+    tls: &TlsConfig,
+) -> crate::transport::WsStream {
+    let mut url =
+        reqwest::Url::parse(&format!("{issuer}/v1/{path}")).expect("build local control URL");
+    url.set_scheme("wss").expect("switch control URL to WSS");
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .expect("build WSS request");
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        WsHeaderValue::from_str(&format!("Bearer {token}")).expect("build WSS bearer header"),
+    );
+    crate::transport::connect_wss(request, tls)
         .await
-        .expect("authenticate admin");
-    let (target_id, _) = create_enrolled_target(state, "machine-control").await;
-    grant_target(state, target_id).await;
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
-    let (first_sender, mut first_receiver) = mpsc::channel(32);
-    let (second_sender, mut second_receiver) = mpsc::channel(32);
-    let first_session = Uuid::new_v4();
-    let second_session = Uuid::new_v4();
-    open_test_tunnel(
-        state,
-        user,
-        first_session,
-        target_id,
-        target_connection_id,
-        first_sender.clone(),
-    )
-    .await;
-    open_test_tunnel(
-        state,
-        user,
-        second_session,
-        target_id,
-        target_connection_id,
-        second_sender.clone(),
-    )
-    .await;
-    let _ = first_receiver.recv().await.expect("first offer");
-    let _ = target_receiver.recv().await.expect("first target offer");
-    let _ = second_receiver.recv().await.expect("second offer");
-    let _ = target_receiver.recv().await.expect("second target offer");
+        .expect("connect TLS-verified WSS control channel")
+}
 
-    control::close_pending_user_tunnels(state, user.user_id, user.session_id, &first_sender).await;
-    assert!(
-        !state
-            .inner
-            .tunnels
-            .read()
-            .await
-            .contains_key(&first_session)
-    );
-    let second_runtime = state
-        .inner
-        .tunnels
-        .read()
+async fn send_control(websocket: &mut crate::transport::WsStream, message: &ControlMessage) {
+    websocket
+        .send(Message::Text(
+            serde_json::to_string(message)
+                .expect("encode test control message")
+                .into(),
+        ))
         .await
-        .get(&second_session)
-        .cloned()
-        .expect("second control connection session remains");
-    {
-        let mut status = second_runtime.state.lock().await;
-        status.client_quic_ready = true;
-        status.target_quic_ready = true;
+        .expect("send test control message");
+}
+
+async fn receive_control(websocket: &mut crate::transport::WsStream) -> ControlMessage {
+    loop {
+        match websocket
+            .next()
+            .await
+            .expect("test control websocket closed")
+            .expect("read test control websocket")
+        {
+            Message::Text(text) => {
+                return serde_json::from_str(&text).expect("decode test control message");
+            }
+            Message::Binary(bytes) => {
+                return serde_json::from_slice(&bytes).expect("decode test control message");
+            }
+            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Close(_) | Message::Frame(_) => panic!("test control websocket closed"),
+        }
     }
-    control::activate_path(
-        state,
-        target_id,
-        target_connection_id,
-        second_session,
-        SelectedPath::Quic,
-    )
-    .await;
-    let second_status: String =
-        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
-            .bind(second_session.to_string())
-            .fetch_one(&state.inner.db.pool)
-            .await
-            .expect("read second session state");
-    assert_eq!(second_status, "active");
-    assert!(
-        !state
-            .inner
-            .tunnels
-            .read()
-            .await
-            .contains_key(&second_session)
-    );
 }
 
 const TEST_PRIVATE_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
