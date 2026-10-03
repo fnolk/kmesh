@@ -214,7 +214,7 @@ async fn run_client_control(state: ServerState, user: AuthenticatedUser, socket:
         }
     }
     writer.abort();
-    close_pending_user_tunnels(&state, user.user_id, user.session_id).await;
+    close_pending_client_tunnels(&state, &sender).await;
 }
 
 async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocket) {
@@ -863,20 +863,21 @@ async fn fail_from_target(
     }
 }
 
-async fn close_pending_user_tunnels(state: &ServerState, user_id: Uuid, auth_session_id: Uuid) {
+pub(super) async fn close_pending_client_tunnels(
+    state: &ServerState,
+    client_sender: &mpsc::Sender<ControlMessage>,
+) {
     let runtimes = state
         .inner
         .tunnels
         .read()
         .await
         .values()
-        .filter(|runtime| runtime.user_id == user_id && runtime.auth_session_id == auth_session_id)
+        .filter(|runtime| runtime.client_sender.same_channel(client_sender))
         .cloned()
         .collect::<Vec<_>>();
     for runtime in runtimes {
-        if *runtime.phase.lock().await == TunnelPhase::Pending {
-            close_tunnel(state, &runtime, "client control connection closed").await;
-        }
+        close_pending_tunnel(state, &runtime, "client control connection closed").await;
     }
 }
 
@@ -893,9 +894,7 @@ async fn close_pending_target_tunnels(state: &ServerState, target_id: Uuid, conn
         .cloned()
         .collect::<Vec<_>>();
     for runtime in runtimes {
-        if *runtime.phase.lock().await == TunnelPhase::Pending {
-            close_tunnel(state, &runtime, "target control connection closed").await;
-        }
+        close_pending_tunnel(state, &runtime, "target control connection closed").await;
     }
 }
 
@@ -951,14 +950,12 @@ fn spawn_pending_expiry(state: ServerState, runtime: Arc<TunnelRuntime>) {
     tokio::spawn(async move {
         let seconds = runtime.expires_at.saturating_sub(unix_time()).max(0) as u64;
         tokio::time::sleep(Duration::from_secs(seconds)).await;
-        if *runtime.phase.lock().await == TunnelPhase::Pending {
-            close_tunnel(
-                &state,
-                &runtime,
-                "SSH authorization expired before activation",
-            )
-            .await;
-        }
+        close_pending_tunnel(
+            &state,
+            &runtime,
+            "SSH authorization expired before activation",
+        )
+        .await;
     });
 }
 
@@ -969,6 +966,20 @@ async fn close_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntime>, reason:
     }
     *phase = TunnelPhase::Closed;
     drop(phase);
+    finish_tunnel_close(state, runtime, reason).await;
+}
+
+async fn close_pending_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntime>, reason: &str) {
+    let mut phase = runtime.phase.lock().await;
+    if *phase != TunnelPhase::Pending {
+        return;
+    }
+    *phase = TunnelPhase::Closed;
+    drop(phase);
+    finish_tunnel_close(state, runtime, reason).await;
+}
+
+async fn finish_tunnel_close(state: &ServerState, runtime: &Arc<TunnelRuntime>, reason: &str) {
     let _ = sqlx::query(
         "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
          WHERE id = ?2 AND status IN ('pending', 'active')",

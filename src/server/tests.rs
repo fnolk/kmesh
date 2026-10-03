@@ -750,6 +750,207 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
 }
 
 #[tokio::test]
+async fn closing_client_control_only_closes_its_pending_tunnels() {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    let login = login_password(state).await;
+    let user = auth::authenticate(state, &bearer(&login.access_token))
+        .await
+        .expect("authenticate admin");
+    let target_secret = SecretKey::generate();
+    let (target_id, _) =
+        create_enrolled_target(state, "control-owner-target", &target_secret).await;
+    grant_target(state, target_id).await;
+    let (target_connection_id, mut target_receiver) =
+        online_target(state, target_id, &target_secret).await;
+    let (sender_a, mut receiver_a) = mpsc::channel(32);
+    let (sender_b, mut receiver_b) = mpsc::channel(32);
+
+    let pending_a = Uuid::new_v4();
+    let pending_a_key = SecretKey::generate();
+    control::open_tunnel(
+        state,
+        user,
+        &sender_a,
+        pending_a,
+        target_id,
+        pending_a_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open sender A pending tunnel");
+    assert!(matches!(
+        target_receiver.recv().await.expect("sender A preparation"),
+        ControlMessage::Prepare { session_id, .. } if session_id == pending_a
+    ));
+
+    let active_a = Uuid::new_v4();
+    let active_a_key = SecretKey::generate();
+    control::open_tunnel(
+        state,
+        user,
+        &sender_a,
+        active_a,
+        target_id,
+        active_a_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open sender A active tunnel");
+    assert!(matches!(
+        target_receiver.recv().await.expect("sender A active preparation"),
+        ControlMessage::Prepare { session_id, .. } if session_id == active_a
+    ));
+    control::activate_tunnel(
+        state,
+        target_id,
+        target_connection_id,
+        active_a,
+        active_a_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await;
+    assert!(matches!(
+        receiver_a.recv().await.expect("sender A activation"),
+        ControlMessage::Activated { session_id } if session_id == active_a
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("target activation"),
+        ControlMessage::Activated { session_id } if session_id == active_a
+    ));
+
+    let pending_b_one = Uuid::new_v4();
+    let pending_b_one_key = SecretKey::generate();
+    control::open_tunnel(
+        state,
+        user,
+        &sender_b,
+        pending_b_one,
+        target_id,
+        pending_b_one_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open sender B first pending tunnel");
+    assert!(matches!(
+        target_receiver.recv().await.expect("sender B first preparation"),
+        ControlMessage::Prepare { session_id, .. } if session_id == pending_b_one
+    ));
+
+    let pending_b_two = Uuid::new_v4();
+    let pending_b_two_key = SecretKey::generate();
+    control::open_tunnel(
+        state,
+        user,
+        &sender_b,
+        pending_b_two,
+        target_id,
+        pending_b_two_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open sender B second pending tunnel");
+    assert!(matches!(
+        target_receiver.recv().await.expect("sender B second preparation"),
+        ControlMessage::Prepare { session_id, .. } if session_id == pending_b_two
+    ));
+
+    control::close_pending_client_tunnels(state, &sender_a).await;
+    assert!(matches!(
+        receiver_a.recv().await.expect("sender A pending close"),
+        ControlMessage::Close { session_id, .. } if session_id == pending_a
+    ));
+    assert!(
+        receiver_a.try_recv().is_err(),
+        "sender A active tunnel receives no close"
+    );
+    assert!(matches!(
+        target_receiver.recv().await.expect("target pending close"),
+        ControlMessage::Close { session_id, .. } if session_id == pending_a
+    ));
+    assert!(
+        receiver_b.try_recv().is_err(),
+        "sender B receives no close from sender A"
+    );
+    assert_eq!(
+        state
+            .on_connect(&endpoint_connect_request(active_a_key.public()))
+            .await,
+        Access::Allow
+    );
+
+    let pending_a_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(pending_a.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read sender A pending status");
+    let active_a_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(active_a.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read sender A active status");
+    let pending_b_one_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(pending_b_one.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read sender B first pending status");
+    let pending_b_two_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(pending_b_two.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read sender B second pending status");
+    assert_eq!(pending_a_status, "closed");
+    assert_eq!(active_a_status, "active");
+    assert_eq!(pending_b_one_status, "pending");
+    assert_eq!(pending_b_two_status, "pending");
+
+    control::activate_tunnel(
+        state,
+        target_id,
+        target_connection_id,
+        pending_b_one,
+        pending_b_one_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await;
+    control::activate_tunnel(
+        state,
+        target_id,
+        target_connection_id,
+        pending_b_two,
+        pending_b_two_key.public().to_string(),
+        RelayMode::Private,
+    )
+    .await;
+    assert!(matches!(
+        receiver_b.recv().await.expect("sender B first activation"),
+        ControlMessage::Activated { session_id } if session_id == pending_b_one
+    ));
+    assert!(matches!(
+        receiver_b.recv().await.expect("sender B second activation"),
+        ControlMessage::Activated { session_id } if session_id == pending_b_two
+    ));
+    let pending_b_one_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(pending_b_one.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read activated sender B first status");
+    let pending_b_two_status: String =
+        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+            .bind(pending_b_two.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read activated sender B second status");
+    assert_eq!(pending_b_one_status, "active");
+    assert_eq!(pending_b_two_status, "active");
+}
+
+#[tokio::test]
 async fn public_default_mode_works_without_a_private_relay() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
