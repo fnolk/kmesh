@@ -164,6 +164,13 @@ async def run(args):
         raise ValueError("--client-bin must name an executable local file")
     if not args.target_bin.startswith("/"):
         raise ValueError("--target-bin must be an absolute path on target-1")
+    client_secret_file = Path(args.client_secret_file).expanduser().resolve()
+    if not client_secret_file.is_file():
+        raise ValueError("--client-secret-file must name an existing local file")
+    if client_secret_file.stat().st_mode & 0o077:
+        raise ValueError("--client-secret-file must be private to its owner")
+    if not args.target_secret_file.startswith("/"):
+        raise ValueError("--target-secret-file must be an absolute path on target-1")
 
     run_id = uuid.uuid4().hex
     pid_file = f"/tmp/kmesh-udp-ac-{run_id}.pid"
@@ -171,7 +178,7 @@ async def run(args):
 pid=$$
 printf '%s\\n' \"$pid\" > {shlex.quote(pid_file)}
 printf 'KMESH_AC_REMOTE_PID=%s\\n' \"$pid\" >&2
-exec {shlex.quote(args.target_bin)} --role target --local-ip {TARGET_IP} --ca-file {TARGET_CA}
+exec {shlex.quote(args.target_bin)} --role target --local-ip {TARGET_IP} --ca-file {TARGET_CA} --endpoint-secret-key-file {shlex.quote(args.target_secret_file)}
 """
     queue, events = asyncio.Queue(), {"client": [], "target": []}
     remote_pid, procs, readers = {"pid": None}, {}, []
@@ -183,7 +190,8 @@ exec {shlex.quote(args.target_bin)} --role target --local-ip {TARGET_IP} --ca-fi
             raise TimeoutError("runner deadline elapsed before start")
         client = await asyncio.create_subprocess_exec(
             str(client_bin), "--role", "client", "--local-ip", CLIENT_IP,
-            "--ca-file", CLIENT_CA, stdin=asyncio.subprocess.PIPE,
+            "--ca-file", CLIENT_CA, "--endpoint-secret-key-file", str(client_secret_file),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
@@ -289,6 +297,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-bin", required=True, help="local macOS udp_ac_check executable")
     parser.add_argument("--target-bin", required=True, help="absolute udp_ac_check path already staged on target-1")
+    parser.add_argument("--client-secret-file", required=True, help="private local enrolled endpoint key file")
+    parser.add_argument("--target-secret-file", required=True, help="absolute enrolled endpoint key file path on target-1")
     parser.add_argument("--out-dir", required=True, help="new private evidence directory")
     return asyncio.run(run(parser.parse_args()))
 
