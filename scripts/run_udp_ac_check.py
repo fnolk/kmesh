@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import copy
 import ipaddress
 import json
 import os
@@ -16,6 +17,10 @@ from pathlib import Path
 HOST = "target-1"
 CLIENT_IP = "10.0.0.6"
 TARGET_IP = "10.0.0.4"
+PRIVATE_RELAY_URL = "https://192.0.2.11:9443/"
+B_QAD_PORT = 3478
+OFFICIAL_RELAY_URL = "https://aps1-1.relay.n0.iroh.link./"
+OFFICIAL_QAD_PORT = 7842
 CLIENT_CA = "/Users/example/.cache/kmesh-live/server/ca.pem"
 TARGET_CA = "/opt/kmesh-iroh-verification/ca.pem"
 TIMEOUT = 60
@@ -25,6 +30,10 @@ CAPTURE_PID_MARKER = re.compile(rb"KMESH_AC_CAPTURE_PID=([0-9]+)")
 CAPTURE_CHILD_PID_MARKER = re.compile(rb"KMESH_AC_CAPTURE_CHILD_PID=([0-9]+)")
 CAPTURE_EXE_MARKER = re.compile(rb"KMESH_AC_CAPTURE_EXE=(/[^\r\n]+)")
 CAPTURE_CHILD_EXE_MARKER = re.compile(rb"KMESH_AC_CAPTURE_CHILD_EXE=(/[^\r\n]+)")
+ANSI_ESCAPE = re.compile(rb"\x1b\[[0-9;]*m")
+QAD_REPORT = re.compile(
+    rb'QadProbeReport\s*\{\s*relay:\s*RelayUrl\("([^"]+)"\),.*?\baddr:\s*(\[[^\]]+\]:\d+|[^,\s}]+)'
+)
 
 
 def create_private_file(path):
@@ -40,7 +49,26 @@ def parse_event(line):
     return value if isinstance(value, dict) and isinstance(value.get("event"), str) else None
 
 
-async def collect(reader, path, role, events, queue=None, remote_pid=None):
+def parse_socket_address(value, field):
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a socket address string")
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0 or value[end + 1:end + 2] != ":":
+            raise ValueError(f"{field} has invalid IPv6 socket syntax")
+        host, port_text = value[1:end], value[end + 2:]
+    else:
+        host, separator, port_text = value.rpartition(":")
+        if not separator:
+            raise ValueError(f"{field} has invalid socket syntax")
+    address = ipaddress.ip_address(host)
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{field} has invalid port")
+    return address, port
+
+
+async def collect(reader, path, role, events, queue=None, remote_pid=None, qad_reports=None, qad_report_event=None):
     with path.open("ab") as output:
         while line := await reader.readline():
             output.write(line)
@@ -49,6 +77,15 @@ async def collect(reader, path, role, events, queue=None, remote_pid=None):
                 match = PID_MARKER.search(line)
                 if match:
                     remote_pid["pid"] = int(match.group(1))
+            if qad_reports is not None:
+                match = QAD_REPORT.search(ANSI_ESCAPE.sub(b"", line))
+                if match:
+                    qad_reports[role].append({
+                        "relay_url": match.group(1).decode(),
+                        "socket_addr": match.group(2).decode(),
+                        "raw_line": ANSI_ESCAPE.sub(b"", line).decode(errors="replace").rstrip(),
+                    })
+                    qad_report_event.set()
             if queue is not None:
                 event = parse_event(line)
                 if event is not None:
@@ -247,6 +284,8 @@ async def run(args):
         raise ValueError("public mode uses fresh helper identities and accepts no secret-file paths")
     if args.capture_target and args.relay_mode != "private":
         raise ValueError("--capture-target is available for private mode only")
+    if args.mapping_candidates and args.relay_mode != "private":
+        raise ValueError("--mapping-candidates is available for private mode only")
 
     run_id = uuid.uuid4().hex
     pid_file = f"/tmp/kmesh-udp-ac-{run_id}.pid"
@@ -259,6 +298,8 @@ async def run(args):
             "--local-ip", TARGET_IP,
             "--endpoint-secret-key-file", args.target_secret_file,
         ])
+        if args.mapping_candidates:
+            target_args.append("--mapping-candidates")
     remote_command = f"""umask 077
 pid=$$
 printf '%s\\n' \"$pid\" > {shlex.quote(pid_file)}
@@ -267,6 +308,14 @@ export RUST_LOG={shlex.quote(LOG_FILTER)}
 exec {' '.join(shlex.quote(arg) for arg in target_args)}
 """
     queue, events = asyncio.Queue(), {"client": [], "target": []}
+    qad_reports, qad_report_event = {"client": [], "target": []}, asyncio.Event()
+    mapping_candidates = {
+        "enabled": args.mapping_candidates,
+        "ready_before": {},
+        "ready_after": {},
+        "observations": {},
+        "all_successful_qad_reports": {},
+    }
     remote_pid, procs, readers = {"pid": None}, {}, []
     capture_proc, capture_readers = None, []
     capture_info = {
@@ -310,6 +359,8 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
                 "--local-ip", CLIENT_IP,
                 "--endpoint-secret-key-file", str(client_secret_file),
             ])
+            if args.mapping_candidates:
+                client_args.append("--mapping-candidates")
         client = await asyncio.create_subprocess_exec(
             *client_args,
             stdin=asyncio.subprocess.PIPE,
@@ -325,15 +376,124 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
         procs["target"] = target
         readers = [
             asyncio.create_task(collect(client.stdout, logs["client.stdout.jsonl"], "client", events["client"], queue)),
-            asyncio.create_task(collect(client.stderr, logs["client.stderr.log"], "client", events["client"])),
+            asyncio.create_task(collect(
+                client.stderr, logs["client.stderr.log"], "client", events["client"],
+                qad_reports=qad_reports if args.mapping_candidates else None,
+                qad_report_event=qad_report_event if args.mapping_candidates else None,
+            )),
             asyncio.create_task(collect(target.stdout, logs["target.stdout.jsonl"], "target", events["target"], queue)),
-            asyncio.create_task(collect(target.stderr, logs["target.stderr.log"], "target", events["target"], remote_pid=remote_pid)),
+            asyncio.create_task(collect(
+                target.stderr, logs["target.stderr.log"], "target", events["target"],
+                remote_pid=remote_pid,
+                qad_reports=qad_reports if args.mapping_candidates else None,
+                qad_report_event=qad_report_event if args.mapping_candidates else None,
+            )),
         ]
 
         while len(ready) < 2:
             role, event = await next_event(queue, deadline)
             if event["event"] == "ready":
                 ready[role] = event
+
+        if args.mapping_candidates:
+            mapping_candidates["ready_before"] = copy.deepcopy(ready)
+            qad_deadline = min(deadline, asyncio.get_running_loop().time() + 5)
+            reports_by_role = {}
+            while True:
+                reports_by_role.clear()
+                for role in ("client", "target"):
+                    event = ready[role]
+                    if event.get("role") != role or event.get("relay_mode") != "private":
+                        raise ValueError(f"{role} ready event has a mismatched role or relay mode")
+                    relay_map = event.get("relay_map")
+                    if not isinstance(relay_map, list) or len(relay_map) != 2:
+                        raise ValueError(f"{role} ready.relay_map must contain the two configured QAD reflectors")
+                    urls = [entry.get("url") for entry in relay_map if isinstance(entry, dict)]
+                    if len(urls) != 2 or any(not isinstance(url, str) for url in urls) or len(set(urls)) != 2:
+                        raise ValueError(f"{role} ready.relay_map must contain two distinct URL entries")
+                    if not any(entry["url"] == PRIVATE_RELAY_URL and entry.get("qad_udp_port") == B_QAD_PORT for entry in relay_map):
+                        raise ValueError(f"{role} ready.relay_map must retain B relay TCP 9443 and QAD UDP {B_QAD_PORT}")
+                    if any(type(entry.get("qad_udp_port")) is not int or not 1 <= entry["qad_udp_port"] <= 65535 for entry in relay_map):
+                        raise ValueError(f"{role} ready.relay_map contains an invalid QAD UDP port")
+                    configured_qad = {entry["url"]: entry["qad_udp_port"] for entry in relay_map}
+                    if configured_qad != {
+                        PRIVATE_RELAY_URL: B_QAD_PORT,
+                        OFFICIAL_RELAY_URL: OFFICIAL_QAD_PORT,
+                    }:
+                        raise ValueError(f"{role} ready.relay_map differs from the fixed B and official QAD reflectors")
+                    matching = {
+                        url: [report for report in qad_reports[role] if report["relay_url"] == url]
+                        for url in urls
+                    }
+                    if all(matching[url] for url in urls):
+                        reports_by_role[role] = (relay_map, matching)
+                if len(reports_by_role) == 2:
+                    break
+                remaining = qad_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("each live endpoint must emit one successful QadProbeReport per configured reflector")
+                qad_report_event.clear()
+                try:
+                    await asyncio.wait_for(qad_report_event.wait(), remaining)
+                except asyncio.TimeoutError as error:
+                    raise TimeoutError("each live endpoint must emit one successful QadProbeReport per configured reflector") from error
+
+            for role in ("client", "target"):
+                event = ready[role]
+                local_ip, _ = parse_socket_address(event.get("local_socket"), f"{role} ready.local_socket")
+                expected_local_ip = ipaddress.ip_address(CLIENT_IP if role == "client" else TARGET_IP)
+                if local_ip.version != 4 or local_ip != expected_local_ip:
+                    raise ValueError(f"{role} live Endpoint bound socket does not match its configured IPv4 interface")
+                global_ip, _ = parse_socket_address(event.get("global_v4"), f"{role} ready.global_v4")
+                if global_ip.version != 4:
+                    raise ValueError(f"{role} ready.global_v4 must be IPv4")
+                endpoint_addr = event.get("endpoint_addr")
+                if not isinstance(endpoint_addr, dict) or endpoint_addr.get("id") != event.get("endpoint_id"):
+                    raise ValueError(f"{role} ready EndpointAddr identity must match the active Endpoint")
+                existing_addrs = endpoint_addr.get("addrs")
+                if not isinstance(existing_addrs, list):
+                    raise ValueError(f"{role} ready EndpointAddr.addrs must be a list")
+                relay_addrs_before = [addr for addr in existing_addrs if isinstance(addr, dict) and "Relay" in addr]
+                relay_map, matching = reports_by_role[role]
+                observed = []
+                for relay in relay_map:
+                    report = matching[relay["url"]][0]
+                    report_ip, report_port = parse_socket_address(
+                        report["socket_addr"], f"{role} QadProbeReport addr from {relay['url']}"
+                    )
+                    if report_ip.version != 4 or report_ip != global_ip:
+                        raise ValueError(f"{role} QAD reflector reports a public IPv4 that differs from ready.global_v4")
+                    observed.append({
+                        "relay_url": relay["url"],
+                        "qad_udp_port": relay.get("qad_udp_port"),
+                        "socket_addr": f"{report_ip}:{report_port}",
+                        "raw_report": report,
+                    })
+                unique_candidates = list(dict.fromkeys(item["socket_addr"] for item in observed))
+                before = copy.deepcopy(event)
+                after = copy.deepcopy(event)
+                after_addrs = after["endpoint_addr"]["addrs"]
+                appended_candidates = []
+                for socket_addr in unique_candidates:
+                    ip_candidate = {"Ip": socket_addr}
+                    if ip_candidate not in after_addrs:
+                        after_addrs.append(ip_candidate)
+                        appended_candidates.append(socket_addr)
+                relay_addrs_after = [addr for addr in after_addrs if isinstance(addr, dict) and "Relay" in addr]
+                if relay_addrs_after != relay_addrs_before or after["endpoint_addr"]["id"] != before["endpoint_addr"]["id"]:
+                    raise RuntimeError("mapping candidate injection changed authenticated EndpointAddr identity or relay URLs")
+                ready[role] = after
+                mapping_candidates["ready_before"][role] = before
+                mapping_candidates["ready_after"][role] = copy.deepcopy(after)
+                mapping_candidates["observations"][role] = {
+                    "endpoint_id": event["endpoint_id"],
+                    "bound_socket": event["local_socket"],
+                    "global_v4": event["global_v4"],
+                    "relay_map": relay_map,
+                    "successful_qad_reports": observed,
+                    "observed_unique_candidates": unique_candidates,
+                    "newly_appended_candidates": appended_candidates,
+                }
 
         if args.capture_target:
             capture_info["target_local_socket"] = ready["target"]["local_socket"]
@@ -524,6 +684,9 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
                     and failure is None):
                 failure = "RuntimeError: target tcpdump did not complete its bounded verified capture"
 
+    if args.mapping_candidates:
+        mapping_candidates["all_successful_qad_reports"] = copy.deepcopy(qad_reports)
+
     cleanup = await cleanup_target(
         pid_file, args.target_bin, remote_pid["pid"],
         logs["remote-cleanup.stdout.log"], logs["remote-cleanup.stderr.log"],
@@ -543,6 +706,11 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
         and all(event is not None and event.get("pass") is True for event in nonce_events.values())
         and all(event is not None and event.get("pass") is True for event in complete.values())
         and cleanup["verified"]
+        and (not args.mapping_candidates or (
+            len(mapping_candidates["observations"]) == 2
+            and all(len(observation["successful_qad_reports"]) == 2
+                    for observation in mapping_candidates["observations"].values())
+        ))
         and (not args.capture_target or (
             capture_info["started_utc"] is not None
             and capture_info["exit_code"] == 124
@@ -564,6 +732,7 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
         "complete": complete,
         "exit_codes": {role: proc.returncode for role, proc in procs.items()},
         "remote_cleanup": cleanup,
+        "mapping_candidates": mapping_candidates,
         "target_capture": capture_info,
         "events": events,
         "raw_logs": {name: str(path) for name, path in logs.items()},
@@ -585,6 +754,7 @@ def main():
     parser.add_argument("--target-secret-file", help="absolute enrolled key file on target-1 (private mode only)")
     parser.add_argument("--out-dir", required=True, help="new private evidence directory")
     parser.add_argument("--capture-target", action="store_true", help="capture the target UDP endpoint on target-1 ens1f0")
+    parser.add_argument("--mapping-candidates", action="store_true", help="exchange each endpoint's two live QAD-observed IP:port candidates")
     return asyncio.run(run(parser.parse_args()))
 
 
