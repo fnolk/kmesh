@@ -32,37 +32,51 @@ async fn iroh_stream_preserves_half_close_and_final_ssh_exit_status_bytes() {
     let target = loopback_endpoint(true).await;
     let client = loopback_endpoint(false).await;
     let target_addr = target.addr();
+    let (mut sshd, mut agent_socket) = tokio::io::duplex(4096);
+    let (mut ssh_client, mut client_socket) = tokio::io::duplex(4096);
 
     let target_task = tokio::spawn(async move {
         let connection = accept_peer(&target).await.unwrap();
         let mut stream = IrohByteStream::accept_bi(connection).await.unwrap();
-        let mut request = Vec::new();
-        stream.read_to_end(&mut request).await.unwrap();
-        assert_eq!(request, b"ssh request before client EOF");
-
-        stream
-            .write_all(b"stdout final bytes\nSSH_EXIT_STATUS=7\n")
+        tokio::io::copy_bidirectional(&mut stream, &mut agent_socket)
             .await
             .unwrap();
         stream.finish_send_and_wait().await.unwrap();
+    });
+    let sshd_task = tokio::spawn(async move {
+        let mut request = Vec::new();
+        sshd.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"ssh request before client EOF");
+        sshd.write_all(b"stdout final bytes\nSSH_EXIT_STATUS=7\n")
+            .await
+            .unwrap();
+        sshd.shutdown().await.unwrap();
     });
 
     let connection = connect_peer(&client, target_addr).await.unwrap();
     let mut stream = IrohByteStream::open_bi(connection).await.unwrap();
     assert_eq!(stream.selected_path().unwrap().kind, IrohPathKind::Direct);
-    stream
+    let client_task = tokio::spawn(async move {
+        tokio::io::copy_bidirectional(&mut client_socket, &mut stream)
+            .await
+            .unwrap();
+        stream.finish_send_and_wait().await.unwrap();
+    });
+    ssh_client
         .write_all(b"ssh request before client EOF")
         .await
         .unwrap();
-    stream.finish_send_and_wait().await.unwrap();
+    ssh_client.shutdown().await.unwrap();
 
     let response = tokio::time::timeout(Duration::from_secs(5), async {
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
+        ssh_client.read_to_end(&mut response).await.unwrap();
         response
     })
     .await
     .unwrap();
     assert_eq!(response, b"stdout final bytes\nSSH_EXIT_STATUS=7\n");
     target_task.await.unwrap();
+    sshd_task.await.unwrap();
+    client_task.await.unwrap();
 }

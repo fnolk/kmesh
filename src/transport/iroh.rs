@@ -94,6 +94,7 @@ pub struct IrohByteStream {
     connection: Connection,
     send: SendStream,
     recv: RecvStream,
+    send_finished: bool,
 }
 
 impl IrohByteStream {
@@ -106,6 +107,7 @@ impl IrohByteStream {
             connection,
             send,
             recv,
+            send_finished: false,
         })
     }
 
@@ -118,6 +120,7 @@ impl IrohByteStream {
             connection,
             send,
             recv,
+            send_finished: false,
         })
     }
 
@@ -146,7 +149,10 @@ impl IrohByteStream {
     /// Call this after normal bidirectional SSH EOF and before closing the connection. Use
     /// [`Self::reset`] when cancellation interrupts the copy.
     pub async fn finish_send_and_wait(&mut self) -> io::Result<()> {
-        self.send.shutdown().await?;
+        if !self.send_finished {
+            self.send.shutdown().await?;
+            self.send_finished = true;
+        }
         match self.send.stopped().await {
             Ok(None) => Ok(()),
             Ok(Some(code)) => Err(io::Error::new(
@@ -192,7 +198,17 @@ impl AsyncWrite for IrohByteStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
+        let this = self.get_mut();
+        if this.send_finished {
+            return Poll::Ready(Ok(()));
+        }
+        match Pin::new(&mut this.send).poll_shutdown(cx) {
+            Poll::Ready(Ok(())) => {
+                this.send_finished = true;
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
     }
 }
 
