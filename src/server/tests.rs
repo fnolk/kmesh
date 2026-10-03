@@ -313,6 +313,14 @@ async fn exchange_test_client_candidates(
     assert_eq!(*offered_target, target_id);
     assert_eq!(client_endpoint_id, &client_secret.public().to_string());
     assert_eq!(*offered_mode, relay_mode);
+    let enrolled_endpoint_id = state
+        .inner
+        .db
+        .target_endpoint_id(target_id)
+        .await
+        .expect("read enrolled target EndpointId")
+        .expect("target is enrolled");
+    assert_eq!(target_endpoint_id, &enrolled_endpoint_id);
 
     let client_endpoint_addr = EndpointAddr::new(client_secret.public()).with_relay_url(relay_url);
     control::send_dial_offer(
@@ -1627,7 +1635,8 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     assert_eq!(report.preferred_relay.as_ref(), Some(&relay_url));
 
     let mut agent_control = connect_control_ws(&issuer, "agent/control", &agent_token, &tls).await;
-    let relay_only_target_addr = EndpointAddr::new(target_endpoint.id()).with_relay_url(relay_url);
+    let relay_only_target_addr =
+        EndpointAddr::new(target_endpoint.id()).with_relay_url(relay_url.clone());
     send_control(
         &mut agent_control,
         &ControlMessage::AgentReady {
