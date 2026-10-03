@@ -83,6 +83,7 @@ struct Args {
     role: Role,
     relay_selection: RelaySelection,
     observe_mappings: bool,
+    mapping_candidates: bool,
     ca_file: Option<PathBuf>,
     local_ip: Option<Ipv4Addr>,
     endpoint_secret_key_file: Option<PathBuf>,
@@ -160,6 +161,7 @@ async fn run() -> Result<()> {
     };
     let private_relay_url: iroh::RelayUrl =
         B_RELAY_URL.parse().context("parse fixed B relay URL")?;
+    let mut private_allowed_relay_urls = BTreeSet::from([private_relay_url.clone()]);
     let mut relay_map_info = vec![json!({
         "url": private_relay_url,
         "qad_udp_port": B_QAD_PORT
@@ -183,7 +185,7 @@ async fn run() -> Result<()> {
                 private_relay_url.clone(),
                 Some(RelayQuicConfig::new(B_QAD_PORT)),
             )];
-            if args.observe_mappings {
+            if args.observe_mappings || args.mapping_candidates {
                 let official_relay = RelayMode::Default
                     .relay_map()
                     .relays::<Vec<_>>()
@@ -199,6 +201,7 @@ async fn run() -> Result<()> {
                     "url": official_relay.url,
                     "qad_udp_port": official_qad_port
                 }));
+                private_allowed_relay_urls.insert(official_relay.url.clone());
                 relays.push(official_relay.as_ref().clone());
             }
             Endpoint::builder(presets::Minimal)
@@ -235,19 +238,85 @@ async fn run() -> Result<()> {
     let mut relay_status = endpoint.home_relay_status();
     loop {
         let statuses = relay_status.get();
-        if statuses.iter().any(|relay| relay.is_connected()) {
+        let b_relay_connected = statuses
+            .iter()
+            .any(|relay| relay.url() == &private_relay_url && relay.is_connected());
+        if args.mapping_candidates && b_relay_connected {
+            let actual_home_relay_url =
+                endpoint.addr().relay_urls().next().map(ToString::to_string);
+            emit(json!({
+                "event": "relay_connectivity",
+                "role": args.role.as_str(),
+                "actual_home_relay_url": actual_home_relay_url,
+                "b_relay_url": private_relay_url,
+                "b_relay_connected": b_relay_connected,
+                "connected_relays": statuses
+                    .iter()
+                    .filter(|relay| relay.is_connected())
+                    .map(|relay| relay.url().to_string())
+                    .collect::<Vec<_>>()
+            }))?;
             break;
         }
-        if let Some(reason) = statuses.iter().find_map(|relay| relay.auth_denied_reason()) {
-            emit(
-                json!({"event":"relay_auth_denied","role":args.role.as_str(),"relay_mode":args.relay_selection.as_str(),"reason":reason}),
-            )?;
+        if !args.mapping_candidates && statuses.iter().any(|relay| relay.is_connected()) {
+            break;
+        }
+        let auth_denied_reason = if args.mapping_candidates {
+            statuses
+                .iter()
+                .find(|relay| relay.url() == &private_relay_url)
+                .and_then(|relay| relay.auth_denied_reason())
+        } else {
+            statuses.iter().find_map(|relay| relay.auth_denied_reason())
+        };
+        if let Some(reason) = auth_denied_reason {
+            if args.mapping_candidates {
+                emit(json!({
+                    "event": "relay_auth_denied",
+                    "role": args.role.as_str(),
+                    "b_relay_url": private_relay_url,
+                    "b_relay_connected": false,
+                    "actual_home_relay_url": endpoint
+                        .addr()
+                        .relay_urls()
+                        .next()
+                        .map(ToString::to_string),
+                    "reason": reason
+                }))?;
+            } else {
+                emit(
+                    json!({"event":"relay_auth_denied","role":args.role.as_str(),"relay_mode":args.relay_selection.as_str(),"reason":reason}),
+                )?;
+            }
             bail!("selected Iroh relay denied the registered EndpointId: {reason}");
         }
-        timeout_at(deadline, relay_status.updated())
-            .await
-            .context("wait for Iroh relay readiness")?
-            .map_err(|_| anyhow!("Iroh relay status watcher disconnected"))?;
+        match timeout_at(deadline, relay_status.updated()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => bail!("Iroh relay status watcher disconnected"),
+            Err(_) if args.mapping_candidates => {
+                let statuses = relay_status.get();
+                let actual_home_relay_url =
+                    endpoint.addr().relay_urls().next().map(ToString::to_string);
+                emit(json!({
+                    "event": "relay_connectivity_timeout",
+                    "role": args.role.as_str(),
+                    "b_relay_url": private_relay_url,
+                    "b_relay_connected": statuses
+                        .iter()
+                        .any(|relay| relay.url() == &private_relay_url && relay.is_connected()),
+                    "actual_home_relay_url": actual_home_relay_url,
+                    "connected_relays": statuses
+                        .iter()
+                        .filter(|relay| relay.is_connected())
+                        .map(|relay| relay.url().to_string())
+                        .collect::<Vec<_>>()
+                }))?;
+                bail!(
+                    "B private relay did not connect before deadline; actual home relay is {actual_home_relay_url:?}"
+                );
+            }
+            Err(_) => bail!("wait for Iroh relay readiness timed out"),
+        }
     }
     let mut report_watcher = endpoint.net_report();
     let report = timeout_at(deadline, report_watcher.initialized())
@@ -290,6 +359,7 @@ async fn run() -> Result<()> {
             .map_err(|_| anyhow!("endpoint address watcher disconnected"))?;
     }
     let own_addr = match args.relay_selection {
+        RelaySelection::Private if args.mapping_candidates => endpoint.addr(),
         RelaySelection::Private => EndpointAddr::new(endpoint.id())
             .with_ip_addr(SocketAddr::V4(global_v4))
             .with_relay_url(private_relay_url.clone()),
@@ -300,7 +370,7 @@ async fn run() -> Result<()> {
         .next()
         .cloned()
         .context("ready endpoint address has no home relay URL")?;
-    emit(json!({
+    let mut ready_event = json!({
         "event":"ready", "role":args.role.as_str(), "relay_mode":args.relay_selection.as_str(), "endpoint_id":endpoint.id().to_string(),
         "global_v4":global_v4, "local_socket":bound_socket, "endpoint_addr":own_addr,
         "relay_url":own_home_relay_url,
@@ -308,7 +378,11 @@ async fn run() -> Result<()> {
             RelaySelection::Private => format!("192.0.2.11:{B_QAD_PORT}/udp"),
             RelaySelection::Public => "Iroh RelayMode::Default (UDP 7842)".to_owned(),
         }
-    }))?;
+    });
+    if args.mapping_candidates {
+        ready_event["relay_map"] = json!(relay_map_info);
+    }
+    emit(ready_event)?;
 
     let mut control = AsyncBufReader::new(tokio::io::stdin());
     let peer = read_peer(&mut control, deadline).await?;
@@ -335,7 +409,7 @@ async fn run() -> Result<()> {
         .parse()
         .context("parse peer home relay URL")?;
     let allowed_relay_urls = match args.relay_selection {
-        RelaySelection::Private => BTreeSet::from([private_relay_url.clone()]),
+        RelaySelection::Private => private_allowed_relay_urls.clone(),
         RelaySelection::Public => RelayMode::Default.relay_map().urls::<BTreeSet<_>>(),
     };
     ensure!(
@@ -567,6 +641,7 @@ fn parse_args() -> Result<Args> {
     let mut role = None;
     let mut relay_selection = None;
     let mut observe_mappings = false;
+    let mut mapping_candidates = false;
     let mut ca_file = None;
     let mut local_ip = None;
     let mut endpoint_secret_key_file = None;
@@ -588,6 +663,7 @@ fn parse_args() -> Result<Args> {
                 })
             }
             "--observe-mappings" => observe_mappings = true,
+            "--mapping-candidates" => mapping_candidates = true,
             "--ca-file" => ca_file = args.next().map(PathBuf::from),
             "--local-ip" => {
                 local_ip = Some(
@@ -602,15 +678,19 @@ fn parse_args() -> Result<Args> {
             }
             _ => {
                 bail!(
-                    "usage: udp_ac_check --role target|client --relay-mode private|public [--observe-mappings] [--ca-file <PEM>] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
+                    "usage: udp_ac_check --role target|client --relay-mode private|public [--observe-mappings | --mapping-candidates] [--ca-file <PEM>] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
                 )
             }
         }
     }
     let relay_selection = relay_selection.context("--relay-mode is required")?;
     ensure!(
-        !observe_mappings || relay_selection == RelaySelection::Private,
-        "--observe-mappings is available for private mode only"
+        !(observe_mappings && mapping_candidates),
+        "--observe-mappings and --mapping-candidates are mutually exclusive"
+    );
+    ensure!(
+        !(observe_mappings || mapping_candidates) || relay_selection == RelaySelection::Private,
+        "mapping observation modes are available for private mode only"
     );
     match relay_selection {
         RelaySelection::Private => {
@@ -630,6 +710,7 @@ fn parse_args() -> Result<Args> {
         role: role.context("--role is required")?,
         relay_selection,
         observe_mappings,
+        mapping_candidates,
         ca_file,
         local_ip,
         endpoint_secret_key_file,
@@ -832,7 +913,9 @@ fn init_tracing() {
         "warn,iroh::socket::transports=trace,iroh::socket::remote_map::remote_state=debug";
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    let filter = if std::env::args().any(|arg| arg == "--observe-mappings") {
+    let filter = if std::env::args()
+        .any(|arg| arg == "--observe-mappings" || arg == "--mapping-candidates")
+    {
         filter.add_directive(
             "iroh::net_report=debug"
                 .parse()
