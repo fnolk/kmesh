@@ -258,12 +258,12 @@ pub enum ControlMessage {
         client_endpoint_id: String,
         relay_mode: RelayMode,
     },
-    Offer {
+    ClientOffer {
         session_id: Uuid,
         target_id: Uuid,
         ticket: String,
         client_endpoint_id: String,
-        target_endpoint_addr: iroh::EndpointAddr,
+        target_endpoint_id: String,
         ticket_public_key_pem: String,
         relay_mode: RelayMode,
     },
@@ -276,8 +276,18 @@ pub enum ControlMessage {
         relay_mode: RelayMode,
         endpoint_addr: iroh::EndpointAddr,
     },
-    OfferReady {
+    ClientReady {
         session_id: Uuid,
+        relay_mode: RelayMode,
+        client_endpoint_addr: iroh::EndpointAddr,
+    },
+    DialOffer {
+        session_id: Uuid,
+        target_id: Uuid,
+        ticket: String,
+        client_endpoint_id: String,
+        client_endpoint_addr: iroh::EndpointAddr,
+        ticket_public_key_pem: String,
         relay_mode: RelayMode,
     },
     IrohReady {
