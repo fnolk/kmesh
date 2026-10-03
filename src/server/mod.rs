@@ -34,6 +34,7 @@ pub struct ServerOptions {
     pub tls_cert: PathBuf,
     pub tls_key: PathBuf,
     pub qad_bind: SocketAddr,
+    pub disable_private_relay: bool,
 }
 
 #[derive(Clone)]
@@ -137,12 +138,13 @@ pub async fn run(options: ServerOptions) -> Result<()> {
             online_agents: RwLock::new(std::collections::HashMap::new()),
             tunnels: RwLock::new(std::collections::HashMap::new()),
             transport_info: RwLock::new(crate::protocol::TransportInfo {
-                relay_url: options.issuer.clone(),
+                private_relay_url: (!options.disable_private_relay).then(|| options.issuer.clone()),
                 qad_port: options.qad_bind.port(),
             }),
         }),
     };
-    let relay_access: Arc<dyn iroh_relay::server::DynAccessControl> = Arc::new(state.clone());
+    let relay_access = (!options.disable_private_relay)
+        .then(|| Arc::new(state.clone()) as Arc<dyn iroh_relay::server::DynAccessControl>);
     let server = iroh::listen_and_serve(
         router(state.clone()),
         relay_access,
@@ -219,6 +221,7 @@ fn validate_token_keys(keys: &TokenKeySet, issuer: &str) -> Result<()> {
         target_id: Uuid::new_v4(),
         client_endpoint_id: String::new(),
         target_endpoint_id: String::new(),
+        relay_mode: crate::protocol::RelayMode::Private,
         iss: issuer.to_owned(),
         aud: identity::TUNNEL_TICKET_AUDIENCE.to_owned(),
         iat: now,

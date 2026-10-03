@@ -107,6 +107,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     tls_cert: args.tls_cert.clone(),
                     tls_key: args.tls_key.clone(),
                     qad_bind: args.qad_bind,
+                    disable_private_relay: args.disable_private_relay,
                 })
                 .await?;
             }

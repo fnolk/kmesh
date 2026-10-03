@@ -39,7 +39,7 @@ pub struct IrohServer {
     shutdown: watch::Sender<bool>,
     https_task: Option<JoinHandle<Result<()>>>,
     qad_server: IrohRelayServer,
-    relay_service: RelayService,
+    relay_service: Option<RelayService>,
 }
 
 impl IrohServer {
@@ -72,7 +72,9 @@ impl IrohServer {
                 }
             }
         };
-        self.relay_service.shutdown().await;
+        if let Some(relay_service) = self.relay_service.as_ref() {
+            relay_service.shutdown().await;
+        }
         self.qad_server
             .shutdown()
             .await
@@ -93,7 +95,9 @@ impl IrohServer {
             relay_service,
             ..
         } = self;
-        relay_service.shutdown().await;
+        if let Some(relay_service) = relay_service {
+            relay_service.shutdown().await;
+        }
         qad_server
             .shutdown()
             .await
@@ -110,7 +114,7 @@ impl IrohServer {
 
 pub async fn listen_and_serve(
     router: Router,
-    relay_access: Arc<dyn DynAccessControl>,
+    relay_access: Option<Arc<dyn DynAccessControl>>,
     https_bind: SocketAddr,
     qad_bind: SocketAddr,
     tls_cert: impl AsRef<Path>,
@@ -124,16 +128,19 @@ pub async fn listen_and_serve(
         .local_addr()
         .context("read kmesh HTTPS listener address")?;
 
-    let relay_service = RelayService::new(
-        relay_handlers(),
-        hyper::HeaderMap::new(),
-        None,
-        KeyCache::new(1024),
-        relay_access,
-        Arc::new(Metrics::default()),
-    );
-    let relay_service_with_notify =
-        RelayServiceWithNotify::new(relay_service.clone(), Arc::new(Notify::new()));
+    let relay_service = relay_access.map(|relay_access| {
+        RelayService::new(
+            relay_handlers(),
+            hyper::HeaderMap::new(),
+            None,
+            KeyCache::new(1024),
+            relay_access,
+            Arc::new(Metrics::default()),
+        )
+    });
+    let relay_service_with_notify = relay_service.as_ref().map(|relay_service| {
+        RelayServiceWithNotify::new(relay_service.clone(), Arc::new(Notify::new()))
+    });
 
     let mut qad_config = IrohServerConfig::default();
     let mut quic_config = IrohQuicConfig::new(qad_bind);
@@ -202,7 +209,7 @@ async fn serve_https(
     listener: TcpListener,
     tls_acceptor: TlsAcceptor,
     router: Router,
-    relay: RelayServiceWithNotify,
+    relay: Option<RelayServiceWithNotify>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut connections = JoinSet::new();
@@ -273,7 +280,7 @@ async fn serve_connection(
 #[derive(Clone)]
 struct CombinedService {
     router: Router,
-    relay: RelayServiceWithNotify,
+    relay: Option<RelayServiceWithNotify>,
     peer: SocketAddr,
 }
 
@@ -295,8 +302,8 @@ impl Service<Request<Incoming>> for CombinedService {
                     | "/healthz"
                     | "/generate_204"
             );
-        if is_iroh_path {
-            let relay = self.relay.clone();
+        if is_iroh_path && self.relay.is_some() {
+            let relay = self.relay.clone().expect("checked above");
             Box::pin(async move {
                 let response = relay.call(request).await?;
                 Ok(response.map(box_relay_body))

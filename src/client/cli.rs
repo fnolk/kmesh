@@ -79,6 +79,8 @@ pub struct ServerRunArgs {
     pub tls_key: PathBuf,
     #[arg(long, default_value = "0.0.0.0:3478")]
     pub qad_bind: SocketAddr,
+    #[arg(long)]
+    pub disable_private_relay: bool,
 }
 
 #[derive(Debug, Subcommand)]

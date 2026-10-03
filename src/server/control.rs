@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
     sync::atomic::{AtomicI64, Ordering},
     time::Duration,
@@ -13,7 +14,7 @@ use axum::{
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
-use iroh::{EndpointAddr, RelayUrl, TransportAddr};
+use iroh::EndpointAddr;
 use sqlx::Row;
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
@@ -21,7 +22,8 @@ use uuid::Uuid;
 use crate::{
     identity::{self, TUNNEL_TICKET_AUDIENCE},
     protocol::{
-        AgentEnrollmentRequest, AgentEnrollmentResponse, ControlMessage, TunnelTicketClaims,
+        AgentEnrollmentRequest, AgentEnrollmentResponse, ControlMessage, RelayMode,
+        TunnelTicketClaims,
     },
 };
 
@@ -40,7 +42,7 @@ const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 pub struct OnlineAgent {
     pub(crate) connection_id: Uuid,
     pub(crate) sender: mpsc::Sender<ControlMessage>,
-    pub(crate) endpoint_addr: Option<EndpointAddr>,
+    pub(crate) endpoints: HashMap<RelayMode, EndpointAddr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,9 +59,11 @@ pub(crate) struct TunnelRuntime {
     pub access_expires_at: i64,
     pub target_id: Uuid,
     pub target_connection_id: Uuid,
+    pub relay_mode: RelayMode,
     pub client_endpoint_id: String,
     pub target_endpoint_id: String,
-    pub offer: ControlMessage,
+    pub ticket: String,
+    pub offer: Mutex<Option<ControlMessage>>,
     pub client_sender: mpsc::Sender<ControlMessage>,
     pub target_sender: mpsc::Sender<ControlMessage>,
     pub phase: Mutex<TunnelPhase>,
@@ -285,6 +289,7 @@ async fn handle_client_message(
             session_id,
             target_id,
             client_endpoint_id,
+            relay_mode,
         } => {
             if let Err(error) = open_tunnel(
                 state,
@@ -293,6 +298,7 @@ async fn handle_client_message(
                 session_id,
                 target_id,
                 client_endpoint_id,
+                relay_mode,
             )
             .await
             {
@@ -321,27 +327,55 @@ async fn handle_agent_message(
     message: ControlMessage,
 ) {
     match message {
-        ControlMessage::AgentReady { endpoint_addr } => {
-            if let Err(error) =
-                register_agent_endpoint(state, target_id, connection_id, endpoint_addr).await
+        ControlMessage::AgentReady {
+            session_id,
+            relay_mode,
+            endpoint_addr,
+        } => {
+            if let Err(error) = register_agent_endpoint(
+                state,
+                target_id,
+                connection_id,
+                relay_mode,
+                endpoint_addr.clone(),
+            )
+            .await
             {
-                send_agent_error(
-                    state,
-                    target_id,
-                    connection_id,
-                    None,
-                    "endpoint_mismatch",
-                    &error.to_string(),
-                )
-                .await;
+                if let Some(session_id) = session_id {
+                    fail_from_target(
+                        state,
+                        session_id,
+                        target_id,
+                        connection_id,
+                        "endpoint_mismatch".to_owned(),
+                        error.to_string(),
+                    )
+                    .await;
+                } else {
+                    send_agent_error(
+                        state,
+                        target_id,
+                        connection_id,
+                        None,
+                        "endpoint_mismatch",
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            } else if let Some(session_id) = session_id {
+                send_target_offer(state, target_id, connection_id, relay_mode, session_id).await;
             }
         }
-        ControlMessage::OfferReady { session_id } => {
-            send_offer_to_client(state, target_id, connection_id, session_id).await;
+        ControlMessage::OfferReady {
+            session_id,
+            relay_mode,
+        } => {
+            send_offer_to_client(state, target_id, connection_id, relay_mode, session_id).await;
         }
         ControlMessage::IrohReady {
             session_id,
             client_endpoint_id,
+            relay_mode,
         } => {
             activate_tunnel(
                 state,
@@ -349,6 +383,7 @@ async fn handle_agent_message(
                 connection_id,
                 session_id,
                 client_endpoint_id,
+                relay_mode,
             )
             .await;
         }
@@ -383,7 +418,19 @@ pub(super) async fn open_tunnel(
     session_id: Uuid,
     target_id: Uuid,
     client_endpoint_id: String,
+    relay_mode: RelayMode,
 ) -> Result<(), ApiError> {
+    if relay_mode == RelayMode::Private
+        && state
+            .inner
+            .transport_info
+            .read()
+            .await
+            .private_relay_url
+            .is_none()
+    {
+        return Err(ApiError::conflict("private Iroh relay is not configured"));
+    }
     let client_endpoint_id = client_endpoint_id
         .parse::<iroh::EndpointId>()
         .map_err(|_| ApiError::bad_request("client EndpointId is invalid"))?
@@ -401,14 +448,7 @@ pub(super) async fn open_tunnel(
         .await
         .get(&target_id)
         .cloned()
-        .filter(|agent| agent.endpoint_addr.is_some())
         .ok_or_else(|| ApiError::not_found("target is offline"))?;
-    let target_endpoint_addr = target_agent.endpoint_addr.clone().expect("filtered above");
-    if target_endpoint_addr.id.to_string() != target_endpoint_id {
-        return Err(ApiError::conflict(
-            "target EndpointId changed while opening the SSH session",
-        ));
-    }
 
     let now = unix_time();
     let expires_at = (now + TICKET_TTL_SECS).min(user.access_expires_at);
@@ -422,6 +462,7 @@ pub(super) async fn open_tunnel(
         target_id,
         client_endpoint_id: client_endpoint_id.clone(),
         target_endpoint_id: target_endpoint_id.clone(),
+        relay_mode,
         iss: state.inner.issuer.clone(),
         aud: TUNNEL_TICKET_AUDIENCE.to_owned(),
         iat: now as u64,
@@ -467,16 +508,11 @@ pub(super) async fn open_tunnel(
         access_expires_at: user.access_expires_at,
         target_id,
         target_connection_id: target_agent.connection_id,
+        relay_mode,
         client_endpoint_id: client_endpoint_id.clone(),
         target_endpoint_id,
-        offer: ControlMessage::Offer {
-            session_id,
-            target_id,
-            ticket,
-            client_endpoint_id,
-            target_endpoint_addr,
-            ticket_public_key_pem: state.inner.keys.tunnel_ticket.public_key_pem.clone(),
-        },
+        ticket,
+        offer: Mutex::new(None),
         client_sender: client_sender.clone(),
         target_sender: target_agent.sender.clone(),
         phase: Mutex::new(TunnelPhase::Pending),
@@ -491,7 +527,10 @@ pub(super) async fn open_tunnel(
 
     if runtime
         .target_sender
-        .send(runtime.offer.clone())
+        .send(ControlMessage::Prepare {
+            session_id,
+            relay_mode,
+        })
         .await
         .is_err()
     {
@@ -506,6 +545,7 @@ pub(super) async fn send_offer_to_client(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,
+    relay_mode: RelayMode,
     session_id: Uuid,
 ) {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
@@ -514,21 +554,83 @@ pub(super) async fn send_offer_to_client(
     };
     if runtime.target_id != target_id
         || runtime.target_connection_id != connection_id
+        || runtime.relay_mode != relay_mode
         || *runtime.phase.lock().await != TunnelPhase::Pending
         || runtime.expires_at <= unix_time()
     {
         return;
     }
-    if runtime
-        .client_sender
-        .send(runtime.offer.clone())
-        .await
-        .is_err()
-    {
+    let offer = runtime.offer.lock().await.clone();
+    let Some(offer) = offer else {
+        return;
+    };
+    if runtime.client_sender.send(offer).await.is_err() {
         close_tunnel(
             state,
             &runtime,
             "client control connection closed before offer",
+        )
+        .await;
+    }
+}
+
+async fn send_target_offer(
+    state: &ServerState,
+    target_id: Uuid,
+    connection_id: Uuid,
+    relay_mode: RelayMode,
+    session_id: Uuid,
+) {
+    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+    let Some(runtime) = runtime else {
+        return;
+    };
+    if runtime.target_id != target_id
+        || runtime.target_connection_id != connection_id
+        || runtime.relay_mode != relay_mode
+        || *runtime.phase.lock().await != TunnelPhase::Pending
+        || runtime.expires_at <= unix_time()
+    {
+        return;
+    }
+    let target_endpoint_addr = {
+        let online = state.inner.online_agents.read().await;
+        let Some(agent) = online
+            .get(&target_id)
+            .filter(|agent| agent.connection_id == connection_id)
+        else {
+            return;
+        };
+        agent.endpoints.get(&relay_mode).cloned()
+    };
+    let Some(target_endpoint_addr) = target_endpoint_addr else {
+        return;
+    };
+    if target_endpoint_addr.id.to_string() != runtime.target_endpoint_id {
+        fail_tunnel(
+            state,
+            &runtime,
+            "endpoint_mismatch",
+            "target EndpointId changed",
+        )
+        .await;
+        return;
+    }
+    let offer = ControlMessage::Offer {
+        session_id,
+        target_id,
+        ticket: runtime.ticket.clone(),
+        client_endpoint_id: runtime.client_endpoint_id.clone(),
+        target_endpoint_addr,
+        ticket_public_key_pem: state.inner.keys.tunnel_ticket.public_key_pem.clone(),
+        relay_mode,
+    };
+    *runtime.offer.lock().await = Some(offer.clone());
+    if runtime.target_sender.send(offer).await.is_err() {
+        close_tunnel(
+            state,
+            &runtime,
+            "target control connection closed during prepare",
         )
         .await;
     }
@@ -569,6 +671,7 @@ async fn register_agent_endpoint(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,
+    relay_mode: RelayMode,
     endpoint_addr: EndpointAddr,
 ) -> Result<(), ApiError> {
     let endpoint_id = state
@@ -577,22 +680,13 @@ async fn register_agent_endpoint(
         .target_endpoint_id(target_id)
         .await?
         .ok_or_else(ApiError::unauthorized)?;
-    let expected_relay_url: RelayUrl =
-        reqwest::Url::parse(&state.inner.transport_info.read().await.relay_url)
-            .expect("configured relay URL is a validated HTTPS origin")
-            .into();
-    let relay_urls = endpoint_addr.relay_urls().collect::<Vec<_>>();
-    if endpoint_addr.id.to_string() != endpoint_id
-        || endpoint_addr.ip_addrs().count() > 32
-        || relay_urls.len() != 1
-        || relay_urls[0] != &expected_relay_url
-        || endpoint_addr.addrs.iter().any(|address| match address {
-            TransportAddr::Ip(_) => false,
-            TransportAddr::Relay(url) => url != &expected_relay_url,
-            TransportAddr::Custom(_) => true,
-            _ => true,
-        })
-    {
+    if endpoint_addr.id.to_string() != endpoint_id || endpoint_addr.ip_addrs().count() > 32 {
+        return Err(ApiError::unauthorized());
+    }
+    let relay_choice = relay_choice(state, relay_mode).await?;
+    crate::transport::validate_endpoint_addr(&endpoint_addr, &relay_choice)
+        .map_err(|_| ApiError::unauthorized())?;
+    if endpoint_addr.relay_urls().next().is_none() {
         return Err(ApiError::unauthorized());
     }
     let mut online = state.inner.online_agents.write().await;
@@ -600,8 +694,27 @@ async fn register_agent_endpoint(
         .get_mut(&target_id)
         .filter(|agent| agent.connection_id == connection_id)
         .ok_or_else(ApiError::unauthorized)?;
-    agent.endpoint_addr = Some(endpoint_addr);
+    agent.endpoints.insert(relay_mode, endpoint_addr);
     Ok(())
+}
+
+async fn relay_choice(
+    state: &ServerState,
+    relay_mode: RelayMode,
+) -> Result<crate::transport::RelayChoice, ApiError> {
+    let transport = state.inner.transport_info.read().await.clone();
+    match relay_mode {
+        RelayMode::Private => {
+            let relay_url = transport
+                .private_relay_url
+                .ok_or_else(|| ApiError::unauthorized())?;
+            Ok(crate::transport::RelayChoice::Private {
+                url: reqwest::Url::parse(&relay_url).map_err(|_| ApiError::unauthorized())?,
+                qad_port: transport.qad_port,
+            })
+        }
+        RelayMode::PublicDefault => Ok(crate::transport::RelayChoice::PublicDefault),
+    }
 }
 
 pub(super) async fn activate_tunnel(
@@ -610,6 +723,7 @@ pub(super) async fn activate_tunnel(
     connection_id: Uuid,
     session_id: Uuid,
     client_endpoint_id: String,
+    relay_mode: RelayMode,
 ) {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
     let Some(runtime) = runtime else {
@@ -618,6 +732,7 @@ pub(super) async fn activate_tunnel(
     if runtime.target_id != target_id
         || runtime.target_connection_id != connection_id
         || runtime.client_endpoint_id != client_endpoint_id
+        || runtime.relay_mode != relay_mode
     {
         return;
     }

@@ -213,8 +213,15 @@ pub struct AgentCredentials {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransportInfo {
-    pub relay_url: String,
+    pub private_relay_url: Option<String>,
     pub qad_port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayMode {
+    Private,
+    PublicDefault,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,6 +242,7 @@ pub struct TunnelTicketClaims {
     pub target_id: Uuid,
     pub client_endpoint_id: String,
     pub target_endpoint_id: String,
+    pub relay_mode: RelayMode,
     pub iss: String,
     pub aud: String,
     pub iat: u64,
@@ -248,6 +256,7 @@ pub enum ControlMessage {
         session_id: Uuid,
         target_id: Uuid,
         client_endpoint_id: String,
+        relay_mode: RelayMode,
     },
     Offer {
         session_id: Uuid,
@@ -256,16 +265,25 @@ pub enum ControlMessage {
         client_endpoint_id: String,
         target_endpoint_addr: iroh::EndpointAddr,
         ticket_public_key_pem: String,
+        relay_mode: RelayMode,
+    },
+    Prepare {
+        session_id: Uuid,
+        relay_mode: RelayMode,
     },
     AgentReady {
+        session_id: Option<Uuid>,
+        relay_mode: RelayMode,
         endpoint_addr: iroh::EndpointAddr,
     },
     OfferReady {
         session_id: Uuid,
+        relay_mode: RelayMode,
     },
     IrohReady {
         session_id: Uuid,
         client_endpoint_id: String,
+        relay_mode: RelayMode,
     },
     Activated {
         session_id: Uuid,
