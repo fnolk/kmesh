@@ -483,7 +483,8 @@ async def start_target_capture(client_ready, logs, deadline):
     capture_command = (
         "printf 'KMESH_BIRTHDAY_CAPTURE_PID=%s\\n' \"$$\" >&2; "
         f"exec /usr/bin/timeout -s INT -k 2s {CAPTURE_SECONDS}s "
-        f"/usr/sbin/tcpdump -i ens1f0 -nn -tttt -l {shlex.quote(capture_filter)}"
+        f"/usr/sbin/tcpdump -i ens1f0 --immediate-mode -nn -tttt -l "
+        f"{shlex.quote(capture_filter)}"
     )
     proc = await asyncio.create_subprocess_exec(
         *ssh_base(), HOST, "/bin/sh -c " + shlex.quote(capture_command),
@@ -497,6 +498,8 @@ async def start_target_capture(client_ready, logs, deadline):
         "supervisor_executable": None,
         "child_executable": None,
         "interface": "ens1f0",
+        "capture_mode": "immediate",
+        "capture_mode_option": "--immediate-mode",
         "filter": capture_filter,
         "c_public_ips": public_ips,
         "c_local_ip": client_local_ip,
@@ -635,6 +638,19 @@ async def finish_target_capture(state, logs):
         match = re.search(pattern, stderr)
         if match:
             state["statistics"][key] = int(match.group(1))
+    captured = state["statistics"].get("captured")
+    received = state["statistics"].get("received_by_filter")
+    dropped = (
+        state["statistics"].get("dropped_by_kernel", 0)
+        + state["statistics"].get("dropped_by_interface", 0)
+    )
+    state["capture_incomplete"] = (
+        None if captured is None or received is None
+        else captured != received or dropped > 0
+    )
+    state["capture_stats_note"] = (
+        "received_by_filter semantics are OS-dependent; this flag describes capture completeness only"
+    )
     state.pop("_proc", None)
     state.pop("_readers", None)
     return state
