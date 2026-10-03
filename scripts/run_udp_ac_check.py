@@ -286,6 +286,8 @@ async def run(args):
         raise ValueError("--capture-target is available for private mode only")
     if args.mapping_candidates and args.relay_mode != "private":
         raise ValueError("--mapping-candidates is available for private mode only")
+    if args.predict_target_next_port and (args.relay_mode != "private" or not args.mapping_candidates):
+        raise ValueError("--predict-target-next-port requires private --mapping-candidates mode")
 
     run_id = uuid.uuid4().hex
     pid_file = f"/tmp/kmesh-udp-ac-{run_id}.pid"
@@ -313,10 +315,19 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
         "enabled": args.mapping_candidates,
         "ready_original": {},
         "observations": {},
+        "watch_addr_published_ip_candidates": {},
         "all_successful_qad_reports": {},
         "control_to_client": None,
         "control_to_target": None,
         "local_candidates_published": {},
+        "prediction": {
+            "enabled": args.predict_target_next_port,
+            "input_source": "only this target process's successful QadProbeReport records, matched to its ready.relay_map URLs",
+            "rule": "for each live target reflector-observed SocketAddr, use the same public IP and observed UDP port plus one",
+            "history_basis": "three earlier independent endpoint runs showed a per-reflector +1 port trend; historical addresses do not populate this run's candidates",
+            "assumption": "A's peer-destination mapping may follow that +1 trend; the prediction remains unverified until a selected path uses it",
+            "target_predicted_candidates": [],
+        },
     }
     remote_pid, procs, readers = {"pid": None}, {}, []
     capture_proc, capture_readers = None, []
@@ -480,14 +491,30 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
                     "relay_map": relay_map,
                     "successful_qad_reports": observed,
                     "observed_unique_candidates": unique_candidates,
+                    "predicted_extra_candidates": [],
                 }
 
             client_self_candidates = mapping_candidates["observations"]["client"]["observed_unique_candidates"]
             target_self_candidates = mapping_candidates["observations"]["target"]["observed_unique_candidates"]
+            target_prediction = []
+            if args.predict_target_next_port:
+                for candidate in target_self_candidates:
+                    predicted_ip, observed_port = parse_socket_address(candidate, "target measured reflector candidate")
+                    if observed_port == 65535:
+                        raise ValueError("target +1 port prediction would overflow the UDP port range")
+                    predicted_address = f"{predicted_ip}:{observed_port + 1}"
+                    if predicted_address not in target_prediction:
+                        target_prediction.append(predicted_address)
+                if len(target_prediction) > 2:
+                    raise ValueError("target next-port prediction exceeded the two-reflector candidate bound")
+                mapping_candidates["observations"]["target"]["predicted_extra_candidates"] = target_prediction
+                mapping_candidates["prediction"]["target_predicted_candidates"] = target_prediction
             control_to_client = copy.deepcopy(ready["target"])
             control_to_client["receiver_self_observed_candidates"] = client_self_candidates
+            control_to_client["receiver_self_predicted_candidates"] = []
             control_to_target = copy.deepcopy(ready["client"])
             control_to_target["receiver_self_observed_candidates"] = target_self_candidates
+            control_to_target["receiver_self_predicted_candidates"] = target_prediction
             mapping_candidates["control_to_client"] = {
                 "sender_role": "target",
                 "sender_endpoint_id": ready["target"]["endpoint_id"],
@@ -618,10 +645,24 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
                     raise ValueError(f"{role} local_candidates_published bound socket mismatch")
                 if event.get("actual_home_relay_url") != ready[role].get("relay_url") or event.get("b_relay_connected") is not True:
                     raise ValueError(f"{role} local candidate publication did not retain the connected private B relay")
-                expected_candidates = observation["observed_unique_candidates"]
-                published_candidates = event.get("receiver_self_observed_candidates")
-                if not isinstance(published_candidates, list) or list(dict.fromkeys(published_candidates)) != expected_candidates:
-                    raise ValueError(f"{role} published candidates differ from this process's own QAD observations")
+                expected_observed = observation["observed_unique_candidates"]
+                expected_predicted = observation["predicted_extra_candidates"]
+                expected_published = list(dict.fromkeys(expected_observed + expected_predicted))
+                event_observed = event.get("receiver_self_observed_candidates")
+                if (not isinstance(event_observed, list) or len(event_observed) != len(expected_observed)
+                        or any(not isinstance(address, str) for address in event_observed)
+                        or set(event_observed) != set(expected_observed)):
+                    raise ValueError(f"{role} published measured candidates differ from this process's QAD observations")
+                event_predicted = event.get("receiver_self_predicted_port_candidates")
+                if (not isinstance(event_predicted, list) or len(event_predicted) != len(expected_predicted)
+                        or any(not isinstance(address, str) for address in event_predicted)
+                        or set(event_predicted) != set(expected_predicted)):
+                    raise ValueError(f"{role} published predicted candidates differ from the controller's bounded rule")
+                event_published = event.get("published_candidates")
+                if (not isinstance(event_published, list) or len(event_published) != len(expected_published)
+                        or any(not isinstance(address, str) for address in event_published)
+                        or set(event_published) != set(expected_published)):
+                    raise ValueError(f"{role} published candidate union differs from measured and predicted inputs")
                 endpoint_addr_before = event.get("endpoint_addr_before")
                 endpoint_addr_after = event.get("endpoint_addr_after")
                 if (not isinstance(endpoint_addr_before, dict) or not isinstance(endpoint_addr_after, dict)
@@ -633,9 +674,13 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
                 if (relay_after != relay_before
                         or {"Relay": event["actual_home_relay_url"]} not in relay_after):
                     raise ValueError(f"{role} local candidate publication changed EndpointAddr relay URLs")
-                if not all({"Ip": address} in endpoint_addr_after.get("addrs", []) for address in expected_candidates):
+                if not all({"Ip": address} in endpoint_addr_after.get("addrs", []) for address in expected_published):
                     raise ValueError(f"{role} watch_addr confirmation lacks one or more observed QAD candidates")
                 local_candidates_published[role] = event
+                mapping_candidates["watch_addr_published_ip_candidates"][role] = [
+                    addr["Ip"] for addr in endpoint_addr_after.get("addrs", [])
+                    if isinstance(addr, dict) and isinstance(addr.get("Ip"), str)
+                ]
             mapping_candidates["local_candidates_published"] = local_candidates_published
 
         while len(direct) < 2:
@@ -751,6 +796,68 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
         role: next((event for event in events[role] if event.get("event") == "complete"), None)
         for role in ("client", "target")
     }
+    prediction_result = None
+    if args.predict_target_next_port:
+        target_observation = mapping_candidates["observations"].get("target", {})
+        predicted_candidates = target_observation.get("predicted_extra_candidates", [])
+        measured_candidates = target_observation.get("observed_unique_candidates", [])
+        client_nonce = nonce_events["client"] or {}
+        selected_sample = client_nonce.get("selected_direct_before")
+        if not isinstance(selected_sample, dict):
+            selected_sample = (direct.get("client") or {}).get("selected_path")
+        selected_remote = selected_sample.get("remote_addr") if isinstance(selected_sample, dict) else None
+        selected_ipv4 = bool(
+            isinstance(selected_sample, dict)
+            and selected_sample.get("selected") is True
+            and selected_sample.get("is_ip") is True
+            and selected_sample.get("is_ipv4") is True
+        )
+        selected_socket_addr = None
+        if selected_ipv4:
+            selected_ip, selected_port = parse_socket_address(selected_remote[3:], "selected IPv4 path remote_addr")
+            selected_socket_addr = f"{selected_ip}:{selected_port}"
+        path_id = selected_sample.get("path_id") if isinstance(selected_sample, dict) else None
+        selected_delta = next((
+            delta for delta in client_nonce.get("direct_path_udp_deltas", [])
+            if delta.get("path_id") == path_id
+        ), None)
+        same_path_bytes = bool(
+            selected_delta
+            and selected_delta.get("tx_bytes_delta", 0) > 0
+            and selected_delta.get("rx_bytes_delta", 0) > 0
+            and client_nonce.get("direct_bytes_grew_both_directions") is True
+        )
+        nonce_pass = (
+            all(event is not None and event.get("nonce_echoes_match") is True and event.get("pass") is True
+                for event in nonce_events.values())
+            and all(event is not None and event.get("pass") is True for event in complete.values())
+        )
+        predicted_hit = selected_ipv4 and selected_socket_addr in predicted_candidates
+        measured_hit = selected_ipv4 and selected_socket_addr in measured_candidates
+        prediction_confirmed = predicted_hit and same_path_bytes and nonce_pass
+        if prediction_confirmed:
+            outcome = "predicted_candidate_direct_data_confirmed"
+        elif same_path_bytes and nonce_pass and measured_hit:
+            outcome = "measured_reflector_candidate_direct_data_confirmed"
+        elif same_path_bytes and nonce_pass:
+            outcome = "other_candidate_direct_data_confirmed"
+        elif selected_ipv4:
+            outcome = "direct_path_selected_without_complete_payload_proof"
+        else:
+            outcome = "no_direct_result"
+        prediction_result = {
+            "outcome": outcome,
+            "predicted_candidates": predicted_candidates,
+            "measured_reflector_candidates": measured_candidates,
+            "selected_remote_addr": selected_remote,
+            "selected_socket_addr": selected_socket_addr,
+            "selected_ipv4_path": selected_ipv4,
+            "selected_remote_is_predicted": bool(predicted_hit),
+            "selected_remote_is_reflector_measured": bool(measured_hit),
+            "same_path_tx_and_rx_bytes_grew": same_path_bytes,
+            "nonce_pass_both_roles": bool(nonce_pass),
+            "prediction_confirmed": bool(prediction_confirmed),
+        }
     success = (
         failure is None
         and set(procs) == {"client", "target"}
@@ -781,6 +888,7 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
         "target_executable": args.target_bin,
         "ready": ready,
         "direct_selected": direct,
+        "prediction_result": prediction_result,
         "nonce_result": nonce_events,
         "complete": complete,
         "exit_codes": {role: proc.returncode for role, proc in procs.items()},
@@ -808,6 +916,7 @@ def main():
     parser.add_argument("--out-dir", required=True, help="new private evidence directory")
     parser.add_argument("--capture-target", action="store_true", help="capture the target UDP endpoint on target-1 ens1f0")
     parser.add_argument("--mapping-candidates", action="store_true", help="exchange each endpoint's two live QAD-observed IP:port candidates")
+    parser.add_argument("--predict-target-next-port", action="store_true", help="add at most two target candidates predicted from this run's QAD ports")
     return asyncio.run(run(parser.parse_args()))
 
 
