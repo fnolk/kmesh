@@ -2194,6 +2194,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "jsonwebtoken",
+ "noq",
  "rand 0.10.3",
  "rcgen",
  "reqwest",
