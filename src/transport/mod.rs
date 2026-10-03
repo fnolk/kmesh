@@ -131,7 +131,7 @@ pub fn is_network_failure_source(error: &(dyn StdError + 'static)) -> bool {
             match error {
                 iroh_relay::client::DialError::Dns { .. }
                 | iroh_relay::client::DialError::Timeout { .. } => return true,
-                iroh_relay::client::DialError::Io { source }
+                iroh_relay::client::DialError::Io { source, .. }
                     if is_network_io_error(source.kind()) =>
                 {
                     return true;
