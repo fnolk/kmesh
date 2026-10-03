@@ -339,19 +339,22 @@ async def send_json(proc, value):
     await proc.stdin.drain()
 
 
-async def next_event(queue, deadline):
-    remaining = deadline - asyncio.get_running_loop().time()
-    if remaining <= 0:
-        raise TimeoutError("75-second runner deadline elapsed")
-    try:
-        role, event = await asyncio.wait_for(queue.get(), remaining)
-    except asyncio.TimeoutError as error:
-        raise TimeoutError("75-second runner deadline elapsed") from error
-    if event is None:
-        raise RuntimeError(f"{role} helper stdout closed before the protocol completed")
-    if event.get("event") == "failure":
-        raise RuntimeError(f"{role} helper failed: {event.get('error', event)}")
-    return role, event
+async def next_event(queue, deadline, finished_roles):
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("75-second runner deadline elapsed")
+        try:
+            role, event = await asyncio.wait_for(queue.get(), remaining)
+        except asyncio.TimeoutError as error:
+            raise TimeoutError("75-second runner deadline elapsed") from error
+        if event is None:
+            if role in finished_roles:
+                continue
+            raise RuntimeError(f"{role} helper stdout closed before a validated complete event")
+        if event.get("event") == "failure":
+            raise RuntimeError(f"{role} helper failed: {event.get('error', event)}")
+        return role, event
 
 
 async def cleanup_remote_helper(pid_file, target_bin, reported_pid, stdout_path, stderr_path):
@@ -686,6 +689,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
     capture_state = None
     ready, raw_ready, raw_selected = {}, {}, {}
     native_ready, direct_selected, nonce_results, complete = {}, {}, {}, {}
+    finished_roles = set()
     handoff_messages, connect_messages = {}, {}
     failure, last_phase, gate_data_open = None, "startup", False
     target_metadata = client_metadata = None
@@ -727,7 +731,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
 
         last_phase = "ready"
         while len(ready) < 2:
-            role, event = await next_event(queue, deadline)
+            role, event = await next_event(queue, deadline, finished_roles)
             if event["event"] != "ready":
                 continue
             if role in ready or event.get("role") != role:
@@ -761,7 +765,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
 
         last_phase = "raw_ready"
         while len(raw_ready) < 2:
-            role, event = await next_event(queue, deadline)
+            role, event = await next_event(queue, deadline, finished_roles)
             if event["event"] != "raw_ready":
                 continue
             sockets = event.get("sockets")
@@ -801,7 +805,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
 
         last_phase = "raw_selected"
         while len(raw_selected) < 2:
-            role, event = await next_event(queue, deadline)
+            role, event = await next_event(queue, deadline, finished_roles)
             if event["event"] != "raw_selected":
                 continue
             if event.get("role") != role or role in raw_selected:
@@ -821,7 +825,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
 
         last_phase = "native_ready"
         while len(native_ready) < 2:
-            role, event = await next_event(queue, deadline)
+            role, event = await next_event(queue, deadline, finished_roles)
             if event["event"] != "native_ready":
                 continue
             if event.get("role") != role or role in native_ready:
@@ -857,7 +861,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
 
         last_phase = "direct_selected"
         while len(direct_selected) < 2:
-            role, event = await next_event(queue, deadline)
+            role, event = await next_event(queue, deadline, finished_roles)
             if event["event"] != "direct_selected":
                 continue
             if event.get("role") != role or role in direct_selected:
@@ -873,7 +877,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
 
         last_phase = "nonce_and_fin"
         while len(nonce_results) < 2 or len(complete) < 2:
-            role, event = await next_event(queue, deadline)
+            role, event = await next_event(queue, deadline, finished_roles)
             if event["event"] == "nonce_result":
                 if event.get("role") != role or role in nonce_results:
                     raise ValueError(f"{role} nonce_result event has an invalid role or is repeated")
@@ -881,7 +885,19 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
             elif event["event"] == "complete":
                 if event.get("role") != role or role in complete:
                     raise ValueError(f"{role} complete event has an invalid role or is repeated")
+                if role not in nonce_results:
+                    raise ValueError(f"{role} complete arrived before its nonce_result")
+                if (event.get("endpoint_id") != native_ready[role]["endpoint_id"]
+                        or event.get("same_tuple_reused") is not True
+                        or event.get("nonce_echoes_match") is not True
+                        or event.get("peer_nonces_echoed") is not True
+                        or event.get("fin_complete") is not True
+                        or event.get("peer_eof") is not True
+                        or event.get("send_stopped_ok") is not True
+                        or event.get("pass") is not True):
+                    raise ValueError(f"{role} complete event failed the same-tuple nonce/FIN contract")
                 complete[role] = event
+                finished_roles.add(role)
 
         nonce_validation = validate_nonce_protocol(
             nonce_results, direct_selected, native_ready, complete
