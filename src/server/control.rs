@@ -19,18 +19,24 @@ mod punch;
 mod runtime;
 mod tunnel;
 
-pub(super) use http::{agent_control, client_control, enroll, transport_info};
-pub(super) use punch::{
+pub(in crate::server) use http::{
+    agent_control, authenticate_agent, client_control, enroll, transport_info,
+};
+use punch::{
     PunchSelection, PunchSide, fail_punch_to_native, register_agent_discovery,
     register_client_discovery, register_punch_ready, register_punch_selection, send_native_plans,
 };
 pub(crate) use runtime::{TunnelPhase, TunnelRuntime};
-pub(super) use runtime::{
-    allow_agent_data_endpoint, close_from_client, close_from_target, close_pending_client_tunnels,
-    close_tunnel, fail_from_client, fail_from_target, fail_pending_from_target, unregister_agent,
+pub(in crate::server) use runtime::{
+    allow_agent_data_endpoint, close_pending_client_tunnels, unregister_agent,
 };
-pub(super) use tunnel::{
-    maybe_activate_tunnel, maybe_send_dial_offer, open_tunnel, register_agent_data_endpoint,
+use runtime::{
+    close_from_client, close_from_target, close_tunnel, fail_from_client, fail_from_target,
+    fail_pending_from_target,
+};
+pub(in crate::server) use tunnel::open_tunnel;
+use tunnel::{
+    maybe_activate_tunnel, maybe_send_dial_offer, register_agent_data_endpoint,
     register_agent_identity, register_agent_iroh_ready, register_client_endpoint,
     register_path_ready, send_client_offer,
 };

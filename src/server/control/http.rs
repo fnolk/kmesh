@@ -15,13 +15,13 @@ use super::super::{
 use super::MAX_CONTROL_MESSAGE;
 use crate::protocol::{AgentEnrollmentRequest, AgentEnrollmentResponse};
 
-pub(super) async fn transport_info(
+pub(in crate::server) async fn transport_info(
     State(state): State<ServerState>,
 ) -> axum::Json<crate::protocol::TransportInfo> {
     axum::Json(state.inner.transport_info.read().await.clone())
 }
 
-pub(super) async fn enroll(
+pub(in crate::server) async fn enroll(
     State(state): State<ServerState>,
     axum::Json(request): axum::Json<AgentEnrollmentRequest>,
 ) -> Result<axum::Json<AgentEnrollmentResponse>, ApiError> {
@@ -79,7 +79,7 @@ pub(super) async fn enroll(
     }))
 }
 
-pub(super) async fn client_control(
+pub(in crate::server) async fn client_control(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -91,7 +91,7 @@ pub(super) async fn client_control(
         .on_upgrade(move |socket| super::run_client_control(state, user, socket)))
 }
 
-pub(super) async fn agent_control(
+pub(in crate::server) async fn agent_control(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -103,7 +103,10 @@ pub(super) async fn agent_control(
         .on_upgrade(move |socket| super::run_agent_control(state, target_id, socket)))
 }
 
-async fn authenticate_agent(state: &ServerState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+pub(in crate::server) async fn authenticate_agent(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<Uuid, ApiError> {
     let hash = super::super::hash_secret(bearer_token(headers)?);
     let row = sqlx::query(
         "SELECT id FROM targets WHERE agent_token_hash = ?1 AND enabled = 1 AND deleted_at IS NULL",

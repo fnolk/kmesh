@@ -21,7 +21,7 @@ use super::{
 
 const TICKET_TTL_SECS: i64 = 60;
 
-pub(super) async fn open_tunnel(
+pub(in crate::server) async fn open_tunnel(
     state: &ServerState,
     user: AuthenticatedUser,
     client_sender: &mpsc::Sender<ControlMessage>,

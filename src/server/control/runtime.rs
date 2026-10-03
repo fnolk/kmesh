@@ -103,7 +103,7 @@ pub(super) async fn fail_from_client(
     }
 }
 
-pub(super) async fn allow_agent_data_endpoint(
+pub(in crate::server) async fn allow_agent_data_endpoint(
     state: &ServerState,
     endpoint_id: &str,
 ) -> Result<bool, ApiError> {
@@ -346,7 +346,7 @@ pub(super) async fn fail_pending_from_target(
     }
 }
 
-pub(super) async fn close_pending_client_tunnels(
+pub(in crate::server) async fn close_pending_client_tunnels(
     state: &ServerState,
     client_sender: &mpsc::Sender<ControlMessage>,
 ) {
@@ -381,7 +381,11 @@ async fn close_pending_target_tunnels(state: &ServerState, target_id: Uuid, conn
     }
 }
 
-pub(super) async fn unregister_agent(state: &ServerState, target_id: Uuid, connection_id: Uuid) {
+pub(in crate::server) async fn unregister_agent(
+    state: &ServerState,
+    target_id: Uuid,
+    connection_id: Uuid,
+) {
     let mut online = state.inner.online_agents.write().await;
     if online
         .get(&target_id)
