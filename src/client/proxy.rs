@@ -133,10 +133,10 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
         let mut ticker = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
+                _ = ticker.tick(), if tracing::enabled!(tracing::Level::TRACE) => {
                     for current in snapshot_iroh_paths(&path_connection) {
                         if let Some(before) = previous.get(&current.remote_address) {
-                            eprintln!(
+                            tracing::trace!(
                                 "QUIC path UDP interval ({}) kind={:?} selected={} TX delta={} RX delta={}",
                                 current.remote_address,
                                 current.kind,
@@ -145,7 +145,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                                 current.udp_rx_bytes.saturating_sub(before.udp_rx_bytes),
                             );
                         } else {
-                            eprintln!(
+                            tracing::trace!(
                                 "QUIC path UDP baseline ({}) kind={:?} selected={} TX={} RX={}",
                                 current.remote_address,
                                 current.kind,
@@ -171,7 +171,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                                     udp_tx_bytes: stats.udp_tx.bytes,
                                     udp_rx_bytes: stats.udp_rx.bytes,
                                 });
-                                eprintln!("QUIC path opened ({remote_addr}) UDP baseline TX={} RX={}", stats.udp_tx.bytes, stats.udp_rx.bytes);
+                                tracing::trace!(remote_address = %remote_addr, udp_tx_bytes = stats.udp_tx.bytes, udp_rx_bytes = stats.udp_rx.bytes, "QUIC path opened");
                             }
                         }
                         PathEvent::Selected { id, remote_addr, .. } => {
@@ -186,14 +186,12 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                                     udp_tx_bytes: stats.udp_tx.bytes,
                                     udp_rx_bytes: stats.udp_rx.bytes,
                                 });
-                                eprintln!("连接路径切换：{label} ({remote_addr}) UDP baseline TX={} RX={}", stats.udp_tx.bytes, stats.udp_rx.bytes);
-                            } else {
-                                eprintln!("连接路径切换：{label} ({remote_addr})");
                             }
+                            eprintln!("连接路径切换：{label} ({remote_addr})");
                         }
                         PathEvent::Closed { remote_addr, last_stats, .. } => {
                             if let Some(before) = previous.remove(&remote_addr.to_string()) {
-                                eprintln!(
+                                tracing::trace!(
                                     "QUIC path closed ({remote_addr}) UDP final TX={} RX={} delta TX={} RX={}",
                                     last_stats.udp_tx.bytes,
                                     last_stats.udp_rx.bytes,
@@ -201,7 +199,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                                     last_stats.udp_rx.bytes.saturating_sub(before.udp_rx_bytes),
                                 );
                             } else {
-                                eprintln!("QUIC path closed ({remote_addr}) UDP final TX={} RX={}", last_stats.udp_tx.bytes, last_stats.udp_rx.bytes);
+                                tracing::trace!(remote_address = %remote_addr, udp_tx_bytes = last_stats.udp_tx.bytes, udp_rx_bytes = last_stats.udp_rx.bytes, "QUIC path closed");
                             }
                         }
                         _ => {}
@@ -213,49 +211,21 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let copy_result = copy_stdio(&mut stream).await;
     path_task.abort();
     let _ = path_task.await;
-    let (ssh_upload_bytes, ssh_download_bytes, paths_before, paths_after, final_path) =
-        match copy_result {
-            Ok(stats) => stats,
-            Err(error) => {
-                let _ = stream.reset();
-                let _ = Api::send_control(
-                    &mut control,
-                    &ControlMessage::Close {
-                        session_id,
-                        reason: "client_ssh_stream_failed".to_owned(),
-                    },
-                )
-                .await;
-                return Err(error).context("copy local SSH stdio over Iroh");
-            }
-        };
-    eprintln!(
-        "SSH QUIC path snapshots before={paths_before:?} after={paths_after:?}; SSH stdio local_to_target={ssh_upload_bytes} target_to_local={ssh_download_bytes}"
-    );
-    for after in &paths_after {
-        if let Some(before) = paths_before.iter().find(|before| {
-            before.kind == after.kind && before.remote_address == after.remote_address
-        }) {
-            eprintln!(
-                "QUIC path UDP delta ({}) kind={:?} selected_before={} selected_after={} TX={} RX={}",
-                after.remote_address,
-                after.kind,
-                before.selected,
-                after.selected,
-                after.udp_tx_bytes.saturating_sub(before.udp_tx_bytes),
-                after.udp_rx_bytes.saturating_sub(before.udp_rx_bytes),
-            );
-        } else {
-            eprintln!(
-                "QUIC path UDP snapshot ({}) kind={:?} selected_after={} baseline_missing=true TX={} RX={}",
-                after.remote_address,
-                after.kind,
-                after.selected,
-                after.udp_tx_bytes,
-                after.udp_rx_bytes,
-            );
+    let (ssh_upload_bytes, ssh_download_bytes, final_path) = match copy_result {
+        Ok(stats) => stats,
+        Err(error) => {
+            let _ = stream.reset();
+            let _ = Api::send_control(
+                &mut control,
+                &ControlMessage::Close {
+                    session_id,
+                    reason: "client_ssh_stream_failed".to_owned(),
+                },
+            )
+            .await;
+            return Err(error).context("copy local SSH stdio over Iroh");
         }
-    }
+    };
     if let Some(path) = final_path {
         let label = match path.kind {
             IrohPathKind::Direct => "P2P 直连",
@@ -812,15 +782,7 @@ async fn wait_activated(
     }
 }
 
-async fn copy_stdio(
-    stream: &mut IrohByteStream,
-) -> Result<(
-    u64,
-    u64,
-    Vec<crate::transport::IrohPathStats>,
-    Vec<crate::transport::IrohPathStats>,
-    Option<IrohSelectedPath>,
-)> {
+async fn copy_stdio(stream: &mut IrohByteStream) -> Result<(u64, u64, Option<IrohSelectedPath>)> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let paths_before = stream.path_stats();
@@ -842,6 +804,38 @@ async fn copy_stdio(
     };
     let paths_after = stream.path_stats();
     let selected_path = stream.selected_path();
+    tracing::debug!(
+        paths_before = ?paths_before,
+        paths_after = ?paths_after,
+        ssh_upload_bytes = transferred.0,
+        ssh_download_bytes = transferred.1,
+        selected_path = ?selected_path,
+        "SSH QUIC path snapshots"
+    );
+    for after in &paths_after {
+        if let Some(before) = paths_before.iter().find(|before| {
+            before.kind == after.kind && before.remote_address == after.remote_address
+        }) {
+            tracing::debug!(
+                "QUIC path UDP delta ({}) kind={:?} selected_before={} selected_after={} TX={} RX={}",
+                after.remote_address,
+                after.kind,
+                before.selected,
+                after.selected,
+                after.udp_tx_bytes.saturating_sub(before.udp_tx_bytes),
+                after.udp_rx_bytes.saturating_sub(before.udp_rx_bytes),
+            );
+        } else {
+            tracing::debug!(
+                "QUIC path UDP snapshot ({}) kind={:?} selected_after={} baseline_missing=true TX={} RX={}",
+                after.remote_address,
+                after.kind,
+                after.selected,
+                after.udp_tx_bytes,
+                after.udp_rx_bytes,
+            );
+        }
+    }
     stream
         .finish_send_and_wait()
         .await
@@ -849,13 +843,7 @@ async fn copy_stdio(
     stream
         .connection()
         .close(iroh::endpoint::VarInt::from_u32(0), b"ssh session complete");
-    Ok((
-        transferred.0,
-        transferred.1,
-        paths_before,
-        paths_after,
-        selected_path,
-    ))
+    Ok((transferred.0, transferred.1, selected_path))
 }
 
 #[cfg(test)]

@@ -1612,11 +1612,63 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     if not marker_observed:
         raise VerificationError("path probe command did not return its completion marker")
     diagnostics = endpoint_diagnostics(result.stderr)
+    ssh_transfer_bytes = None
+    direct_selected_path_deltas = []
+    stderr_lines = result.stderr.decode("utf-8", "replace").splitlines()
+    for line in stderr_lines:
+        if "SSH QUIC path snapshots" in line:
+            transfer_match = re.search(
+                r"ssh_upload_bytes=(\d+)\s+ssh_download_bytes=(\d+)", line
+            )
+            if transfer_match:
+                ssh_transfer_bytes = {
+                    "local_to_target": int(transfer_match.group(1)),
+                    "target_to_local": int(transfer_match.group(2)),
+                }
+        delta_match = re.search(
+            r"QUIC path UDP delta \((?P<address>[^)]+)\) kind=Direct "
+            r"selected_before=(?P<before>true|false) selected_after=(?P<after>true|false) "
+            r"TX=(?P<tx>\d+) RX=(?P<rx>\d+)",
+            line,
+        )
+        if delta_match:
+            remote_address = delta_match.group("address")
+            direct_selected = any(
+                item["kind"] == "direct"
+                and item["remote_address"] == remote_address
+                for item in path_events
+            ) and (delta_match.group("before") == "true" or delta_match.group("after") == "true")
+            if direct_selected:
+                direct_selected_path_deltas.append(
+                    {
+                        "remote_address": remote_address,
+                        "udp_tx_bytes": int(delta_match.group("tx")),
+                        "udp_rx_bytes": int(delta_match.group("rx")),
+                    }
+                )
+    ssh_status = "passed" if result.returncode == 0 and stdout_lines else "failed"
+    p2p_status = (
+        "passed"
+        if ssh_status == "passed"
+        and ssh_transfer_bytes is not None
+        and sum(ssh_transfer_bytes.values()) > 0
+        and any(
+            item["udp_tx_bytes"] > 0 and item["udp_rx_bytes"] > 0
+            for item in direct_selected_path_deltas
+        )
+        else "failed"
+    )
     harness.report[f"path_probe_{mode_suffix}"] = {
-        "status": "passed",
+        "status": p2p_status,
+        "ssh_status": ssh_status,
+        "p2p_status": p2p_status,
         "duration_seconds": seconds,
         "hostname": stdout_lines[0] if stdout_lines else "",
         "marker_observed": marker_observed,
+        "ssh_command_exit_code": result.returncode,
+        "ssh_transfer_bytes": ssh_transfer_bytes,
+        "direct_selected_path_ssh_udp_deltas": direct_selected_path_deltas,
+        "direct_selected_path_udp_delta_observed": bool(direct_selected_path_deltas),
         "path_events_in_stderr_order": path_events,
         "initial_path": path_events[0] if path_events else None,
         "selected_path": path_events[-1] if path_events else None,
@@ -1698,20 +1750,31 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    harness.report["status"] = "prepared" if args.command == "stage" else "passed"
+    phase_status = "prepared" if args.command == "stage" else "passed"
+    if args.command == "path-probe":
+        state = harness.load_state()
+        mode_suffix = "private" if state["server_mode"] == "private" else "public-default"
+        probe = harness.report[f"path_probe_{mode_suffix}"]
+        harness.report["ssh_status"] = probe["ssh_status"]
+        harness.report["p2p_status"] = probe["p2p_status"]
+        phase_status = probe["p2p_status"]
+    harness.report["last_phase_status"] = phase_status
+    harness.report["status"] = harness.report.get("p2p_status", phase_status)
     harness.write_report()
+    result_fields = {"status": phase_status, "report_status": harness.report["status"]}
+    if harness.report.get("p2p_status"):
+        result_fields["ssh_status"] = harness.report["ssh_status"]
+        result_fields["p2p_status"] = harness.report["p2p_status"]
+    result_fields.update(
+        {"phase": args.command, "report": str(harness.report_path), "events": len(harness.events)}
+    )
     print(
         json.dumps(
-            {
-                "status": harness.report["status"],
-                "phase": args.command,
-                "report": str(harness.report_path),
-                "events": len(harness.events),
-            },
+            result_fields,
             ensure_ascii=False,
         )
     )
-    return 0
+    return 1 if args.command == "path-probe" and phase_status == "failed" else 0
 
 
 if __name__ == "__main__":

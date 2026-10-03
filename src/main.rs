@@ -10,7 +10,18 @@ async fn main() {
         .with_writer(std::io::stderr)
         .with_filter(filter_fn(|metadata| {
             if metadata.target() == "noq_proto::connection::paths" {
-                return true;
+                let fields = metadata.fields();
+                let static_path_message =
+                    fields.field("message").is_some() && fields.iter().count() == 1;
+                let amplification_budget = fields.field("network_path").is_some()
+                    && fields.field("anti_amplification_budget").is_some()
+                    && fields.field("message").is_some()
+                    && fields.iter().count() == 3;
+                let path_status = fields.field("status").is_some()
+                    && fields.field("seq").is_some()
+                    && fields.field("message").is_some()
+                    && fields.iter().count() == 3;
+                return static_path_message || amplification_budget || path_status;
             }
             if metadata.target() != "noq_proto::connection" {
                 return !metadata.target().starts_with("noq_proto::connection::");
@@ -30,12 +41,9 @@ async fn main() {
                 && fields.field("max_local_addresses").is_some()
                 && fields.field("message").is_some()
                 && fields.iter().count() == 3;
-            let metadata_only_event =
-                fields.field("message").is_some() && fields.iter().count() == 1;
-            off_path_nat_probe
-                || off_path_response
-                || nat_traversal_negotiated
-                || metadata_only_event
+            // The root connection target also has a message-only `got frame {f}` fallback;
+            // suppress that unbounded formatted frame event and keep only explicit safe schemas.
+            off_path_nat_probe || off_path_response || nat_traversal_negotiated
         }));
     tracing_subscriber::registry()
         .with(env_filter)
