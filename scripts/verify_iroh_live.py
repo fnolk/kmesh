@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import select
 import shlex
 import ssl
 import socket
@@ -1584,11 +1585,9 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     alias = match.group(1)
     env = {
         "PATH": str(harness.args.client_binary.parent) + os.pathsep + os.environ.get("PATH", ""),
-        "RUST_LOG": "iroh::net_report=debug,iroh::_events::qnt::init=debug,iroh::socket::remote_map::remote_state=trace,noq_proto::connection=trace,noq_proto::connection::paths=trace,kmesh::client::proxy=debug",
+        "RUST_LOG": "iroh::net_report=debug,iroh::_events::qnt::init=debug,iroh::socket::remote_map::remote_state=trace,noq_proto::connection=trace,noq_proto::connection::paths=trace,kmesh::client::proxy=trace",
     }
-    result = harness.local(
-        "path-probe",
-        f"ssh-path-probe-{mode_suffix}",
+    process = subprocess.Popen(
         [
             "ssh",
             "-F",
@@ -1598,24 +1597,112 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
             "-o",
             "ControlPath=none",
             alias,
-            f"hostname; sleep {seconds}; echo kmesh-path-probe-complete",
+            "sh -s",
         ],
-        env=env,
-        timeout=seconds + 25,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, **env},
+        bufsize=0,
+    )
+    stdout_chunks = []
+    stderr_chunks = []
+    stderr_events = []
+    pending_stderr = bytearray()
+    selected_kind = None
+    process_started_at = time.monotonic()
+    direct_wait_deadline = time.monotonic() + seconds
+    command_sent_at = None
+    script_sent_after_direct = False
+    process_deadline = None
+    process_timed_out = False
+    open_streams = {process.stdout, process.stderr}
+    script = b"hostname\nprintf '%s\\n' kmesh-path-probe-complete\nsleep 1\nexit 23\n"
+    while open_streams or process.poll() is None:
+        now = time.monotonic()
+        if command_sent_at is None and process.poll() is None and (
+            selected_kind == "direct" or now >= direct_wait_deadline
+        ):
+            script_sent_after_direct = selected_kind == "direct"
+            command_sent_at = now
+            process_deadline = now + 25
+            try:
+                process.stdin.write(script)
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+        if command_sent_at is not None and process.poll() is None and now >= process_deadline:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            process_timed_out = True
+        readable, _, _ = select.select(list(open_streams), [], [], 0.1) if open_streams else ([], [], [])
+        for stream in readable:
+            chunk = os.read(stream.fileno(), 4096)
+            if not chunk:
+                open_streams.remove(stream)
+                if stream is process.stderr and pending_stderr:
+                    line = bytes(pending_stderr)
+                    stderr_events.append((time.monotonic(), line))
+                    for event in selected_paths(line):
+                        selected_kind = event["kind"]
+                    pending_stderr.clear()
+                continue
+            if stream is process.stdout:
+                stdout_chunks.append(chunk)
+                continue
+            stderr_chunks.append(chunk)
+            pending_stderr.extend(chunk)
+            while b"\n" in pending_stderr:
+                line, _, remaining = pending_stderr.partition(b"\n")
+                line += b"\n"
+                pending_stderr[:] = remaining
+                stderr_events.append((time.monotonic(), line))
+                for event in selected_paths(line):
+                    selected_kind = event["kind"]
+    if process.stdin and not process.stdin.closed:
+        try:
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+    returncode = process.wait()
+    stdout = b"".join(stdout_chunks)
+    stderr = b"".join(stderr_chunks)
+    stdout_lines = stdout.decode("utf-8", "replace").splitlines()
+    marker_observed = "kmesh-path-probe-complete" in stdout_lines
+    hostname = next((line for line in stdout_lines if line and line != "kmesh-path-probe-complete"), "")
+    ssh_status = "passed" if returncode == 23 and hostname and marker_observed else "failed"
+    harness.record(
+        "path-probe",
+        f"ssh-path-probe-{mode_suffix}",
+        status=ssh_status,
+        exit_code=returncode,
+        stdout_bytes=len(stdout),
+        stderr=stderr,
+        details={
+            "direct_selected_before_script": script_sent_after_direct,
+            "direct_wait_timeout_seconds": seconds,
+            "direct_wait_elapsed_seconds": round(
+                (command_sent_at or time.monotonic()) - process_started_at, 3
+            ),
+            "process_timed_out": process_timed_out,
+        },
     )
     stderr_path = harness.run_dir / f"path-probe-{mode_suffix}.stderr"
-    stderr_path.write_bytes(result.stderr)
+    stderr_path.write_bytes(stderr)
     os.chmod(stderr_path, 0o600)
-    path_events = selected_paths(result.stderr)
-    stdout_lines = result.stdout.decode("utf-8", "replace").splitlines()
-    marker_observed = "kmesh-path-probe-complete" in stdout_lines
-    if not marker_observed:
-        raise VerificationError("path probe command did not return its completion marker")
-    diagnostics = endpoint_diagnostics(result.stderr)
+    path_events = selected_paths(stderr)
+    diagnostics = endpoint_diagnostics(stderr)
     ssh_transfer_bytes = None
-    direct_selected_path_deltas = []
-    stderr_lines = result.stderr.decode("utf-8", "replace").splitlines()
-    for line in stderr_lines:
+    in_flight_deltas = {}
+    for event_time, raw_line in stderr_events:
+        line = raw_line.decode("utf-8", "replace")
         if "SSH QUIC path snapshots" in line:
             transfer_match = re.search(
                 r"ssh_upload_bytes=(\d+)\s+ssh_download_bytes=(\d+)", line
@@ -1625,33 +1712,24 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
                     "local_to_target": int(transfer_match.group(1)),
                     "target_to_local": int(transfer_match.group(2)),
                 }
-        delta_match = re.search(
-            r"QUIC path UDP delta \((?P<address>[^)]+)\) kind=Direct "
-            r"selected_before=(?P<before>true|false) selected_after=(?P<after>true|false) "
-            r"TX=(?P<tx>\d+) RX=(?P<rx>\d+)",
+        if command_sent_at is None or event_time < command_sent_at:
+            continue
+        interval_match = re.search(
+            r"QUIC path UDP interval \((?P<address>[^)]+)\) kind=Direct "
+            r"selected=true TX delta=(?P<tx>\d+) RX delta=(?P<rx>\d+)",
             line,
         )
-        if delta_match:
-            remote_address = delta_match.group("address")
-            direct_selected = any(
-                item["kind"] == "direct"
-                and item["remote_address"] == remote_address
-                for item in path_events
-            ) and (delta_match.group("before") == "true" or delta_match.group("after") == "true")
-            if direct_selected:
-                direct_selected_path_deltas.append(
-                    {
-                        "remote_address": remote_address,
-                        "udp_tx_bytes": int(delta_match.group("tx")),
-                        "udp_rx_bytes": int(delta_match.group("rx")),
-                    }
-                )
-    ssh_status = "passed" if result.returncode == 0 and stdout_lines else "failed"
+        if interval_match:
+            remote_address = interval_match.group("address")
+            delta = in_flight_deltas.setdefault(remote_address, {"udp_tx_bytes": 0, "udp_rx_bytes": 0})
+            delta["udp_tx_bytes"] += int(interval_match.group("tx"))
+            delta["udp_rx_bytes"] += int(interval_match.group("rx"))
+    direct_selected_path_deltas = [{"remote_address": address, **delta} for address, delta in in_flight_deltas.items()]
+    path_delta_source = "in_flight_interval" if in_flight_deltas else None
+    final_path_is_direct = bool(path_events and path_events[-1]["kind"] == "direct")
     p2p_status = (
         "passed"
-        if ssh_status == "passed"
-        and ssh_transfer_bytes is not None
-        and sum(ssh_transfer_bytes.values()) > 0
+        if ssh_status == "passed" and script_sent_after_direct and final_path_is_direct
         and any(
             item["udp_tx_bytes"] > 0 and item["udp_rx_bytes"] > 0
             for item in direct_selected_path_deltas
@@ -1662,11 +1740,19 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
         "status": p2p_status,
         "ssh_status": ssh_status,
         "p2p_status": p2p_status,
-        "duration_seconds": seconds,
-        "hostname": stdout_lines[0] if stdout_lines else "",
+        "duration_seconds": round(time.monotonic() - process_started_at, 3),
+        "direct_wait_timeout_seconds": seconds,
+        "direct_wait_elapsed_seconds": round(
+            (command_sent_at or time.monotonic()) - process_started_at, 3
+        ),
+        "hostname": hostname,
         "marker_observed": marker_observed,
-        "ssh_command_exit_code": result.returncode,
+        "ssh_command_exit_code": returncode,
+        "direct_selected_before_script": script_sent_after_direct,
+        "process_timed_out": process_timed_out,
         "ssh_transfer_bytes": ssh_transfer_bytes,
+        "ssh_transfer_summary_observed": ssh_transfer_bytes is not None,
+        "direct_path_delta_source": path_delta_source if direct_selected_path_deltas else None,
         "direct_selected_path_ssh_udp_deltas": direct_selected_path_deltas,
         "direct_selected_path_udp_delta_observed": bool(direct_selected_path_deltas),
         "path_events_in_stderr_order": path_events,
@@ -1674,8 +1760,8 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
         "selected_path": path_events[-1] if path_events else None,
         "observed_direct_path": any(item["kind"] == "direct" for item in path_events),
         "stderr_file": str(stderr_path),
-        "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
-        "stderr_bytes": len(result.stderr),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stderr_bytes": len(stderr),
         "ssh_config": str(ssh_config),
         "debug_filter": env["RUST_LOG"],
         **diagnostics,
