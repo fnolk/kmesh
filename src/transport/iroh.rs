@@ -10,9 +10,7 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey, Watcher as _,
-    endpoint::{
-        Connection, NetReportConfig, PortmapperConfig, RecvStream, SendStream, VarInt, presets,
-    },
+    endpoint::{Connection, NetReportConfig, RecvStream, SendStream, VarInt, presets},
 };
 use iroh_relay::{RelayQuicConfig, tls::CaTlsConfig};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -70,7 +68,6 @@ pub async fn create_endpoint(
         .secret_key(secret_key)
         .alpns(alpns)
         .relay_mode(relay_mode)
-        .portmapper_config(PortmapperConfig::Disabled)
         .net_report_config(net_report)
         .ca_tls_config(build_ca_tls_config(&options.tls)?);
 
