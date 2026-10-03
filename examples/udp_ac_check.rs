@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{BufReader, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     path::PathBuf,
@@ -57,6 +57,7 @@ struct Args {
     role: Role,
     ca_file: PathBuf,
     local_ip: Ipv4Addr,
+    endpoint_secret_key_file: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -110,10 +111,19 @@ async fn run() -> Result<()> {
         .context("parse B CA file")?;
     ensure!(!certs.is_empty(), "B CA file contains no certificates");
     let ca_tls = CaTlsConfig::default().with_extra_roots(certs);
+    let secret_key_b64 = fs::read_to_string(&args.endpoint_secret_key_file)
+        .context("read temporary enrolled Endpoint secret key")?;
+    let secret_key_bytes = URL_SAFE_NO_PAD
+        .decode(secret_key_b64.trim())
+        .context("decode temporary enrolled Endpoint secret key")?;
+    let secret_key_bytes: [u8; 32] = secret_key_bytes
+        .try_into()
+        .map_err(|_| anyhow!("temporary Endpoint secret key must contain 32 bytes"))?;
+    let secret_key = SecretKey::from_bytes(&secret_key_bytes);
     let relay_url: iroh::RelayUrl = B_RELAY_URL.parse().context("parse fixed B relay URL")?;
     let relay = RelayConfig::new(relay_url.clone(), Some(RelayQuicConfig::new(B_QAD_PORT)));
     let builder = Endpoint::builder(presets::Minimal)
-        .secret_key(SecretKey::generate())
+        .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
         .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay])))
         .ca_tls_config(ca_tls)
@@ -131,9 +141,21 @@ async fn run() -> Result<()> {
         .find(|addr| addr.is_ipv4() && addr.ip() == IpAddr::V4(args.local_ip))
         .context("read bound IPv4 UDP socket")?;
 
-    timeout_at(deadline, endpoint.online())
-        .await
-        .context("wait for B private relay readiness")?;
+    let mut relay_status = endpoint.home_relay_status();
+    loop {
+        let statuses = relay_status.get();
+        if statuses.iter().any(|relay| relay.is_connected()) {
+            break;
+        }
+        if let Some(reason) = statuses.iter().find_map(|relay| relay.auth_denied_reason()) {
+            emit(json!({"event":"relay_auth_denied","role":args.role.as_str(),"reason":reason}))?;
+            bail!("B private relay denied the registered EndpointId: {reason}");
+        }
+        timeout_at(deadline, relay_status.updated())
+            .await
+            .context("wait for B private relay readiness")?
+            .map_err(|_| anyhow!("B private relay status watcher disconnected"))?;
+    }
     let mut report_watcher = endpoint.net_report();
     let report = timeout_at(deadline, report_watcher.initialized())
         .await
@@ -328,6 +350,7 @@ fn parse_args() -> Result<Args> {
     let mut role = None;
     let mut ca_file = None;
     let mut local_ip = None;
+    let mut endpoint_secret_key_file = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -347,8 +370,13 @@ fn parse_args() -> Result<Args> {
                         .context("parse local IPv4")?,
                 )
             }
+            "--endpoint-secret-key-file" => {
+                endpoint_secret_key_file = args.next().map(PathBuf::from)
+            }
             _ => {
-                bail!("usage: udp_ac_check --role target|client --ca-file <PEM> --local-ip <IPv4>")
+                bail!(
+                    "usage: udp_ac_check --role target|client --ca-file <PEM> --local-ip <IPv4> --endpoint-secret-key-file <FILE>"
+                )
             }
         }
     }
@@ -356,6 +384,8 @@ fn parse_args() -> Result<Args> {
         role: role.context("--role is required")?,
         ca_file: ca_file.context("--ca-file is required")?,
         local_ip: local_ip.context("--local-ip is required")?,
+        endpoint_secret_key_file: endpoint_secret_key_file
+            .context("--endpoint-secret-key-file is required")?,
     })
 }
 
