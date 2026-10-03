@@ -311,10 +311,12 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
     qad_reports, qad_report_event = {"client": [], "target": []}, asyncio.Event()
     mapping_candidates = {
         "enabled": args.mapping_candidates,
-        "ready_before": {},
-        "ready_after": {},
+        "ready_original": {},
         "observations": {},
         "all_successful_qad_reports": {},
+        "control_to_client": None,
+        "control_to_target": None,
+        "local_candidates_published": {},
     }
     remote_pid, procs, readers = {"pid": None}, {}, []
     capture_proc, capture_readers = None, []
@@ -396,7 +398,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
                 ready[role] = event
 
         if args.mapping_candidates:
-            mapping_candidates["ready_before"] = copy.deepcopy(ready)
+            mapping_candidates["ready_original"] = copy.deepcopy(ready)
             qad_deadline = min(deadline, asyncio.get_running_loop().time() + 5)
             reports_by_role = {}
             while True:
@@ -453,7 +455,8 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
                 existing_addrs = endpoint_addr.get("addrs")
                 if not isinstance(existing_addrs, list):
                     raise ValueError(f"{role} ready EndpointAddr.addrs must be a list")
-                relay_addrs_before = [addr for addr in existing_addrs if isinstance(addr, dict) and "Relay" in addr]
+                if not any(addr == {"Ip": event["global_v4"]} for addr in existing_addrs):
+                    raise ValueError(f"{role} original ready EndpointAddr must retain its QAD global_v4 candidate")
                 relay_map, matching = reports_by_role[role]
                 observed = []
                 for relay in relay_map:
@@ -470,21 +473,6 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
                         "raw_report": report,
                     })
                 unique_candidates = list(dict.fromkeys(item["socket_addr"] for item in observed))
-                before = copy.deepcopy(event)
-                after = copy.deepcopy(event)
-                after_addrs = after["endpoint_addr"]["addrs"]
-                appended_candidates = []
-                for socket_addr in unique_candidates:
-                    ip_candidate = {"Ip": socket_addr}
-                    if ip_candidate not in after_addrs:
-                        after_addrs.append(ip_candidate)
-                        appended_candidates.append(socket_addr)
-                relay_addrs_after = [addr for addr in after_addrs if isinstance(addr, dict) and "Relay" in addr]
-                if relay_addrs_after != relay_addrs_before or after["endpoint_addr"]["id"] != before["endpoint_addr"]["id"]:
-                    raise RuntimeError("mapping candidate injection changed authenticated EndpointAddr identity or relay URLs")
-                ready[role] = after
-                mapping_candidates["ready_before"][role] = before
-                mapping_candidates["ready_after"][role] = copy.deepcopy(after)
                 mapping_candidates["observations"][role] = {
                     "endpoint_id": event["endpoint_id"],
                     "bound_socket": event["local_socket"],
@@ -492,8 +480,30 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
                     "relay_map": relay_map,
                     "successful_qad_reports": observed,
                     "observed_unique_candidates": unique_candidates,
-                    "newly_appended_candidates": appended_candidates,
                 }
+
+            client_self_candidates = mapping_candidates["observations"]["client"]["observed_unique_candidates"]
+            target_self_candidates = mapping_candidates["observations"]["target"]["observed_unique_candidates"]
+            control_to_client = copy.deepcopy(ready["target"])
+            control_to_client["receiver_self_observed_candidates"] = client_self_candidates
+            control_to_target = copy.deepcopy(ready["client"])
+            control_to_target["receiver_self_observed_candidates"] = target_self_candidates
+            mapping_candidates["control_to_client"] = {
+                "sender_role": "target",
+                "sender_endpoint_id": ready["target"]["endpoint_id"],
+                "receiver_role": "client",
+                "receiver_endpoint_id": ready["client"]["endpoint_id"],
+                "receiver_self_observed_candidates": client_self_candidates,
+                "peer_ready": control_to_client,
+            }
+            mapping_candidates["control_to_target"] = {
+                "sender_role": "client",
+                "sender_endpoint_id": ready["client"]["endpoint_id"],
+                "receiver_role": "target",
+                "receiver_endpoint_id": ready["target"]["endpoint_id"],
+                "receiver_self_observed_candidates": target_self_candidates,
+                "peer_ready": control_to_target,
+            }
 
         if args.capture_target:
             capture_info["target_local_socket"] = ready["target"]["local_socket"]
@@ -583,8 +593,50 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
 
         if args.capture_target:
             capture_info["peer_metadata_gate_utc"] = datetime.now(timezone.utc).isoformat()
-        await send_json(client, ready["target"])
-        await send_json(target, ready["client"])
+        if args.mapping_candidates:
+            control_to_client = mapping_candidates["control_to_client"]["peer_ready"]
+            control_to_target = mapping_candidates["control_to_target"]["peer_ready"]
+        else:
+            control_to_client = ready["target"]
+            control_to_target = ready["client"]
+        await send_json(client, control_to_client)
+        await send_json(target, control_to_target)
+
+        if args.mapping_candidates:
+            local_candidates_published = {}
+            while len(local_candidates_published) < 2:
+                role, event = await next_event(queue, deadline)
+                if event["event"] == "direct_selected":
+                    direct[role] = event
+                    continue
+                if event["event"] != "local_candidates_published":
+                    continue
+                observation = mapping_candidates["observations"][role]
+                if event.get("role") != role or event.get("endpoint_id") != observation["endpoint_id"]:
+                    raise ValueError(f"{role} local_candidates_published identity mismatch")
+                if event.get("bound_socket") != observation["bound_socket"]:
+                    raise ValueError(f"{role} local_candidates_published bound socket mismatch")
+                if event.get("actual_home_relay_url") != ready[role].get("relay_url") or event.get("b_relay_connected") is not True:
+                    raise ValueError(f"{role} local candidate publication did not retain the connected private B relay")
+                expected_candidates = observation["observed_unique_candidates"]
+                published_candidates = event.get("receiver_self_observed_candidates")
+                if not isinstance(published_candidates, list) or list(dict.fromkeys(published_candidates)) != expected_candidates:
+                    raise ValueError(f"{role} published candidates differ from this process's own QAD observations")
+                endpoint_addr_before = event.get("endpoint_addr_before")
+                endpoint_addr_after = event.get("endpoint_addr_after")
+                if (not isinstance(endpoint_addr_before, dict) or not isinstance(endpoint_addr_after, dict)
+                        or endpoint_addr_before.get("id") != observation["endpoint_id"]
+                        or endpoint_addr_after.get("id") != observation["endpoint_id"]):
+                    raise ValueError(f"{role} published EndpointAddr identity mismatch")
+                relay_before = [addr for addr in endpoint_addr_before.get("addrs", []) if isinstance(addr, dict) and "Relay" in addr]
+                relay_after = [addr for addr in endpoint_addr_after.get("addrs", []) if isinstance(addr, dict) and "Relay" in addr]
+                if (relay_after != relay_before
+                        or {"Relay": event["actual_home_relay_url"]} not in relay_after):
+                    raise ValueError(f"{role} local candidate publication changed EndpointAddr relay URLs")
+                if not all({"Ip": address} in endpoint_addr_after.get("addrs", []) for address in expected_candidates):
+                    raise ValueError(f"{role} watch_addr confirmation lacks one or more observed QAD candidates")
+                local_candidates_published[role] = event
+            mapping_candidates["local_candidates_published"] = local_candidates_published
 
         while len(direct) < 2:
             role, event = await next_event(queue, deadline)
@@ -710,6 +762,7 @@ printf 'KMESH_AC_CAPTURE_CHILD_EXE=%s\\n' "$child_exe"
             len(mapping_candidates["observations"]) == 2
             and all(len(observation["successful_qad_reports"]) == 2
                     for observation in mapping_candidates["observations"].values())
+            and len(mapping_candidates["local_candidates_published"]) == 2
         ))
         and (not args.capture_target or (
             capture_info["started_utc"] is not None
