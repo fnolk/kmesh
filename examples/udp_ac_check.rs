@@ -32,6 +32,7 @@ const PRIVATE_ALPN: &[u8] = b"kmesh/udp-ac-check/1";
 // Matches the ALPN used by the archived successful AC run.
 const PUBLIC_ALPN: &[u8] = b"kmesh/iroh-mechanism/1";
 const ROUND_TIMEOUT: Duration = Duration::from_secs(40);
+const MAPPING_TIMEOUT: Duration = Duration::from_secs(20);
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
 const NONCES_PER_DIRECTION: usize = 3;
 
@@ -81,6 +82,7 @@ impl RelaySelection {
 struct Args {
     role: Role,
     relay_selection: RelaySelection,
+    observe_mappings: bool,
     ca_file: Option<PathBuf>,
     local_ip: Option<Ipv4Addr>,
     endpoint_secret_key_file: Option<PathBuf>,
@@ -126,8 +128,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
-    let deadline = Instant::now() + ROUND_TIMEOUT;
     let args = parse_args()?;
+    let deadline = Instant::now()
+        + if args.observe_mappings {
+            MAPPING_TIMEOUT
+        } else {
+            ROUND_TIMEOUT
+        };
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -153,6 +160,10 @@ async fn run() -> Result<()> {
     };
     let private_relay_url: iroh::RelayUrl =
         B_RELAY_URL.parse().context("parse fixed B relay URL")?;
+    let mut relay_map_info = vec![json!({
+        "url": private_relay_url,
+        "qad_udp_port": B_QAD_PORT
+    })];
     let builder = match args.relay_selection {
         RelaySelection::Private => {
             let ca_file = args
@@ -168,13 +179,32 @@ async fn run() -> Result<()> {
             let local_ip = args
                 .local_ip
                 .context("private relay mode requires --local-ip")?;
+            let mut relays = vec![RelayConfig::new(
+                private_relay_url.clone(),
+                Some(RelayQuicConfig::new(B_QAD_PORT)),
+            )];
+            if args.observe_mappings {
+                let official_relay = RelayMode::Default
+                    .relay_map()
+                    .relays::<Vec<_>>()
+                    .into_iter()
+                    .next()
+                    .expect("the Iroh default relay map includes official relays");
+                let official_qad_port = official_relay
+                    .quic
+                    .as_ref()
+                    .expect("Iroh default relay configs enable QAD")
+                    .port;
+                relay_map_info.push(json!({
+                    "url": official_relay.url,
+                    "qad_udp_port": official_qad_port
+                }));
+                relays.push(official_relay.as_ref().clone());
+            }
             Endpoint::builder(presets::Minimal)
                 .secret_key(secret_key)
                 .alpns(vec![args.relay_selection.alpn().to_vec()])
-                .relay_mode(RelayMode::Custom(RelayMap::from_iter([RelayConfig::new(
-                    private_relay_url.clone(),
-                    Some(RelayQuicConfig::new(B_QAD_PORT)),
-                )])))
+                .relay_mode(RelayMode::Custom(RelayMap::from_iter(relays)))
                 .ca_tls_config(ca_tls)
                 .portmapper_config(PortmapperConfig::Disabled)
                 .net_report_config(NetReportConfig::minimal())
@@ -223,6 +253,24 @@ async fn run() -> Result<()> {
     let report = timeout_at(deadline, report_watcher.initialized())
         .await
         .context("wait for initialized QAD report")?;
+    if args.observe_mappings {
+        emit(json!({
+            "event": "mapping_report",
+            "role": args.role.as_str(),
+            "endpoint_id": endpoint.id().to_string(),
+            "bound_socket": bound_socket,
+            "relay_map": relay_map_info,
+            "udp_v4": report.udp_v4,
+            "global_v4": report.global_v4,
+            "mapping_varies_by_dest_ipv4": report.mapping_varies_by_dest_ipv4,
+            "udp_v6": report.udp_v6,
+            "mapping_varies_by_dest_ipv6": report.mapping_varies_by_dest_ipv6
+        }))?;
+        timeout_at(deadline, endpoint.close())
+            .await
+            .context("close mapping observation endpoint")?;
+        return Ok(());
+    }
     let global_v4: SocketAddrV4 = report
         .global_v4
         .context("QAD report has no global IPv4 mapping")?;
@@ -518,6 +566,7 @@ async fn run() -> Result<()> {
 fn parse_args() -> Result<Args> {
     let mut role = None;
     let mut relay_selection = None;
+    let mut observe_mappings = false;
     let mut ca_file = None;
     let mut local_ip = None;
     let mut endpoint_secret_key_file = None;
@@ -538,6 +587,7 @@ fn parse_args() -> Result<Args> {
                     _ => bail!("--relay-mode must be private or public"),
                 })
             }
+            "--observe-mappings" => observe_mappings = true,
             "--ca-file" => ca_file = args.next().map(PathBuf::from),
             "--local-ip" => {
                 local_ip = Some(
@@ -552,12 +602,16 @@ fn parse_args() -> Result<Args> {
             }
             _ => {
                 bail!(
-                    "usage: udp_ac_check --role target|client --relay-mode private|public [--ca-file <PEM>] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
+                    "usage: udp_ac_check --role target|client --relay-mode private|public [--observe-mappings] [--ca-file <PEM>] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
                 )
             }
         }
     }
     let relay_selection = relay_selection.context("--relay-mode is required")?;
+    ensure!(
+        !observe_mappings || relay_selection == RelaySelection::Private,
+        "--observe-mappings is available for private mode only"
+    );
     match relay_selection {
         RelaySelection::Private => {
             ensure!(ca_file.is_some(), "private relay mode requires --ca-file");
@@ -575,6 +629,7 @@ fn parse_args() -> Result<Args> {
     Ok(Args {
         role: role.context("--role is required")?,
         relay_selection,
+        observe_mappings,
         ca_file,
         local_ip,
         endpoint_secret_key_file,
@@ -777,6 +832,15 @@ fn init_tracing() {
         "warn,iroh::socket::transports=trace,iroh::socket::remote_map::remote_state=debug";
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    let filter = if std::env::args().any(|arg| arg == "--observe-mappings") {
+        filter.add_directive(
+            "iroh::net_report=debug"
+                .parse()
+                .expect("static NetReport log directive is valid"),
+        )
+    } else {
+        filter
+    };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
