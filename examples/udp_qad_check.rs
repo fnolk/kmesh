@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         let started = Instant::now();
         let mut record = json!({
             "round": round,
-            "probe_id": Uuid::new_v4(),
+            "round_id": Uuid::new_v4(),
             "requested_remote": SERVER_ADDR,
             "tls_server_name": SERVER_NAME,
             "local_socket": local_socket,
@@ -92,8 +92,21 @@ async fn main() -> Result<()> {
                 record["error"] = json!(error.to_string());
             }
             Ok(Ok(connection)) => {
-                let handshake_ms = started.elapsed().as_millis();
-                let handshake_confirmed = connection.handshake_data().is_some();
+                let handshake_started = Instant::now();
+                let handshake_confirmed =
+                    match timeout(CONNECT_TIMEOUT, connection.handshake_confirmed()).await {
+                        Ok(Ok(())) => true,
+                        Ok(Err(error)) => {
+                            record["error"] = json!(error.to_string());
+                            false
+                        }
+                        Err(_) => {
+                            record["error"] =
+                                json!("QUIC handshake confirmation timed out after 5 seconds");
+                            false
+                        }
+                    };
+                let handshake_ms = handshake_started.elapsed().as_millis();
                 let observed_started = Instant::now();
                 let observed =
                     timeout(OBSERVE_TIMEOUT, connection.observed_external_addr().next()).await;
@@ -108,12 +121,14 @@ async fn main() -> Result<()> {
                         record["error"] = json!("QAD observed-address stream ended");
                         None
                     }
-                    Ok(Some(address)) => Some(address),
+                    Ok(Some(address)) => {
+                        Some(SocketAddr::new(address.ip().to_canonical(), address.port()))
+                    }
                 };
-                record["connection_stable_id"] = json!(connection.stable_id());
+                record["connection_stable_id_local"] = json!(connection.stable_id());
                 record["handshake_confirmed"] = json!(handshake_confirmed);
                 record["tls_verified"] = json!(handshake_confirmed);
-                record["handshake_latency_ms"] = json!(handshake_ms);
+                record["handshake_confirmation_latency_ms"] = json!(handshake_ms);
                 record["observed_latency_ms"] = json!(observed_started.elapsed().as_millis());
                 if let Some(address) = observed_addr {
                     record["observed_external_addr"] = json!(address);
