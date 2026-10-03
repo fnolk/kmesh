@@ -1535,19 +1535,49 @@ mod tests {
             .expect("first session client did not accept")
             .expect("first session accept task panicked")
             .expect("first session client accepts");
-        let mut target_stream = IrohByteStream::open_bi(connection)
+        let mut target_stream =
+            tokio::time::timeout(Duration::from_secs(5), IrohByteStream::open_bi(connection))
+                .await
+                .expect("first session stream open timed out")
+                .expect("open first session stream");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            target_stream.write_all(b"stream ready"),
+        )
+        .await
+        .expect("first session stream warmup write timed out")
+        .expect("write first session stream warmup");
+        tokio::time::timeout(Duration::from_secs(5), target_stream.flush())
             .await
-            .expect("open first session stream");
-        let mut client_stream = IrohByteStream::accept_bi(incoming)
-            .await
-            .expect("accept first session stream");
+            .expect("first session stream warmup flush timed out")
+            .expect("flush first session stream warmup");
+        let mut client_stream =
+            tokio::time::timeout(Duration::from_secs(5), IrohByteStream::accept_bi(incoming))
+                .await
+                .expect("first session stream accept timed out")
+                .expect("accept first session stream");
+        let mut warmup_received = [0; 12];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client_stream.read_exact(&mut warmup_received),
+        )
+        .await
+        .expect("first session warmup read timed out")
+        .expect("read first session stream warmup");
+        assert_eq!(&warmup_received, b"stream ready");
 
-        target_two.close().await;
-        target_stream
-            .write_all(b"active session survives")
+        tokio::time::timeout(Duration::from_secs(5), target_two.close())
             .await
-            .expect("write on first session after closing the second endpoint");
-        let mut received = [0u8; 23];
+            .expect("closing the second session endpoint timed out");
+        let active_payload = b"active session survives";
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            target_stream.write_all(active_payload),
+        )
+        .await
+        .expect("write on first session after closing the second endpoint timed out")
+        .expect("write on first session after closing the second endpoint");
+        let mut received = vec![0; active_payload.len()];
         tokio::time::timeout(
             Duration::from_secs(5),
             client_stream.read_exact(&mut received),
@@ -1555,6 +1585,6 @@ mod tests {
         .await
         .expect("first session read timed out")
         .expect("read first session payload");
-        assert_eq!(&received, b"active session survives");
+        assert_eq!(received, active_payload);
     }
 }
