@@ -84,6 +84,7 @@ struct Args {
     relay_selection: RelaySelection,
     observe_mappings: bool,
     mapping_candidates: bool,
+    peer_ip_only: bool,
     ca_file: Option<PathBuf>,
     local_ip: Option<Ipv4Addr>,
     endpoint_secret_key_file: Option<PathBuf>,
@@ -103,6 +104,8 @@ struct PeerReady {
     receiver_self_observed_candidates: Vec<SocketAddr>,
     #[serde(default)]
     receiver_self_predicted_candidates: Vec<SocketAddr>,
+    #[serde(default)]
+    peer_bootstrap_candidates: Vec<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -552,11 +555,56 @@ async fn run() -> Result<()> {
             "endpoint_addr_after": endpoint_addr_after
         }))?;
     }
-    let peer_addr = peer.endpoint_addr.clone();
+    let original_peer_endpoint_addr = peer.endpoint_addr.clone();
+    let mut peer_bootstrap_candidates = Vec::new();
+    let peer_addr = if args.peer_ip_only {
+        ensure!(
+            !peer.peer_bootstrap_candidates.is_empty(),
+            "peer-ip-only requires this run's live peer bootstrap candidates"
+        );
+        ensure!(
+            peer.peer_bootstrap_candidates.len() <= 4,
+            "peer-ip-only accepts at most four measured or predicted QAD candidates"
+        );
+        for candidate in peer.peer_bootstrap_candidates.iter().copied() {
+            ensure!(candidate.is_ipv4(), "peer bootstrap candidate must be IPv4");
+            ensure!(
+                candidate.ip() == peer_ip.ip(),
+                "peer bootstrap candidate public IP differs from this run's peer QAD address"
+            );
+            if !peer_bootstrap_candidates.contains(&candidate) {
+                peer_bootstrap_candidates.push(candidate);
+            }
+        }
+        ensure!(
+            peer_bootstrap_candidates.contains(&peer_ip),
+            "peer-ip-only bootstrap candidates omit the peer's B QAD address"
+        );
+        let mut dial_candidates = original_peer_endpoint_addr
+            .ip_addrs()
+            .copied()
+            .collect::<Vec<_>>();
+        ensure!(
+            dial_candidates.iter().all(SocketAddr::is_ipv4),
+            "peer-IP-only dial candidates must all be IPv4"
+        );
+        for candidate in peer_bootstrap_candidates.iter().copied() {
+            if !dial_candidates.contains(&candidate) {
+                dial_candidates.push(candidate);
+            }
+        }
+        EndpointAddr::new(peer_id).with_addrs(dial_candidates.into_iter().map(TransportAddr::Ip))
+    } else {
+        original_peer_endpoint_addr.clone()
+    };
     emit(json!({
         "event":"peer_received", "role":args.role.as_str(), "local_endpoint_id":endpoint.id().to_string(),
         "peer_endpoint_id":peer_id.to_string(), "peer_global_v4_candidate":peer_ip, "peer_bound_socket":peer_local,
-        "relay_mode":args.relay_selection.as_str(), "peer_home_relay_url":peer_relay_url
+        "relay_mode":args.relay_selection.as_str(), "peer_home_relay_url":peer_relay_url,
+        "peer_ip_only":args.peer_ip_only,
+        "original_peer_endpoint_addr":original_peer_endpoint_addr,
+        "dial_endpoint_addr":peer_addr,
+        "peer_bootstrap_candidates":peer_bootstrap_candidates
     }))?;
 
     let (data, auxiliary, outgoing, incoming, data_role) = match args.relay_selection {
@@ -764,6 +812,7 @@ fn parse_args() -> Result<Args> {
     let mut relay_selection = None;
     let mut observe_mappings = false;
     let mut mapping_candidates = false;
+    let mut peer_ip_only = false;
     let mut ca_file = None;
     let mut local_ip = None;
     let mut endpoint_secret_key_file = None;
@@ -786,6 +835,7 @@ fn parse_args() -> Result<Args> {
             }
             "--observe-mappings" => observe_mappings = true,
             "--mapping-candidates" => mapping_candidates = true,
+            "--peer-ip-only" => peer_ip_only = true,
             "--ca-file" => ca_file = args.next().map(PathBuf::from),
             "--local-ip" => {
                 local_ip = Some(
@@ -800,7 +850,7 @@ fn parse_args() -> Result<Args> {
             }
             _ => {
                 bail!(
-                    "usage: udp_ac_check --role target|client --relay-mode private|public [--observe-mappings | --mapping-candidates] [--ca-file <PEM>] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
+                    "usage: udp_ac_check --role target|client --relay-mode private|public [--observe-mappings | --mapping-candidates [--peer-ip-only]] [--ca-file <PEM>] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
                 )
             }
         }
@@ -813,6 +863,10 @@ fn parse_args() -> Result<Args> {
     ensure!(
         !(observe_mappings || mapping_candidates) || relay_selection == RelaySelection::Private,
         "mapping observation modes are available for private mode only"
+    );
+    ensure!(
+        !peer_ip_only || (mapping_candidates && relay_selection == RelaySelection::Private),
+        "--peer-ip-only requires private --mapping-candidates mode"
     );
     match relay_selection {
         RelaySelection::Private => {
@@ -833,6 +887,7 @@ fn parse_args() -> Result<Args> {
         relay_selection,
         observe_mappings,
         mapping_candidates,
+        peer_ip_only,
         ca_file,
         local_ip,
         endpoint_secret_key_file,
