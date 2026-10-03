@@ -165,22 +165,37 @@ async def run(args):
         raise ValueError("--client-bin must name an executable local file")
     if not args.target_bin.startswith("/"):
         raise ValueError("--target-bin must be an absolute path on target-1")
-    client_secret_file = Path(args.client_secret_file).expanduser().resolve()
-    if not client_secret_file.is_file():
-        raise ValueError("--client-secret-file must name an existing local file")
-    if client_secret_file.stat().st_mode & 0o077:
-        raise ValueError("--client-secret-file must be private to its owner")
-    if not args.target_secret_file.startswith("/"):
-        raise ValueError("--target-secret-file must be an absolute path on target-1")
+    client_secret_file = None
+    if args.relay_mode == "private":
+        if not args.client_secret_file or not args.target_secret_file:
+            raise ValueError("private mode requires both endpoint secret-file paths")
+        client_secret_file = Path(args.client_secret_file).expanduser().resolve()
+        if not client_secret_file.is_file():
+            raise ValueError("--client-secret-file must name an existing local file")
+        if client_secret_file.stat().st_mode & 0o077:
+            raise ValueError("--client-secret-file must be private to its owner")
+        if not args.target_secret_file.startswith("/"):
+            raise ValueError("--target-secret-file must be an absolute path on target-1")
+    elif args.client_secret_file or args.target_secret_file:
+        raise ValueError("public mode uses fresh helper identities and accepts no secret-file paths")
 
     run_id = uuid.uuid4().hex
     pid_file = f"/tmp/kmesh-udp-ac-{run_id}.pid"
+    target_args = [
+        args.target_bin, "--role", "target", "--relay-mode", args.relay_mode,
+        "--ca-file", TARGET_CA,
+    ]
+    if args.relay_mode == "private":
+        target_args.extend([
+            "--local-ip", TARGET_IP,
+            "--endpoint-secret-key-file", args.target_secret_file,
+        ])
     remote_command = f"""umask 077
 pid=$$
 printf '%s\\n' \"$pid\" > {shlex.quote(pid_file)}
 printf 'KMESH_AC_REMOTE_PID=%s\\n' \"$pid\" >&2
 export RUST_LOG={shlex.quote(LOG_FILTER)}
-exec {shlex.quote(args.target_bin)} --role target --local-ip {TARGET_IP} --ca-file {TARGET_CA} --endpoint-secret-key-file {shlex.quote(args.target_secret_file)}
+exec {' '.join(shlex.quote(arg) for arg in target_args)}
 """
     queue, events = asyncio.Queue(), {"client": [], "target": []}
     remote_pid, procs, readers = {"pid": None}, {}, []
@@ -190,9 +205,17 @@ exec {shlex.quote(args.target_bin)} --role target --local-ip {TARGET_IP} --ca-fi
     try:
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError("runner deadline elapsed before start")
+        client_args = [
+            str(client_bin), "--role", "client", "--relay-mode", args.relay_mode,
+            "--ca-file", CLIENT_CA,
+        ]
+        if args.relay_mode == "private":
+            client_args.extend([
+                "--local-ip", CLIENT_IP,
+                "--endpoint-secret-key-file", str(client_secret_file),
+            ])
         client = await asyncio.create_subprocess_exec(
-            str(client_bin), "--role", "client", "--local-ip", CLIENT_IP,
-            "--ca-file", CLIENT_CA, "--endpoint-secret-key-file", str(client_secret_file),
+            *client_args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True, env={**os.environ, "RUST_LOG": LOG_FILTER},
@@ -273,6 +296,7 @@ exec {shlex.quote(args.target_bin)} --role target --local-ip {TARGET_IP} --ca-fi
     summary = {
         "status": "passed" if success else "failed",
         "failure": failure,
+        "relay_mode": args.relay_mode,
         "elapsed_seconds": round(asyncio.get_running_loop().time() - started, 3),
         "local_client_pid": procs["client"].pid if "client" in procs else None,
         "target_ssh_pid": procs["target"].pid if "target" in procs else None,
@@ -299,8 +323,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-bin", required=True, help="local macOS udp_ac_check executable")
     parser.add_argument("--target-bin", required=True, help="absolute udp_ac_check path already staged on target-1")
-    parser.add_argument("--client-secret-file", required=True, help="private local enrolled endpoint key file")
-    parser.add_argument("--target-secret-file", required=True, help="absolute enrolled endpoint key file path on target-1")
+    parser.add_argument("--relay-mode", required=True, choices=("private", "public"))
+    parser.add_argument("--client-secret-file", help="private local enrolled key file (private mode only)")
+    parser.add_argument("--target-secret-file", help="absolute enrolled key file on target-1 (private mode only)")
     parser.add_argument("--out-dir", required=True, help="new private evidence directory")
     return asyncio.run(run(parser.parse_args()))
 
