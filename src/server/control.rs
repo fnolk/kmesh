@@ -63,7 +63,8 @@ pub(crate) struct TunnelRuntime {
     pub client_endpoint_id: String,
     pub target_endpoint_id: String,
     pub ticket: String,
-    pub offer: Mutex<Option<ControlMessage>>,
+    pub client_offer_sent: Mutex<bool>,
+    pub client_endpoint_addr: Mutex<Option<EndpointAddr>>,
     pub client_sender: mpsc::Sender<ControlMessage>,
     pub target_sender: mpsc::Sender<ControlMessage>,
     pub phase: Mutex<TunnelPhase>,
@@ -278,7 +279,7 @@ async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocke
     unregister_agent(&state, target_id, connection_id).await;
 }
 
-async fn handle_client_message(
+pub(super) async fn handle_client_message(
     state: &ServerState,
     user: AuthenticatedUser,
     sender: &mpsc::Sender<ControlMessage>,
@@ -307,6 +308,40 @@ async fn handle_client_message(
         }
         ControlMessage::Close { session_id, reason } if reason.len() <= 512 => {
             close_from_client(state, session_id, user).await;
+        }
+        ControlMessage::ClientReady {
+            session_id,
+            relay_mode,
+            client_endpoint_addr,
+        } => {
+            if let Err(error) = send_dial_offer(
+                state,
+                user,
+                sender,
+                session_id,
+                relay_mode,
+                client_endpoint_addr,
+            )
+            .await
+            {
+                let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+                if let Some(runtime) = runtime
+                    && runtime.client_sender.same_channel(sender)
+                    && runtime.user_id == user.user_id
+                    && runtime.auth_session_id == user.session_id
+                    && *runtime.phase.lock().await == TunnelPhase::Pending
+                {
+                    fail_tunnel(state, &runtime, "client_ready_denied", &error.to_string()).await;
+                    return;
+                }
+                send_error(
+                    sender,
+                    Some(session_id),
+                    "client_ready_denied",
+                    &error.to_string(),
+                )
+                .await;
+            }
         }
         _ => {
             send_error(
@@ -363,14 +398,8 @@ pub(super) async fn handle_agent_message(
                     .await;
                 }
             } else if let Some(session_id) = session_id {
-                send_target_offer(state, target_id, connection_id, relay_mode, session_id).await;
+                send_client_offer(state, target_id, connection_id, relay_mode, session_id).await;
             }
-        }
-        ControlMessage::OfferReady {
-            session_id,
-            relay_mode,
-        } => {
-            send_offer_to_client(state, target_id, connection_id, relay_mode, session_id).await;
         }
         ControlMessage::IrohReady {
             session_id,
@@ -512,7 +541,8 @@ pub(super) async fn open_tunnel(
         client_endpoint_id: client_endpoint_id.clone(),
         target_endpoint_id,
         ticket,
-        offer: Mutex::new(None),
+        client_offer_sent: Mutex::new(false),
+        client_endpoint_addr: Mutex::new(None),
         client_sender: client_sender.clone(),
         target_sender: target_agent.sender.clone(),
         phase: Mutex::new(TunnelPhase::Pending),
@@ -541,7 +571,7 @@ pub(super) async fn open_tunnel(
     Ok(())
 }
 
-pub(super) async fn send_offer_to_client(
+pub(super) async fn send_client_offer(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,
@@ -560,53 +590,25 @@ pub(super) async fn send_offer_to_client(
     {
         return;
     }
-    let offer = runtime.offer.lock().await.clone();
-    let Some(offer) = offer else {
-        return;
-    };
-    if runtime.client_sender.send(offer).await.is_err() {
-        close_tunnel(
-            state,
-            &runtime,
-            "client control connection closed before offer",
-        )
-        .await;
-    }
-}
-
-pub(super) async fn send_target_offer(
-    state: &ServerState,
-    target_id: Uuid,
-    connection_id: Uuid,
-    relay_mode: RelayMode,
-    session_id: Uuid,
-) {
-    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
-    let Some(runtime) = runtime else {
-        return;
-    };
-    if runtime.target_id != target_id
-        || runtime.target_connection_id != connection_id
-        || runtime.relay_mode != relay_mode
-        || *runtime.phase.lock().await != TunnelPhase::Pending
-        || runtime.expires_at <= unix_time()
-    {
+    let mut client_offer_sent = runtime.client_offer_sent.lock().await;
+    if *client_offer_sent {
         return;
     }
-    let target_endpoint_addr = {
+    let target_endpoint_id = {
         let online = state.inner.online_agents.read().await;
-        let Some(agent) = online
-            .get(&target_id)
-            .filter(|agent| agent.connection_id == connection_id)
-        else {
+        let Some(agent) = online.get(&target_id).filter(|agent| {
+            agent.connection_id == connection_id
+                && agent.sender.same_channel(&runtime.target_sender)
+        }) else {
             return;
         };
-        agent.endpoints.get(&relay_mode).cloned()
+        let Some(endpoint_addr) = agent.endpoints.get(&relay_mode) else {
+            return;
+        };
+        endpoint_addr.id.to_string()
     };
-    let Some(target_endpoint_addr) = target_endpoint_addr else {
-        return;
-    };
-    if target_endpoint_addr.id.to_string() != runtime.target_endpoint_id {
+    if target_endpoint_id != runtime.target_endpoint_id {
+        drop(client_offer_sent);
         fail_tunnel(
             state,
             &runtime,
@@ -616,24 +618,114 @@ pub(super) async fn send_target_offer(
         .await;
         return;
     }
-    let offer = ControlMessage::Offer {
+    let offer = ControlMessage::ClientOffer {
         session_id,
         target_id,
         ticket: runtime.ticket.clone(),
         client_endpoint_id: runtime.client_endpoint_id.clone(),
-        target_endpoint_addr,
+        target_endpoint_id,
         ticket_public_key_pem: state.inner.keys.tunnel_ticket.public_key_pem.clone(),
         relay_mode,
     };
-    *runtime.offer.lock().await = Some(offer.clone());
-    if runtime.target_sender.send(offer).await.is_err() {
+    if runtime.client_sender.send(offer).await.is_err() {
+        drop(client_offer_sent);
         close_tunnel(
             state,
             &runtime,
-            "target control connection closed during prepare",
+            "client control connection closed before ClientOffer",
         )
         .await;
+        return;
     }
+    *client_offer_sent = true;
+}
+
+pub(super) async fn send_dial_offer(
+    state: &ServerState,
+    user: AuthenticatedUser,
+    client_sender: &mpsc::Sender<ControlMessage>,
+    session_id: Uuid,
+    relay_mode: RelayMode,
+    client_endpoint_addr: EndpointAddr,
+) -> Result<(), ApiError> {
+    let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
+    let runtime = runtime.ok_or_else(ApiError::unauthorized)?;
+    if !runtime.client_sender.same_channel(client_sender)
+        || runtime.user_id != user.user_id
+        || runtime.auth_session_id != user.session_id
+        || runtime.access_expires_at != user.access_expires_at
+    {
+        return Err(ApiError::unauthorized());
+    }
+    if runtime.relay_mode != relay_mode
+        || *runtime.phase.lock().await != TunnelPhase::Pending
+        || runtime.expires_at <= unix_time()
+        || runtime.access_expires_at <= unix_time()
+    {
+        return Err(ApiError::conflict(
+            "SSH session is not ready for client candidates",
+        ));
+    }
+    if !*runtime.client_offer_sent.lock().await {
+        return Err(ApiError::conflict(
+            "target endpoint is not ready for this session",
+        ));
+    }
+    if client_endpoint_addr.id.to_string() != runtime.client_endpoint_id
+        || client_endpoint_addr.ip_addrs().count() > 32
+    {
+        return Err(ApiError::unauthorized());
+    }
+    let relay_choice = relay_choice(state, relay_mode).await?;
+    crate::transport::validate_endpoint_addr(&client_endpoint_addr, &relay_choice)
+        .map_err(|_| ApiError::unauthorized())?;
+    if client_endpoint_addr.relay_urls().next().is_none() {
+        return Err(ApiError::unauthorized());
+    }
+
+    let target_sender = {
+        let online = state.inner.online_agents.read().await;
+        let Some(agent) = online.get(&runtime.target_id).filter(|agent| {
+            agent.connection_id == runtime.target_connection_id
+                && agent.sender.same_channel(&runtime.target_sender)
+        }) else {
+            return Err(ApiError::conflict("target control connection changed"));
+        };
+        let Some(target_endpoint_addr) = agent.endpoints.get(&relay_mode) else {
+            return Err(ApiError::conflict("target endpoint is not ready"));
+        };
+        if target_endpoint_addr.id.to_string() != runtime.target_endpoint_id {
+            return Err(ApiError::unauthorized());
+        }
+        agent.sender.clone()
+    };
+
+    let mut registered_client_addr = runtime.client_endpoint_addr.lock().await;
+    if registered_client_addr.is_some() {
+        return Err(ApiError::conflict("client endpoint is already registered"));
+    }
+    *registered_client_addr = Some(client_endpoint_addr.clone());
+    drop(registered_client_addr);
+
+    let offer = ControlMessage::DialOffer {
+        session_id,
+        target_id: runtime.target_id,
+        ticket: runtime.ticket.clone(),
+        client_endpoint_id: runtime.client_endpoint_id.clone(),
+        client_endpoint_addr,
+        ticket_public_key_pem: state.inner.keys.tunnel_ticket.public_key_pem.clone(),
+        relay_mode,
+    };
+    if target_sender.send(offer).await.is_err() {
+        close_tunnel(
+            state,
+            &runtime,
+            "target control connection closed before DialOffer",
+        )
+        .await;
+        return Err(ApiError::conflict("target control connection closed"));
+    }
+    Ok(())
 }
 
 async fn authorized_for_target(
@@ -737,7 +829,10 @@ pub(super) async fn activate_tunnel(
         return;
     }
     let mut phase = runtime.phase.lock().await;
-    if *phase != TunnelPhase::Pending {
+    if *phase != TunnelPhase::Pending
+        || !*runtime.client_offer_sent.lock().await
+        || runtime.client_endpoint_addr.lock().await.is_none()
+    {
         return;
     }
     let now = unix_time();
