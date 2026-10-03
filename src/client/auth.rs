@@ -230,3 +230,6 @@ fn unix_now() -> Result<u64> {
         .context("system clock is before Unix epoch")?
         .as_secs())
 }
+
+#[cfg(test)]
+mod tests;

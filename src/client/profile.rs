@@ -223,3 +223,70 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{AgentCredentials, LoginTokens};
+
+    #[test]
+    fn saved_login_and_agent_state_are_scoped_and_private() {
+        let root = std::env::temp_dir().join(format!("kmesh-profile-test-{}", Uuid::new_v4()));
+        let alice = ProfileStore::new(&root, "https://one.example:9443", "work");
+        let other_user = ProfileStore::new(&root, "https://one.example:9443", "work");
+        let other_server = ProfileStore::new(&root, "https://two.example:9443", "work");
+        let other_profile = ProfileStore::new(&root, "https://one.example:9443", "home");
+        assert_eq!(alice.login_path("alice"), other_user.login_path("ALICE"));
+        assert_ne!(alice.login_path("alice"), alice.login_path("bob"));
+        assert_ne!(alice.login_path("alice"), other_server.login_path("alice"));
+        assert_ne!(alice.login_path("alice"), other_profile.login_path("alice"));
+
+        let saved = SavedLogin {
+            server_url: "https://one.example:9443".to_owned(),
+            profile: "work".to_owned(),
+            username: "Alice".to_owned(),
+            tokens: LoginTokens {
+                access_token: "access-test".to_owned(),
+                refresh_token: "refresh-test".to_owned(),
+                access_expires_at: 100,
+                refresh_expires_at: 200,
+            },
+        };
+        alice.save(&saved).expect("save login atomically");
+        alice.set_active_user("Alice").expect("save active user");
+        assert_eq!(alice.load("alice").unwrap().unwrap().username, "Alice");
+        assert_eq!(alice.active_user().unwrap(), "alice");
+
+        let lock = alice.lock_refresh().expect("open private refresh lock");
+        drop(lock);
+
+        let target_id = Uuid::new_v4();
+        save_agent_credentials(
+            &root,
+            &AgentCredentials {
+                target_id,
+                agent_token: "agent-test".to_owned(),
+                ticket_public_key_pem: "ticket-test".to_owned(),
+                endpoint_secret_key: "device-test".to_owned(),
+            },
+        )
+        .expect("save target credentials atomically");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode(&alice.login_path("alice")), 0o600);
+            assert_eq!(file_mode(&alice.active_user_path()), 0o600);
+            assert_eq!(file_mode(&alice.lock_path()), 0o600);
+            assert_eq!(file_mode(&agent_credentials_path(&root, target_id)), 0o600);
+            assert_eq!(file_mode(&root), 0o700);
+            assert_eq!(file_mode(&root.join("agents")), 0o700);
+            assert_eq!(
+                file_mode(alice.login_path("alice").parent().unwrap()),
+                0o700
+            );
+        }
+        fs::remove_dir_all(root).expect("remove temporary profile tree");
+    }
+}

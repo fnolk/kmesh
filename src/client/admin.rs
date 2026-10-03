@@ -361,3 +361,53 @@ impl Completer for AdminHelper {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_parser_accepts_one_shot_json_operations_and_help_lists_groups() {
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let parsed =
+            AdminLine::try_parse_from(["admin", "--json", "users", "disable", user_id.as_str()])
+                .expect("parse one-shot JSON admin operation");
+        assert!(parsed.json);
+        assert!(matches!(
+            parsed.command,
+            Some(AdminCommand::Users {
+                action: UserAction::Disable { .. }
+            })
+        ));
+
+        let help = AdminLine::command().render_help().to_string();
+        for group in ["users", "keys", "roles", "grants", "targets"] {
+            assert!(help.contains(group), "admin help lists {group}");
+        }
+    }
+
+    #[test]
+    fn admin_repl_completion_covers_each_operation_group() {
+        let history = rustyline::history::DefaultHistory::new();
+        let context = LineContext::new(&history);
+        let helper = AdminHelper;
+        for (line, expected) in [
+            ("", "users"),
+            ("users ", "reset-password"),
+            ("keys ", "remove"),
+            ("roles ", "delete"),
+            ("grants ", "remove"),
+            ("targets ", "issue-enrollment"),
+        ] {
+            let (_, candidates) = helper
+                .complete(line, line.len(), &context)
+                .expect("complete admin command");
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == expected),
+                "completion for {line:?} includes {expected}"
+            );
+        }
+    }
+}

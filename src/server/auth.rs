@@ -658,6 +658,9 @@ fn append_field(payload: &mut Vec<u8>, value: &[u8]) {
     payload.extend_from_slice(value);
 }
 
+#[cfg(test)]
+mod tests;
+
 fn burn_password_work(password: &str) {
     use argon2::password_hash::SaltString;
     let salt = SaltString::encode_b64(b"0123456789abcdef").expect("constant salt is valid");
