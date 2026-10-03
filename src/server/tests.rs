@@ -38,12 +38,12 @@ use crate::{
     protocol::{
         AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, DiscoveryResult,
         LoginTokens, NativePlan, PasswordLoginRequest, PublicKeyChallengeRequest,
-        PublicKeyLoginRequest, ReadyDiscovery, RefreshRequest, RelayMode, TargetPermission,
-        TunnelTicketClaims,
+        PublicKeyLoginRequest, ReadyDiscovery, RefreshRequest, RouteMode, SelectedPath,
+        TargetPermission, TunnelTicketClaims,
     },
     transport::{
         IrohByteStream, IrohEndpointOptions, QadObservation, QadReflector, RelayChoice,
-        accept_peer, connect_peer, create_endpoint, http_client,
+        accept_peer, connect_peer, create_endpoint, http_client, wait_for_selected_path,
     },
 };
 
@@ -250,7 +250,7 @@ async fn send_agent_ready_for_session(
     target_id: Uuid,
     connection_id: Uuid,
     session_id: Uuid,
-    relay_mode: RelayMode,
+    route_mode: RouteMode,
     stable_device_key: &SecretKey,
     target_receiver: &mut mpsc::Receiver<ControlMessage>,
 ) -> SecretKey {
@@ -267,7 +267,7 @@ async fn send_agent_ready_for_session(
         .sign(&identity::agent_session_identity_payload(
             session_id,
             target_id,
-            relay_mode,
+            route_mode,
             &data_key.public(),
             runtime.expires_at,
         ))
@@ -279,7 +279,7 @@ async fn send_agent_ready_for_session(
         connection_id,
         ControlMessage::AgentIdentity {
             session_id,
-            relay_mode,
+            route_mode,
             target_data_endpoint_id: data_key.public().to_string(),
             signature,
         },
@@ -287,41 +287,49 @@ async fn send_agent_ready_for_session(
     .await;
     assert!(matches!(
         target_receiver.recv().await.expect("agent identity accepted"),
-        ControlMessage::IdentityAccepted { session_id: id, relay_mode: mode }
-            if id == session_id && mode == relay_mode
+        ControlMessage::IdentityAccepted { session_id: id, route_mode: mode }
+            if id == session_id && mode == route_mode
     ));
-    control::handle_agent_message(
-        state,
-        target_id,
-        connection_id,
-        ControlMessage::CandidatesReady {
-            session_id,
-            relay_mode,
-            discovery: DiscoveryResult::Unavailable {
-                reason: "test selects native transport".to_owned(),
+    if route_mode == RouteMode::PrivateRelay {
+        assert!(matches!(
+            target_receiver.recv().await.expect("private relay native plan"),
+            ControlMessage::ContinueNative {
+                session_id: id,
+                route_mode: mode,
+                plan: NativePlan::Standard,
+            } if id == session_id && mode == route_mode
+        ));
+    } else {
+        control::handle_agent_message(
+            state,
+            target_id,
+            connection_id,
+            ControlMessage::CandidatesReady {
+                session_id,
+                route_mode,
+                discovery: DiscoveryResult::Unavailable {
+                    reason: "test selects native transport".to_owned(),
+                },
             },
-        },
-    )
-    .await;
-    assert!(matches!(
-        target_receiver.recv().await.expect("native transport plan"),
-        ControlMessage::ContinueNative {
-            session_id: id,
-            relay_mode: mode,
-            plan: NativePlan::Standard,
-        } if id == session_id && mode == relay_mode
-    ));
-    let relay_url = match relay_mode {
-        RelayMode::Private => reqwest::Url::parse(&state.inner.issuer)
-            .expect("valid test issuer")
-            .into(),
-        RelayMode::PublicDefault => {
-            crate::transport::allowed_relay_urls(&crate::transport::RelayChoice::PublicDefault)
-                .expect("load SDK default relay URLs")
-                .into_iter()
-                .next()
-                .expect("SDK default relay URL exists")
-        }
+        )
+        .await;
+        assert!(matches!(
+            target_receiver.recv().await.expect("native transport plan"),
+            ControlMessage::ContinueNative {
+                session_id: id,
+                route_mode: mode,
+                plan: NativePlan::Standard,
+            } if id == session_id && mode == route_mode
+        ));
+    }
+    let endpoint_addr = match route_mode {
+        RouteMode::PrivateRelay => EndpointAddr::new(data_key.public()).with_relay_url(
+            reqwest::Url::parse(&state.inner.issuer)
+                .expect("valid test issuer")
+                .into(),
+        ),
+        RouteMode::PrivateDirect | RouteMode::PublicDirect => EndpointAddr::new(data_key.public())
+            .with_ip_addr(SocketAddr::from(([203, 0, 113, 10], 41000))),
     };
     control::handle_agent_message(
         state,
@@ -329,8 +337,8 @@ async fn send_agent_ready_for_session(
         connection_id,
         ControlMessage::AgentReady {
             session_id,
-            relay_mode,
-            endpoint_addr: EndpointAddr::new(data_key.public()).with_relay_url(relay_url),
+            route_mode,
+            endpoint_addr,
         },
     )
     .await;
@@ -343,7 +351,7 @@ async fn exchange_test_client_candidates(
     target_receiver: &mut mpsc::Receiver<ControlMessage>,
     session_id: Uuid,
     client_secret: &SecretKey,
-    relay_mode: RelayMode,
+    route_mode: RouteMode,
     relay_url: RelayUrl,
 ) -> (ControlMessage, ControlMessage, String) {
     let runtime = state
@@ -370,7 +378,7 @@ async fn exchange_test_client_candidates(
         target_id: offered_target,
         client_endpoint_id,
         target_endpoint_id,
-        relay_mode: offered_mode,
+        route_mode: offered_mode,
         ..
     } = &client_offer
     else {
@@ -379,7 +387,7 @@ async fn exchange_test_client_candidates(
     assert_eq!(*offered_session, session_id);
     assert_eq!(*offered_target, target_id);
     assert_eq!(client_endpoint_id, &client_secret.public().to_string());
-    assert_eq!(*offered_mode, relay_mode);
+    assert_eq!(*offered_mode, route_mode);
     let target_data_endpoint_id = target_endpoint_id.clone();
     let enrolled_endpoint_id = state
         .inner
@@ -390,14 +398,22 @@ async fn exchange_test_client_candidates(
         .expect("target is enrolled");
     assert_ne!(target_endpoint_id, &enrolled_endpoint_id);
 
-    let client_endpoint_addr = EndpointAddr::new(client_secret.public()).with_relay_url(relay_url);
+    let client_endpoint_addr = match route_mode {
+        RouteMode::PrivateRelay => {
+            EndpointAddr::new(client_secret.public()).with_relay_url(relay_url.clone())
+        }
+        RouteMode::PrivateDirect | RouteMode::PublicDirect => {
+            EndpointAddr::new(client_secret.public())
+                .with_ip_addr(SocketAddr::from(([198, 51, 100, 20], 32000)))
+        }
+    };
     assert!(matches!(
         client_receiver.recv().await.expect("client native plan"),
         ControlMessage::ContinueNative {
             session_id: id,
-            relay_mode: mode,
+            route_mode: mode,
             plan: NativePlan::Standard,
-        } if id == session_id && mode == relay_mode
+        } if id == session_id && mode == route_mode
     ));
     control::handle_client_message(
         state,
@@ -405,7 +421,7 @@ async fn exchange_test_client_candidates(
         &client_sender,
         ControlMessage::ClientReady {
             session_id,
-            relay_mode,
+            route_mode,
             client_endpoint_addr: client_endpoint_addr.clone(),
         },
     )
@@ -419,7 +435,7 @@ async fn exchange_test_client_candidates(
         target_id: dial_target,
         client_endpoint_id: dial_client_id,
         client_endpoint_addr: dial_client_addr,
-        relay_mode: dial_mode,
+        route_mode: dial_mode,
         ..
     } = &dial_offer
     else {
@@ -429,8 +445,71 @@ async fn exchange_test_client_candidates(
     assert_eq!(*dial_target, target_id);
     assert_eq!(dial_client_id, &client_secret.public().to_string());
     assert_eq!(dial_client_addr, &client_endpoint_addr);
-    assert_eq!(*dial_mode, relay_mode);
+    assert_eq!(*dial_mode, route_mode);
+    let (client_path, target_path) = match route_mode {
+        RouteMode::PrivateRelay => {
+            let url = relay_url.as_str().to_owned();
+            (
+                SelectedPath::PrivateRelay { url: url.clone() },
+                SelectedPath::PrivateRelay { url },
+            )
+        }
+        RouteMode::PrivateDirect | RouteMode::PublicDirect => (
+            SelectedPath::Direct {
+                remote_address: SocketAddr::from(([203, 0, 113, 10], 41000)),
+            },
+            SelectedPath::Direct {
+                remote_address: SocketAddr::from(([198, 51, 100, 20], 32000)),
+            },
+        ),
+    };
+    control::handle_client_message(
+        state,
+        user,
+        &client_sender,
+        ControlMessage::PathReady {
+            session_id,
+            route_mode,
+            path: client_path,
+        },
+    )
+    .await;
+    let target_connection_id = runtime.target_connection_id;
+    control::handle_agent_message(
+        state,
+        target_id,
+        target_connection_id,
+        ControlMessage::PathReady {
+            session_id,
+            route_mode,
+            path: target_path,
+        },
+    )
+    .await;
     (client_offer, dial_offer, target_data_endpoint_id)
+}
+
+async fn send_agent_iroh_ready_for_session(
+    state: &ServerState,
+    target_id: Uuid,
+    connection_id: Uuid,
+    session_id: Uuid,
+    client_endpoint_id: String,
+    target_data_endpoint_id: String,
+    route_mode: RouteMode,
+) {
+    control::handle_agent_message(
+        state,
+        target_id,
+        connection_id,
+        ControlMessage::IrohReady {
+            session_id,
+            client_endpoint_id,
+            target_data_endpoint_id,
+            route_mode,
+        },
+    )
+    .await;
 }
 
 fn test_qad_ready(
@@ -494,7 +573,7 @@ async fn start_test_birthday_punch(
         session_id,
         target_id,
         client_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open test birthday punch session");
@@ -511,7 +590,7 @@ async fn start_test_birthday_punch(
         .sign(&identity::agent_session_identity_payload(
             session_id,
             target_id,
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
             &target_data_key.public(),
             expires_at,
         ))
@@ -523,7 +602,7 @@ async fn start_test_birthday_punch(
         connection_id,
         ControlMessage::AgentIdentity {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             target_data_endpoint_id: target_data_key.public().to_string(),
             signature,
         },
@@ -540,7 +619,7 @@ async fn start_test_birthday_punch(
         connection_id,
         ControlMessage::CandidatesReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             discovery: test_qad_ready(target_local, target_observed),
         },
     )
@@ -551,7 +630,7 @@ async fn start_test_birthday_punch(
         client_sender,
         ControlMessage::CandidatesReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             discovery: test_qad_ready(client_local, client_observed),
         },
     )
@@ -577,7 +656,7 @@ async fn start_test_birthday_punch(
         connection_id,
         ControlMessage::PunchReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             socket_count: 257,
         },
     )
@@ -588,7 +667,7 @@ async fn start_test_birthday_punch(
         client_sender,
         ControlMessage::PunchReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             socket_count: 1,
         },
     )
@@ -948,7 +1027,7 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
         session_id,
         target_id,
         client_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open pending relay test session");
@@ -961,7 +1040,7 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
         target_id,
         target_connection_id,
         session_id,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &target_secret,
         &mut target_receiver,
     )
@@ -1004,7 +1083,7 @@ async fn per_session_target_identity_requires_the_enrolled_device_signature() {
         session_id,
         target_id,
         client_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open identity-signature session");
@@ -1023,7 +1102,7 @@ async fn per_session_target_identity_requires_the_enrolled_device_signature() {
         .sign(&identity::agent_session_identity_payload(
             session_id,
             target_id,
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
             &data_key.public(),
             expires_at,
         ))
@@ -1035,7 +1114,7 @@ async fn per_session_target_identity_requires_the_enrolled_device_signature() {
         connection_id,
         ControlMessage::AgentIdentity {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             target_data_endpoint_id: data_key.public().to_string(),
             signature,
         },
@@ -1097,7 +1176,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         session_a,
         target_id,
         client_a_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open first duplicate endpoint session");
@@ -1114,7 +1193,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         .sign(&identity::agent_session_identity_payload(
             session_a,
             target_id,
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
             &data_key.public(),
             expiry_a,
         ))
@@ -1126,7 +1205,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         connection_id,
         ControlMessage::AgentIdentity {
             session_id: session_a,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             target_data_endpoint_id: data_key.public().to_string(),
             signature: signature_a,
         },
@@ -1140,6 +1219,22 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         client_a_receiver.recv().await.expect("first ClientOffer"),
         ControlMessage::ClientOffer { session_id, .. } if session_id == session_a
     ));
+    assert!(matches!(
+        client_a_receiver.recv().await.expect("first private relay plan"),
+        ControlMessage::ContinueNative {
+            session_id,
+            route_mode: RouteMode::PrivateRelay,
+            plan: NativePlan::Standard,
+        } if session_id == session_a
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("first target private relay plan"),
+        ControlMessage::ContinueNative {
+            session_id,
+            route_mode: RouteMode::PrivateRelay,
+            plan: NativePlan::Standard,
+        } if session_id == session_a
+    ));
 
     let colliding_client_session = Uuid::new_v4();
     assert!(
@@ -1150,7 +1245,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
             colliding_client_session,
             target_id,
             data_key.public().to_string(),
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
         )
         .await
         .is_err()
@@ -1163,7 +1258,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         session_b,
         target_id,
         client_b_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open second duplicate endpoint session");
@@ -1179,7 +1274,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         .sign(&identity::agent_session_identity_payload(
             session_b,
             target_id,
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
             &data_key.public(),
             expiry_b,
         ))
@@ -1191,7 +1286,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         connection_id,
         ControlMessage::AgentIdentity {
             session_id: session_b,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             target_data_endpoint_id: data_key.public().to_string(),
             signature: signature_b,
         },
@@ -1251,7 +1346,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         session_id,
         target_id,
         client_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateDirect,
     )
     .await
     .expect("open measured punch session");
@@ -1268,7 +1363,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         .sign(&identity::agent_session_identity_payload(
             session_id,
             target_id,
-            RelayMode::Private,
+            RouteMode::PrivateDirect,
             &data_key.public(),
             expires_at,
         ))
@@ -1280,7 +1375,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         connection_id,
         ControlMessage::AgentIdentity {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             target_data_endpoint_id: data_key.public().to_string(),
             signature,
         },
@@ -1364,7 +1459,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         connection_id,
         ControlMessage::CandidatesReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             discovery: target_discovery,
         },
     )
@@ -1375,7 +1470,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         &client_sender,
         ControlMessage::CandidatesReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             discovery: client_discovery,
         },
     )
@@ -1415,7 +1510,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         connection_id,
         ControlMessage::PunchReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             socket_count: 257,
         },
     )
@@ -1426,7 +1521,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         &client_sender,
         ControlMessage::PunchReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             socket_count: 1,
         },
     )
@@ -1453,7 +1548,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         connection_id,
         ControlMessage::PunchSelected {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             index: 7,
             local_socket: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 41001),
             peer_observed_addr: target_peer_observed,
@@ -1466,7 +1561,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         &client_sender,
         ControlMessage::PunchSelected {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             index: 7,
             local_socket: client_local,
             peer_observed_addr: SocketAddrV4::new(target_ip, 2110),
@@ -1544,7 +1639,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
         connection_id,
         ControlMessage::PunchSelected {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             index: 0,
             local_socket: target_local,
             peer_observed_addr: client_mapping,
@@ -1557,7 +1652,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
         &client_sender,
         ControlMessage::PunchSelected {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             index: 0,
             local_socket: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, client_local.port() + 1),
             peer_observed_addr: SocketAddrV4::new(target_ip, 2110),
@@ -1600,7 +1695,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
         connection_id,
         ControlMessage::PunchSelected {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             index: 257,
             local_socket: target_local,
             peer_observed_addr: client_mapping,
@@ -1643,7 +1738,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
         connection_id,
         ControlMessage::PunchSelected {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             index: 7,
             local_socket: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, target_local.port() + 1),
             peer_observed_addr: client_mapping,
@@ -1656,7 +1751,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
         &client_sender,
         ControlMessage::PunchSelected {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateDirect,
             index: 8,
             local_socket: client_local,
             peer_observed_addr: SocketAddrV4::new(target_ip, 2110),
@@ -1698,20 +1793,20 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         denied_session_id,
         target_id,
         denied_client_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open pending SSH session");
     assert!(matches!(
         target_receiver.recv().await.expect("target preparation"),
-        ControlMessage::Prepare { session_id: id, relay_mode: RelayMode::Private, .. } if id == denied_session_id
+        ControlMessage::Prepare { session_id: id, route_mode: RouteMode::PrivateRelay, .. } if id == denied_session_id
     ));
     let _denied_data_key = send_agent_ready_for_session(
         state,
         target_id,
         target_connection_id,
         denied_session_id,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &target_secret,
         &mut target_receiver,
     )
@@ -1726,7 +1821,7 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
             &mut target_receiver,
             denied_session_id,
             &denied_client_key,
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
             relay_url.clone(),
         )
         .await;
@@ -1751,14 +1846,14 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         Access::Allow
     );
     revoke_target(state, target_id).await;
-    control::activate_tunnel(
+    send_agent_iroh_ready_for_session(
         state,
         target_id,
         target_connection_id,
         denied_session_id,
         denied_client_key.public().to_string(),
         denied_target_data_endpoint_id,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await;
     let denied_status: String =
@@ -1793,20 +1888,20 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         active_session_id,
         target_id,
         active_client_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open second pending SSH session");
     assert!(matches!(
         target_receiver.recv().await.expect("second target preparation"),
-        ControlMessage::Prepare { session_id: id, relay_mode: RelayMode::Private, .. } if id == active_session_id
+        ControlMessage::Prepare { session_id: id, route_mode: RouteMode::PrivateRelay, .. } if id == active_session_id
     ));
     let _active_data_key = send_agent_ready_for_session(
         state,
         target_id,
         target_connection_id,
         active_session_id,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &target_secret,
         &mut target_receiver,
     )
@@ -1817,18 +1912,18 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         &mut target_receiver,
         active_session_id,
         &active_client_key,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         relay_url,
     )
     .await;
-    control::activate_tunnel(
+    send_agent_iroh_ready_for_session(
         state,
         target_id,
         target_connection_id,
         active_session_id,
         active_client_key.public().to_string(),
         active_target_data_endpoint_id.clone(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await;
     let active_status: String =
@@ -1894,7 +1989,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         pending_a,
         target_id,
         pending_a_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open sender A pending tunnel");
@@ -1912,7 +2007,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         active_a,
         target_id,
         active_a_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open sender A active tunnel");
@@ -1925,7 +2020,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         target_id,
         target_connection_id,
         active_a,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &target_secret,
         &mut target_receiver,
     )
@@ -1936,7 +2031,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         &mut target_receiver,
         active_a,
         &active_a_key,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         private_relay_url.clone(),
     )
     .await;
@@ -1944,7 +2039,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         session_id: active_a,
         client_endpoint_id: active_a_key.public().to_string(),
         target_data_endpoint_id: active_target_data_endpoint_id.clone(),
-        relay_mode: RelayMode::Private,
+        route_mode: RouteMode::PrivateRelay,
     };
     control::handle_client_message(state, user, &sender_a, iroh_ready.clone()).await;
     assert!(matches!(
@@ -1980,7 +2075,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         pending_b_one,
         target_id,
         pending_b_one_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open sender B first pending tunnel");
@@ -1993,7 +2088,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         target_id,
         target_connection_id,
         pending_b_one,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &target_secret,
         &mut target_receiver,
     )
@@ -2004,7 +2099,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         &mut target_receiver,
         pending_b_one,
         &pending_b_one_key,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         private_relay_url.clone(),
     )
     .await;
@@ -2018,7 +2113,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         pending_b_two,
         target_id,
         pending_b_two_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open sender B second pending tunnel");
@@ -2031,7 +2126,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         target_id,
         target_connection_id,
         pending_b_two,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &target_secret,
         &mut target_receiver,
     )
@@ -2042,7 +2137,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         &mut target_receiver,
         pending_b_two,
         &pending_b_two_key,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         private_relay_url.clone(),
     )
     .await;
@@ -2110,24 +2205,24 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     assert_eq!(pending_b_one_status, "pending");
     assert_eq!(pending_b_two_status, "pending");
 
-    control::activate_tunnel(
+    send_agent_iroh_ready_for_session(
         state,
         target_id,
         target_connection_id,
         pending_b_one,
         pending_b_one_key.public().to_string(),
         pending_b_one_target_data_endpoint_id,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await;
-    control::activate_tunnel(
+    send_agent_iroh_ready_for_session(
         state,
         target_id,
         target_connection_id,
         pending_b_two,
         pending_b_two_key.public().to_string(),
         pending_b_two_target_data_endpoint_id,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await;
     assert!(matches!(
@@ -2180,7 +2275,7 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
         pending_session,
         target_id,
         pending_client_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open pending session");
@@ -2199,7 +2294,7 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
         active_session,
         target_id,
         active_client_key.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open active session");
@@ -2212,7 +2307,7 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
         target_id,
         connection_id,
         active_session,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &device_key,
         &mut target_receiver,
     )
@@ -2223,18 +2318,18 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
         &mut target_receiver,
         active_session,
         &active_client_key,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         relay_url,
     )
     .await;
-    control::activate_tunnel(
+    send_agent_iroh_ready_for_session(
         state,
         target_id,
         connection_id,
         active_session,
         active_client_key.public().to_string(),
         active_target_data_endpoint_id.clone(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await;
     assert!(matches!(
@@ -2314,11 +2409,6 @@ async fn public_default_mode_works_without_a_private_relay() {
     let (target_id, _) = create_enrolled_target(state, "public-mode-target", &target_secret).await;
     grant_target(state, target_id).await;
 
-    let relay_url = crate::transport::allowed_relay_urls(&RelayChoice::PublicDefault)
-        .expect("load SDK default relay allowlist")
-        .into_iter()
-        .next()
-        .expect("SDK default relay set is nonempty");
     let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
     let (client_sender, mut client_receiver) = mpsc::channel(16);
     let client_secret = SecretKey::generate();
@@ -2332,7 +2422,7 @@ async fn public_default_mode_works_without_a_private_relay() {
             Uuid::new_v4(),
             target_id,
             client_secret.public().to_string(),
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
         )
         .await
         .is_err()
@@ -2344,13 +2434,13 @@ async fn public_default_mode_works_without_a_private_relay() {
         session_id,
         target_id,
         client_secret.public().to_string(),
-        RelayMode::PublicDefault,
+        RouteMode::PublicDirect,
     )
     .await
     .expect("public mode remains available without a private relay");
     assert!(matches!(
         target_receiver.recv().await.expect("target preparation"),
-        ControlMessage::Prepare { session_id: received, relay_mode: RelayMode::PublicDefault, .. }
+        ControlMessage::Prepare { session_id: received, route_mode: RouteMode::PublicDirect, .. }
             if received == session_id
     ));
     let data_key = send_agent_ready_for_session(
@@ -2358,7 +2448,7 @@ async fn public_default_mode_works_without_a_private_relay() {
         target_id,
         target_connection_id,
         session_id,
-        RelayMode::PublicDefault,
+        RouteMode::PublicDirect,
         &target_secret,
         &mut target_receiver,
     )
@@ -2366,7 +2456,7 @@ async fn public_default_mode_works_without_a_private_relay() {
     let ControlMessage::ClientOffer {
         ticket,
         target_endpoint_id,
-        relay_mode: RelayMode::PublicDefault,
+        route_mode: RouteMode::PublicDirect,
         ..
     } = client_receiver.recv().await.expect("client offer")
     else {
@@ -2379,13 +2469,13 @@ async fn public_default_mode_works_without_a_private_relay() {
         &state.inner.issuer,
     )
     .expect("decode public-mode ticket");
-    assert_eq!(claims.relay_mode, RelayMode::PublicDefault);
+    assert_eq!(claims.route_mode, RouteMode::PublicDirect);
     assert_eq!(claims.target_endpoint_id, data_key.public().to_string());
     assert!(matches!(
         client_receiver.recv().await.expect("public native transport plan"),
         ControlMessage::ContinueNative {
             session_id: id,
-            relay_mode: RelayMode::PublicDefault,
+            route_mode: RouteMode::PublicDirect,
             plan: NativePlan::Standard,
         } if id == session_id
     ));
@@ -2395,16 +2485,175 @@ async fn public_default_mode_works_without_a_private_relay() {
         &client_sender,
         ControlMessage::ClientReady {
             session_id,
-            relay_mode: RelayMode::PublicDefault,
+            route_mode: RouteMode::PublicDirect,
             client_endpoint_addr: EndpointAddr::new(client_secret.public())
-                .with_relay_url(relay_url),
+                .with_ip_addr(SocketAddr::from(([198, 51, 100, 20], 32000))),
         },
     )
     .await;
     assert!(matches!(
         target_receiver.recv().await.expect("target dial offer"),
-        ControlMessage::DialOffer { session_id: received, relay_mode: RelayMode::PublicDefault, .. }
+        ControlMessage::DialOffer { session_id: received, route_mode: RouteMode::PublicDirect, .. }
             if received == session_id
+    ));
+    control::handle_client_message(
+        state,
+        user,
+        &client_sender,
+        ControlMessage::PathReady {
+            session_id,
+            route_mode: RouteMode::PublicDirect,
+            path: SelectedPath::Direct {
+                remote_address: SocketAddr::from(([203, 0, 113, 10], 41000)),
+            },
+        },
+    )
+    .await;
+    send_agent_iroh_ready_for_session(
+        state,
+        target_id,
+        target_connection_id,
+        session_id,
+        client_secret.public().to_string(),
+        data_key.public().to_string(),
+        RouteMode::PublicDirect,
+    )
+    .await;
+    let status: String = sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+        .bind(session_id.to_string())
+        .fetch_one(&state.inner.db.pool)
+        .await
+        .expect("read route-gated public session status");
+    assert_eq!(status, "pending");
+    control::handle_agent_message(
+        state,
+        target_id,
+        target_connection_id,
+        ControlMessage::PathReady {
+            session_id,
+            route_mode: RouteMode::PublicDirect,
+            path: SelectedPath::Direct {
+                remote_address: SocketAddr::from(([198, 51, 100, 20], 32000)),
+            },
+        },
+    )
+    .await;
+    assert!(matches!(
+        client_receiver.recv().await.expect("public direct activation"),
+        ControlMessage::Activated { session_id: received } if received == session_id
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("target public direct activation"),
+        ControlMessage::Activated { session_id: received } if received == session_id
+    ));
+}
+
+#[tokio::test]
+async fn public_direct_attempt_rejects_a_relay_data_path() {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    let login = login_password(state).await;
+    let user = auth::authenticate(state, &bearer(&login.access_token))
+        .await
+        .expect("authenticate public direct test user");
+    let device_key = SecretKey::generate();
+    let (target_id, _) = create_enrolled_target(state, "public-direct-target", &device_key).await;
+    grant_target(state, target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    let (client_sender, mut client_receiver) = mpsc::channel(16);
+    let client_key = SecretKey::generate();
+    let session_id = Uuid::new_v4();
+    control::open_tunnel(
+        state,
+        user,
+        &client_sender,
+        session_id,
+        target_id,
+        client_key.public().to_string(),
+        RouteMode::PublicDirect,
+    )
+    .await
+    .expect("open public direct attempt");
+    assert!(matches!(
+        target_receiver.recv().await.expect("target preparation"),
+        ControlMessage::Prepare { session_id: received, .. } if received == session_id
+    ));
+    let target_data_key = send_agent_ready_for_session(
+        state,
+        target_id,
+        connection_id,
+        session_id,
+        RouteMode::PublicDirect,
+        &device_key,
+        &mut target_receiver,
+    )
+    .await;
+    let ControlMessage::ClientOffer {
+        session_id: offered,
+        ..
+    } = client_receiver.recv().await.expect("client offer")
+    else {
+        panic!("client received another message instead of ClientOffer");
+    };
+    assert_eq!(offered, session_id);
+    assert!(matches!(
+        client_receiver.recv().await.expect("public direct plan"),
+        ControlMessage::ContinueNative {
+            session_id: planned,
+            route_mode: RouteMode::PublicDirect,
+            plan: NativePlan::Standard,
+        } if planned == session_id
+    ));
+    control::handle_client_message(
+        state,
+        user,
+        &client_sender,
+        ControlMessage::ClientReady {
+            session_id,
+            route_mode: RouteMode::PublicDirect,
+            client_endpoint_addr: EndpointAddr::new(client_key.public())
+                .with_ip_addr(SocketAddr::from(([198, 51, 100, 20], 32000))),
+        },
+    )
+    .await;
+    assert!(matches!(
+        target_receiver.recv().await.expect("target dial offer"),
+        ControlMessage::DialOffer { session_id: offered, .. } if offered == session_id
+    ));
+    control::handle_client_message(
+        state,
+        user,
+        &client_sender,
+        ControlMessage::PathReady {
+            session_id,
+            route_mode: RouteMode::PublicDirect,
+            path: SelectedPath::PrivateRelay {
+                url: "https://kmesh.test/".to_owned(),
+            },
+        },
+    )
+    .await;
+    let status: String = sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+        .bind(session_id.to_string())
+        .fetch_one(&state.inner.db.pool)
+        .await
+        .expect("read rejected public relay session");
+    assert_eq!(status, "closed");
+    assert!(matches!(
+        client_receiver.recv().await.expect("client path rejection"),
+        ControlMessage::Error { session_id: Some(received), code, .. }
+            if received == session_id && code == "client_path_rejected"
+    ));
+    assert!(matches!(
+        target_receiver.recv().await.expect("target path rejection"),
+        ControlMessage::Error { session_id: Some(received), code, .. }
+            if received == session_id && code == "client_path_rejected"
+    ));
+    assert!(matches!(
+        state
+            .on_connect(&endpoint_connect_request(target_data_key.public()))
+            .await,
+        Access::Deny { .. }
     ));
 }
 
@@ -2431,7 +2680,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         session_id,
         target_id,
         client_secret.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open SSH session for ClientReady ownership test");
@@ -2444,7 +2693,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         target_id,
         target_connection_id,
         session_id,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &target_secret,
         &mut target_receiver,
     )
@@ -2460,7 +2709,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         client_receiver.recv().await.expect("client native plan"),
         ControlMessage::ContinueNative {
             session_id: id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             plan: NativePlan::Standard,
         } if id == session_id
     ));
@@ -2475,7 +2724,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         &other_sender,
         ControlMessage::ClientReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             client_endpoint_addr: candidate.clone(),
         },
     )
@@ -2503,7 +2752,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         &client_sender,
         ControlMessage::ClientReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             client_endpoint_addr: EndpointAddr::new(wrong_endpoint.public())
                 .with_relay_url(private_relay),
         },
@@ -2535,7 +2784,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         mode_session,
         target_id,
         mode_client_secret.public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("open SSH session for relay-mode rejection test");
@@ -2548,7 +2797,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         target_id,
         target_connection_id,
         mode_session,
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
         &target_secret,
         &mut target_receiver,
     )
@@ -2561,7 +2810,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         client_receiver.recv().await.expect("client native plan"),
         ControlMessage::ContinueNative {
             session_id: id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             plan: NativePlan::Standard,
         } if id == mode_session
     ));
@@ -2573,7 +2822,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
             session_id: mode_session,
             client_endpoint_id: mode_client_secret.public().to_string(),
             target_data_endpoint_id: mode_data_key.public().to_string(),
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
         },
     )
     .await;
@@ -2587,7 +2836,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
         &client_sender,
         ControlMessage::ClientReady {
             session_id: mode_session,
-            relay_mode: RelayMode::PublicDefault,
+            route_mode: RouteMode::PublicDirect,
             client_endpoint_addr: EndpointAddr::new(mode_client_secret.public())
                 .with_relay_url(reqwest::Url::parse(&state.inner.issuer).unwrap().into()),
         },
@@ -2701,7 +2950,7 @@ async fn rotated_refresh_replay_revokes_the_session() {
 }
 
 #[tokio::test]
-async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
+async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together() {
     let port_probe = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("reserve HTTPS test port");
@@ -2771,7 +3020,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         .into();
     let relay_choice = RelayChoice::Private {
         url: reqwest::Url::parse(&issuer).expect("parse private relay URL"),
-        qad_port: relay_server.qad_addr().port(),
+        quic_port: relay_server.qad_addr().port(),
     };
     let endpoint_options = IrohEndpointOptions {
         relay_choice: relay_choice.clone(),
@@ -2791,7 +3040,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
             session_id,
             target_id,
             client_endpoint_id: client_secret.public().to_string(),
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
         },
     )
     .await;
@@ -2799,7 +3048,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         session_id: prepared_session_id,
         client_endpoint_id: prepared_client_endpoint_id,
         expires_at,
-        relay_mode: RelayMode::Private,
+        route_mode: RouteMode::PrivateRelay,
     } = timeout(Duration::from_secs(10), receive_control(&mut agent_control))
         .await
         .expect("timed out waiting for target prepare")
@@ -2817,7 +3066,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         .sign(&identity::agent_session_identity_payload(
             session_id,
             target_id,
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
             &target_data_secret.public(),
             expires_at,
         ))
@@ -2827,7 +3076,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         &mut agent_control,
         &ControlMessage::AgentIdentity {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             target_data_endpoint_id: target_data_endpoint_id.clone(),
             signature: identity_signature,
         },
@@ -2837,7 +3086,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         timeout(Duration::from_secs(10), receive_control(&mut agent_control))
             .await
             .expect("target identity acceptance timed out"),
-        ControlMessage::IdentityAccepted { session_id: received, relay_mode: RelayMode::Private }
+        ControlMessage::IdentityAccepted { session_id: received, route_mode: RouteMode::PrivateRelay }
             if received == session_id
     ));
     let ControlMessage::ClientOffer {
@@ -2847,7 +3096,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         client_endpoint_id,
         target_endpoint_id,
         ticket_public_key_pem,
-        relay_mode: RelayMode::Private,
+        route_mode: RouteMode::PrivateRelay,
         ..
     } = timeout(
         Duration::from_secs(10),
@@ -2867,28 +3116,6 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     assert_eq!(claims.client_endpoint_id, client_endpoint_id);
     assert_eq!(claims.target_endpoint_id, target_data_endpoint_id);
 
-    send_control(
-        &mut agent_control,
-        &ControlMessage::CandidatesReady {
-            session_id,
-            relay_mode: RelayMode::Private,
-            discovery: DiscoveryResult::Unavailable {
-                reason: "self-hosted stream test uses native transport".to_owned(),
-            },
-        },
-    )
-    .await;
-    send_control(
-        &mut client_control,
-        &ControlMessage::CandidatesReady {
-            session_id,
-            relay_mode: RelayMode::Private,
-            discovery: DiscoveryResult::Unavailable {
-                reason: "self-hosted stream test uses native transport".to_owned(),
-            },
-        },
-    )
-    .await;
     for control in [&mut agent_control, &mut client_control] {
         assert!(matches!(
             timeout(Duration::from_secs(10), receive_control(control))
@@ -2896,7 +3123,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
                 .expect("native transport plan timed out"),
             ControlMessage::ContinueNative {
                 session_id: received,
-                relay_mode: RelayMode::Private,
+                route_mode: RouteMode::PrivateRelay,
                 plan: NativePlan::Standard,
             } if received == session_id
         ));
@@ -2908,24 +3135,12 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     timeout(Duration::from_secs(15), target_endpoint.online())
         .await
         .expect("target did not connect to the private relay");
-    let report = timeout(
-        Duration::from_secs(15),
-        target_endpoint.net_report().initialized(),
-    )
-    .await
-    .expect("target QAD network report timed out");
-    assert!(
-        report.udp_v4,
-        "target QAD did not complete an IPv4 round trip"
-    );
-    assert!(report.global_v4.is_some(), "target QAD did not report IPv4");
-    assert_eq!(report.preferred_relay.as_ref(), Some(&relay_url));
     assert_eq!(target_endpoint.id().to_string(), target_data_endpoint_id);
     send_control(
         &mut agent_control,
         &ControlMessage::AgentReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             endpoint_addr: EndpointAddr::new(target_endpoint.id())
                 .with_relay_url(relay_url.clone()),
         },
@@ -2938,12 +3153,6 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     timeout(Duration::from_secs(15), client_endpoint.online())
         .await
         .expect("client did not connect to the private relay");
-    timeout(
-        Duration::from_secs(15),
-        client_endpoint.net_report().initialized(),
-    )
-    .await
-    .expect("client QAD network report timed out");
     let client_endpoint_addr =
         EndpointAddr::new(client_endpoint.id()).with_relay_url(relay_url.clone());
     let client_accept = {
@@ -2954,7 +3163,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         &mut client_control,
         &ControlMessage::ClientReady {
             session_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
             client_endpoint_addr: client_endpoint_addr.clone(),
         },
     )
@@ -2966,7 +3175,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         client_endpoint_id: dial_client_endpoint_id,
         client_endpoint_addr: dial_client_endpoint_addr,
         ticket_public_key_pem: dial_ticket_public_key,
-        relay_mode: RelayMode::Private,
+        route_mode: RouteMode::PrivateRelay,
     } = timeout(Duration::from_secs(10), receive_control(&mut agent_control))
         .await
         .expect("timed out waiting for target dial offer")
@@ -2991,6 +3200,26 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     .await
     .expect("Iroh peer connection timed out")
     .expect("target connects through the self-hosted relay");
+    let selected_target_path = timeout(
+        Duration::from_secs(10),
+        wait_for_selected_path(
+            &connection,
+            RouteMode::PrivateRelay,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        ),
+    )
+    .await
+    .expect("target did not select the configured private relay")
+    .expect("read target selected path");
+    send_control(
+        &mut agent_control,
+        &ControlMessage::PathReady {
+            session_id,
+            route_mode: RouteMode::PrivateRelay,
+            path: selected_target_path,
+        },
+    )
+    .await;
     let mut target_stream = IrohByteStream::open_bi(connection)
         .await
         .expect("target opens SSH stream");
@@ -3008,6 +3237,26 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         .expect("client did not accept target endpoint")
         .expect("target accept task panicked")
         .expect("accept Iroh peer");
+    let selected_client_path = timeout(
+        Duration::from_secs(10),
+        wait_for_selected_path(
+            &accepted,
+            RouteMode::PrivateRelay,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        ),
+    )
+    .await
+    .expect("client did not select the configured private relay")
+    .expect("read client selected path");
+    send_control(
+        &mut client_control,
+        &ControlMessage::PathReady {
+            session_id,
+            route_mode: RouteMode::PrivateRelay,
+            path: selected_client_path,
+        },
+    )
+    .await;
     assert_eq!(
         accepted.remote_id().to_string(),
         target_endpoint.id().to_string()
@@ -3035,7 +3284,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
             session_id,
             client_endpoint_id,
             target_data_endpoint_id,
-            relay_mode: RelayMode::Private,
+            route_mode: RouteMode::PrivateRelay,
         },
     )
     .await;
