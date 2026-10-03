@@ -1,4 +1,4 @@
-use crate::protocol::{AccessTokenClaims, TunnelTicketClaims};
+use crate::protocol::{AccessTokenClaims, RelayMode, TunnelTicketClaims};
 use anyhow::{Context, Result};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rcgen::{KeyPair, PKCS_ED25519};
@@ -89,6 +89,58 @@ pub fn decode_tunnel_ticket(
     )
 }
 
+/// Canonical bytes the enrolled target identity signs before the server registers a per-session
+/// Iroh data endpoint. The persistent endpoint key proves which device authorized this identity;
+/// the data endpoint key remains session-scoped.
+pub fn agent_session_identity_payload(
+    session_id: uuid::Uuid,
+    target_id: uuid::Uuid,
+    relay_mode: RelayMode,
+    target_data_endpoint_id: &iroh::EndpointId,
+    expires_at: i64,
+) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"kmesh/agent-session-identity/1\0";
+    let mut payload = Vec::with_capacity(DOMAIN.len() + 16 + 16 + 1 + 32 + 8);
+    payload.extend_from_slice(DOMAIN);
+    payload.extend_from_slice(session_id.as_bytes());
+    payload.extend_from_slice(target_id.as_bytes());
+    payload.push(match relay_mode {
+        RelayMode::Private => 1,
+        RelayMode::PublicDefault => 2,
+    });
+    payload.extend_from_slice(target_data_endpoint_id.as_bytes());
+    payload.extend_from_slice(&expires_at.to_be_bytes());
+    payload
+}
+
+pub fn verify_agent_session_identity(
+    stable_device_endpoint_id: &str,
+    session_id: uuid::Uuid,
+    target_id: uuid::Uuid,
+    relay_mode: RelayMode,
+    target_data_endpoint_id: &str,
+    expires_at: i64,
+    signature: &[u8],
+) -> Result<()> {
+    let stable_device_endpoint_id = stable_device_endpoint_id
+        .parse::<iroh::EndpointId>()
+        .context("parse enrolled device EndpointId")?;
+    let target_data_endpoint_id = target_data_endpoint_id
+        .parse::<iroh::EndpointId>()
+        .context("parse per-session target EndpointId")?;
+    let signature = iroh::Signature::try_from(signature).context("parse device signature")?;
+    let payload = agent_session_identity_payload(
+        session_id,
+        target_id,
+        relay_mode,
+        &target_data_endpoint_id,
+        expires_at,
+    );
+    stable_device_endpoint_id
+        .verify(&payload, &signature)
+        .context("verify per-session endpoint identity with enrolled device key")
+}
+
 fn decode_claims<T: DeserializeOwned>(
     token: &str,
     public_key_pem: &str,
@@ -106,4 +158,100 @@ fn decode_claims<T: DeserializeOwned>(
     decode::<T>(token, &key, &validation)
         .map(|data| data.claims)
         .context("verify Ed25519 JWT")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_session_identity_is_bound_to_device_session_target_mode_endpoint_and_expiry() {
+        let device_key = iroh::SecretKey::generate();
+        let data_key = iroh::SecretKey::generate();
+        let session_id = uuid::Uuid::new_v4();
+        let target_id = uuid::Uuid::new_v4();
+        let expires_at = 1_800_000_000;
+        let signature = device_key
+            .sign(&agent_session_identity_payload(
+                session_id,
+                target_id,
+                RelayMode::Private,
+                &data_key.public(),
+                expires_at,
+            ))
+            .to_bytes();
+
+        verify_agent_session_identity(
+            &device_key.public().to_string(),
+            session_id,
+            target_id,
+            RelayMode::Private,
+            &data_key.public().to_string(),
+            expires_at,
+            &signature,
+        )
+        .expect("valid per-session identity signature");
+        assert!(
+            verify_agent_session_identity(
+                &device_key.public().to_string(),
+                uuid::Uuid::new_v4(),
+                target_id,
+                RelayMode::Private,
+                &data_key.public().to_string(),
+                expires_at,
+                &signature,
+            )
+            .is_err()
+        );
+        let other_device_key = iroh::SecretKey::generate();
+        assert!(
+            verify_agent_session_identity(
+                &other_device_key.public().to_string(),
+                session_id,
+                target_id,
+                RelayMode::Private,
+                &data_key.public().to_string(),
+                expires_at,
+                &signature,
+            )
+            .is_err()
+        );
+        let other_data_key = iroh::SecretKey::generate();
+        assert!(
+            verify_agent_session_identity(
+                &device_key.public().to_string(),
+                session_id,
+                target_id,
+                RelayMode::Private,
+                &other_data_key.public().to_string(),
+                expires_at,
+                &signature,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_agent_session_identity(
+                &device_key.public().to_string(),
+                session_id,
+                target_id,
+                RelayMode::PublicDefault,
+                &data_key.public().to_string(),
+                expires_at,
+                &signature,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_agent_session_identity(
+                &device_key.public().to_string(),
+                session_id,
+                target_id,
+                RelayMode::Private,
+                &data_key.public().to_string(),
+                expires_at + 1,
+                &signature,
+            )
+            .is_err()
+        );
+    }
 }

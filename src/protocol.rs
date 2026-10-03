@@ -1,3 +1,5 @@
+use std::net::SocketAddrV4;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -241,12 +243,61 @@ pub struct TunnelTicketClaims {
     pub login_session_id: Uuid,
     pub target_id: Uuid,
     pub client_endpoint_id: String,
+    /// This ticket's target data-plane EndpointId, scoped to `session_id`.
     pub target_endpoint_id: String,
     pub relay_mode: RelayMode,
     pub iss: String,
     pub aud: String,
     pub iat: u64,
     pub exp: u64,
+}
+
+/// QAD results collected on the same IPv4 socket that the subsequent punch uses.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadyDiscovery {
+    /// Bound IPv4 socket used to obtain every observation in this result.
+    pub local_socket: SocketAddrV4,
+    /// Authenticated mappings reported for that same socket.
+    pub observations: Vec<crate::transport::QadObservation>,
+}
+
+/// Address discovery may fail because of the current network; that is a transport result,
+/// separate from ticket or identity errors.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DiscoveryResult {
+    Ready {
+        local_socket: SocketAddrV4,
+        observations: Vec<crate::transport::QadObservation>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl DiscoveryResult {
+    pub fn ready(&self) -> Option<ReadyDiscovery> {
+        match self {
+            Self::Ready {
+                local_socket,
+                observations,
+            } => Some(ReadyDiscovery {
+                local_socket: *local_socket,
+                observations: observations.clone(),
+            }),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum NativePlan {
+    Standard,
+    Handoff {
+        self_observed_addr: SocketAddrV4,
+        peer_observed_addr: SocketAddrV4,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -270,9 +321,59 @@ pub enum ControlMessage {
     Prepare {
         session_id: Uuid,
         relay_mode: RelayMode,
+        client_endpoint_id: String,
+        expires_at: i64,
+    },
+    AgentIdentity {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+        target_data_endpoint_id: String,
+        signature: Vec<u8>,
+    },
+    IdentityAccepted {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+    },
+    CandidatesReady {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+        discovery: DiscoveryResult,
+    },
+    PunchPair {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+        target_endpoint_id: String,
+        client_endpoint_id: String,
+        peer_discovery: ReadyDiscovery,
+    },
+    PunchReady {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+        socket_count: u16,
+    },
+    StartPunch {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+    },
+    PunchSelected {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+        index: u16,
+        local_socket: SocketAddrV4,
+        peer_observed_addr: SocketAddrV4,
+    },
+    PunchFailed {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+        reason: String,
+    },
+    ContinueNative {
+        session_id: Uuid,
+        relay_mode: RelayMode,
+        plan: NativePlan,
     },
     AgentReady {
-        session_id: Option<Uuid>,
+        session_id: Uuid,
         relay_mode: RelayMode,
         endpoint_addr: iroh::EndpointAddr,
     },
@@ -293,6 +394,7 @@ pub enum ControlMessage {
     IrohReady {
         session_id: Uuid,
         client_endpoint_id: String,
+        target_data_endpoint_id: String,
         relay_mode: RelayMode,
     },
     Activated {
