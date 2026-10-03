@@ -101,6 +101,8 @@ struct PeerReady {
     endpoint_addr: EndpointAddr,
     #[serde(default)]
     receiver_self_observed_candidates: Vec<SocketAddr>,
+    #[serde(default)]
+    receiver_self_predicted_candidates: Vec<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -453,14 +455,70 @@ async fn run() -> Result<()> {
             own_candidates.contains(&SocketAddr::V4(global_v4)),
             "own QAD observations omit the B QAD primary address"
         );
+        let mut own_predicted_port_candidates = Vec::new();
+        for candidate in peer.receiver_self_predicted_candidates.iter().copied() {
+            ensure!(
+                args.role == Role::Target,
+                "only A may use the bounded predicted-port-candidate experiment"
+            );
+            ensure!(candidate.is_ipv4(), "predicted port candidate must be IPv4");
+            ensure!(
+                candidate.ip() == IpAddr::V4(*global_v4.ip()),
+                "predicted port candidate public IP differs from the B QAD address"
+            );
+            if !own_predicted_port_candidates.contains(&candidate) {
+                own_predicted_port_candidates.push(candidate);
+            }
+        }
+        if !own_predicted_port_candidates.is_empty() {
+            ensure!(
+                args.role == Role::Target,
+                "only A may use the bounded predicted-port-candidate experiment"
+            );
+            let mut expected_predictions = Vec::new();
+            for candidate in &own_candidates {
+                let SocketAddr::V4(candidate) = candidate else {
+                    bail!("own QAD observation must be IPv4");
+                };
+                let next_port = candidate
+                    .port()
+                    .checked_add(1)
+                    .context("own observed QAD port cannot be incremented")?;
+                let prediction = SocketAddr::V4(SocketAddrV4::new(*candidate.ip(), next_port));
+                if !expected_predictions.contains(&prediction) {
+                    expected_predictions.push(prediction);
+                }
+            }
+            ensure!(
+                expected_predictions.len() <= 2,
+                "the bounded A mapping experiment predicts at most two port candidates"
+            );
+            ensure!(
+                own_predicted_port_candidates
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    == expected_predictions
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>(),
+                "A predicted port candidates must equal this run's observed IPv4 ports plus one"
+            );
+        }
+        let mut published_candidates = own_candidates.clone();
+        for candidate in own_predicted_port_candidates.iter().copied() {
+            if !published_candidates.contains(&candidate) {
+                published_candidates.push(candidate);
+            }
+        }
         let endpoint_addr_before = endpoint.addr();
-        for candidate in own_candidates.iter().copied() {
+        for candidate in published_candidates.iter().copied() {
             endpoint.add_external_addr(candidate).await;
         }
         let mut address_watcher = endpoint.watch_addr();
         loop {
             let current = address_watcher.get();
-            if own_candidates
+            if published_candidates
                 .iter()
                 .all(|candidate| current.ip_addrs().any(|published| published == candidate))
             {
@@ -488,6 +546,8 @@ async fn run() -> Result<()> {
             "actual_home_relay_url": actual_home_relay_url,
             "b_relay_connected": b_relay_connected,
             "receiver_self_observed_candidates": own_candidates,
+            "receiver_self_predicted_port_candidates": own_predicted_port_candidates,
+            "published_candidates": published_candidates,
             "endpoint_addr_before": endpoint_addr_before,
             "endpoint_addr_after": endpoint_addr_after
         }))?;
