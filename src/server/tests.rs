@@ -284,16 +284,28 @@ async fn send_agent_ready_for_session(
 
 async fn exchange_test_client_candidates(
     state: &ServerState,
-    user: super::auth::AuthenticatedUser,
-    client_sender: &mpsc::Sender<ControlMessage>,
     client_receiver: &mut mpsc::Receiver<ControlMessage>,
     target_receiver: &mut mpsc::Receiver<ControlMessage>,
-    target_id: Uuid,
     session_id: Uuid,
     client_secret: &SecretKey,
     relay_mode: RelayMode,
     relay_url: RelayUrl,
 ) -> (ControlMessage, ControlMessage) {
+    let runtime = state
+        .inner
+        .tunnels
+        .read()
+        .await
+        .get(&session_id)
+        .cloned()
+        .expect("session is registered");
+    let user = super::auth::AuthenticatedUser {
+        user_id: runtime.user_id,
+        session_id: runtime.auth_session_id,
+        access_expires_at: runtime.access_expires_at,
+    };
+    let client_sender = runtime.client_sender.clone();
+    let target_id = runtime.target_id;
     let client_offer = client_receiver
         .recv()
         .await
@@ -326,7 +338,7 @@ async fn exchange_test_client_candidates(
     control::send_dial_offer(
         state,
         user,
-        client_sender,
+        &client_sender,
         session_id,
         relay_mode,
         client_endpoint_addr.clone(),
@@ -354,48 +366,6 @@ async fn exchange_test_client_candidates(
     assert_eq!(dial_client_addr, &client_endpoint_addr);
     assert_eq!(*dial_mode, relay_mode);
     (client_offer, dial_offer)
-}
-
-async fn open_reverse_session(
-    state: &ServerState,
-    user: super::auth::AuthenticatedUser,
-    client_sender: &mpsc::Sender<ControlMessage>,
-    client_receiver: &mut mpsc::Receiver<ControlMessage>,
-    target_receiver: &mut mpsc::Receiver<ControlMessage>,
-    target_id: Uuid,
-    target_connection_id: Uuid,
-    session_id: Uuid,
-    client_secret: &SecretKey,
-    relay_mode: RelayMode,
-) -> ControlMessage {
-    control::open_tunnel(
-        state,
-        user,
-        client_sender,
-        session_id,
-        target_id,
-        client_secret.public().to_string(),
-        relay_mode,
-    )
-    .await
-    .expect("open reverse-direction SSH session");
-    assert!(matches!(
-        target_receiver.recv().await.expect("target preparation"),
-        ControlMessage::Prepare { session_id: received, relay_mode: received_mode }
-            if received == session_id && received_mode == relay_mode
-    ));
-    send_agent_ready_for_session(
-        state,
-        target_id,
-        target_connection_id,
-        session_id,
-        relay_mode,
-    )
-    .await;
-    client_receiver
-        .recv()
-        .await
-        .expect("client receives endpoint offer")
 }
 
 fn endpoint_connect_request(endpoint_id: iroh::EndpointId) -> ClientRequest {
@@ -765,11 +735,8 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         .into();
     let (client_offer, _dial_offer) = exchange_test_client_candidates(
         state,
-        user,
-        &client_sender,
         &mut client_receiver,
         &mut target_receiver,
-        target_id,
         denied_session_id,
         &denied_client_key,
         RelayMode::Private,
@@ -859,11 +826,8 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
     .await;
     exchange_test_client_candidates(
         state,
-        user,
-        &client_sender,
         &mut client_receiver,
         &mut target_receiver,
-        target_id,
         active_session_id,
         &active_client_key,
         RelayMode::Private,
@@ -969,11 +933,8 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     .await;
     exchange_test_client_candidates(
         state,
-        user,
-        &sender_a,
         &mut receiver_a,
         &mut target_receiver,
-        target_id,
         active_a,
         &active_a_key,
         RelayMode::Private,
@@ -1037,11 +998,8 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     .await;
     exchange_test_client_candidates(
         state,
-        user,
-        &sender_b,
         &mut receiver_b,
         &mut target_receiver,
-        target_id,
         pending_b_one,
         &pending_b_one_key,
         RelayMode::Private,
@@ -1076,11 +1034,8 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     .await;
     exchange_test_client_candidates(
         state,
-        user,
-        &sender_b,
         &mut receiver_b,
         &mut target_receiver,
-        target_id,
         pending_b_two,
         &pending_b_two_key,
         RelayMode::Private,
@@ -1308,19 +1263,33 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     let (other_sender, mut other_receiver) = mpsc::channel(32);
     let client_secret = SecretKey::generate();
     let session_id = Uuid::new_v4();
-    let client_offer = open_reverse_session(
+    control::open_tunnel(
         state,
         user,
         &client_sender,
-        &mut client_receiver,
-        &mut target_receiver,
+        session_id,
+        target_id,
+        client_secret.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open SSH session for ClientReady ownership test");
+    assert!(matches!(
+        target_receiver.recv().await.expect("target preparation"),
+        ControlMessage::Prepare { session_id: received, .. } if received == session_id
+    ));
+    send_agent_ready_for_session(
+        state,
         target_id,
         target_connection_id,
         session_id,
-        &client_secret,
         RelayMode::Private,
     )
     .await;
+    let client_offer = client_receiver
+        .recv()
+        .await
+        .expect("client receives endpoint offer");
     assert!(
         matches!(client_offer, ControlMessage::ClientOffer { session_id: id, .. } if id == session_id)
     );
@@ -1388,19 +1357,33 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
 
     let mode_session = Uuid::new_v4();
     let mode_client_secret = SecretKey::generate();
-    let _ = open_reverse_session(
+    control::open_tunnel(
         state,
         user,
         &client_sender,
-        &mut client_receiver,
-        &mut target_receiver,
+        mode_session,
+        target_id,
+        mode_client_secret.public().to_string(),
+        RelayMode::Private,
+    )
+    .await
+    .expect("open SSH session for relay-mode rejection test");
+    assert!(matches!(
+        target_receiver.recv().await.expect("target preparation"),
+        ControlMessage::Prepare { session_id: received, .. } if received == mode_session
+    ));
+    send_agent_ready_for_session(
+        state,
         target_id,
         target_connection_id,
         mode_session,
-        &mode_client_secret,
         RelayMode::Private,
     )
     .await;
+    client_receiver
+        .recv()
+        .await
+        .expect("client receives endpoint offer");
     control::handle_client_message(
         state,
         user,
