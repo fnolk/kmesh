@@ -228,6 +228,18 @@ async fn open_ssh_session(
         offer.relay_mode == relay_mode,
         "offer relay mode differs from request"
     );
+    let target_ip_addrs = offer
+        .target_endpoint_addr
+        .ip_addrs()
+        .copied()
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        session = %session_id,
+        relay_mode = ?offer.relay_mode,
+        target_endpoint_id = %offer.target_endpoint_addr.id,
+        target_ip_addrs = ?target_ip_addrs,
+        "received authenticated Iroh target candidates"
+    );
 
     let endpoint = create_endpoint(
         secret_key,
