@@ -59,6 +59,19 @@ struct TunnelOffer {
     relay_mode: RelayMode,
 }
 
+type EndpointMap = Arc<Mutex<HashMap<RelayMode, Endpoint>>>;
+type PendingPeers = Arc<Mutex<HashMap<(RelayMode, String), mpsc::Sender<Connection>>>>;
+
+struct AgentRuntime {
+    endpoint_secret_key: SecretKey,
+    transport_info: TransportInfo,
+    endpoints: EndpointMap,
+    pending_peers: PendingPeers,
+    accept_tasks: JoinSet<()>,
+    active_sessions: JoinSet<()>,
+    completed_sessions: Arc<StdMutex<Vec<Uuid>>>,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("agent connection authentication failed: {0}")]
 struct AgentAuthenticationFailure(String);
@@ -120,41 +133,27 @@ pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &
 
 pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let credentials = profile::load_agent_credentials(&context.config.data_dir, target_id)?;
-    let endpoint_secret_key = decode_secret_key(&credentials.endpoint_secret_key)?;
-    let transport_info = context.api.transport_info().await?;
-    let endpoint_secret_key = Arc::new(endpoint_secret_key);
-    let endpoints = Arc::new(Mutex::new(HashMap::<RelayMode, Endpoint>::new()));
-    let pending_peers = Arc::new(Mutex::new(HashMap::<
-        (RelayMode, String),
-        mpsc::Sender<Connection>,
-    >::new()));
-    let mut accept_tasks = JoinSet::new();
-    let mut active_sessions = JoinSet::new();
-    let completed_sessions = Arc::new(StdMutex::new(Vec::<Uuid>::new()));
+    let mut runtime = AgentRuntime {
+        endpoint_secret_key: decode_secret_key(&credentials.endpoint_secret_key)?,
+        transport_info: context.api.transport_info().await?,
+        endpoints: Arc::new(Mutex::new(HashMap::new())),
+        pending_peers: Arc::new(Mutex::new(HashMap::new())),
+        accept_tasks: JoinSet::new(),
+        active_sessions: JoinSet::new(),
+        completed_sessions: Arc::new(StdMutex::new(Vec::new())),
+    };
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        match control_session(
-            context,
-            &credentials,
-            &endpoint_secret_key,
-            &transport_info,
-            &endpoints,
-            &pending_peers,
-            &mut accept_tasks,
-            &mut active_sessions,
-            &completed_sessions,
-        )
-        .await
-        {
+        match control_session(context, &credentials, &mut runtime).await {
             Ok(()) => bail!("agent control connection closed"),
             Err(error) if is_authentication_error(&error) => {
                 tracing::error!(target = %target_id, error = %error, "agent credential was rejected; active SSH sessions will finish");
-                while let Some(result) = active_sessions.join_next().await {
+                while let Some(result) = runtime.active_sessions.join_next().await {
                     if let Err(error) = result {
                         tracing::warn!(target = %target_id, error = %error, "active SSH session ended");
                     }
                 }
-                accept_tasks.abort_all();
+                runtime.accept_tasks.abort_all();
                 return Err(error);
             }
             Err(error) => {
@@ -226,7 +225,7 @@ async fn send_control_sink(
 async fn accept_connections(
     endpoint: Endpoint,
     relay_mode: RelayMode,
-    pending_peers: Arc<Mutex<HashMap<(RelayMode, String), mpsc::Sender<Connection>>>>,
+    pending_peers: PendingPeers,
 ) {
     loop {
         let connection = match accept_peer(&endpoint).await {
@@ -243,10 +242,10 @@ async fn accept_connections(
             .await
             .get(&(relay_mode, remote_id.clone()))
             .cloned();
-        if let Some(sender) = sender {
-            if sender.send(connection).await.is_err() {
-                tracing::debug!(remote = %remote_id, "Iroh connection arrived after its offer expired");
-            }
+        if let Some(sender) = sender
+            && sender.send(connection).await.is_err()
+        {
+            tracing::debug!(remote = %remote_id, "Iroh connection arrived after its offer expired");
         }
     }
 }
@@ -256,8 +255,8 @@ async fn prepare_endpoint(
     endpoint_secret_key: &SecretKey,
     transport_info: &TransportInfo,
     relay_mode: RelayMode,
-    endpoints: &Arc<Mutex<HashMap<RelayMode, Endpoint>>>,
-    pending_peers: &Arc<Mutex<HashMap<(RelayMode, String), mpsc::Sender<Connection>>>>,
+    endpoints: &EndpointMap,
+    pending_peers: &PendingPeers,
     accept_tasks: &mut JoinSet<()>,
 ) -> std::result::Result<EndpointAddr, TransportError> {
     let endpoint = {
@@ -315,13 +314,7 @@ async fn wait_endpoint_online(endpoint: &Endpoint) -> std::result::Result<(), Tr
 async fn control_session(
     context: &ClientContext,
     credentials: &AgentCredentials,
-    endpoint_secret_key: &SecretKey,
-    transport_info: &TransportInfo,
-    endpoints: &Arc<Mutex<HashMap<RelayMode, Endpoint>>>,
-    pending_peers: &Arc<Mutex<HashMap<(RelayMode, String), mpsc::Sender<Connection>>>>,
-    accept_tasks: &mut JoinSet<()>,
-    active_sessions: &mut JoinSet<()>,
-    completed_sessions: &Arc<StdMutex<Vec<Uuid>>>,
+    runtime: &mut AgentRuntime,
 ) -> Result<()> {
     let ws = tokio::time::timeout(
         CONTROL_CONNECT_TIMEOUT,
@@ -331,7 +324,8 @@ async fn control_session(
     .context("agent control connection timed out")??;
     let (mut writer, mut reader) = ws.split();
     let completed = {
-        let mut completed = completed_sessions
+        let mut completed = runtime
+            .completed_sessions
             .lock()
             .expect("completed session lock poisoned");
         std::mem::take(&mut *completed)
@@ -358,7 +352,7 @@ async fn control_session(
             Some(session_id) = done_rx.recv() => {
                 sessions.remove(&session_id);
             }
-            joined = active_sessions.join_next(), if !active_sessions.is_empty() => {
+            joined = runtime.active_sessions.join_next(), if !runtime.active_sessions.is_empty() => {
                 if let Some(Err(error)) = joined {
                     tracing::warn!(error = %error, "active SSH session task failed");
                 }
@@ -373,12 +367,12 @@ async fn control_session(
                     ControlMessage::Prepare { session_id, relay_mode } => {
                         match prepare_endpoint(
                             context,
-                            endpoint_secret_key,
-                            transport_info,
+                            &runtime.endpoint_secret_key,
+                            &runtime.transport_info,
                             relay_mode,
-                            endpoints,
-                            pending_peers,
-                            accept_tasks,
+                            &runtime.endpoints,
+                            &runtime.pending_peers,
+                            &mut runtime.accept_tasks,
                         ).await {
                             Ok(endpoint_addr) => {
                                 send_control_sink(&mut writer, &ControlMessage::AgentReady {
@@ -440,9 +434,9 @@ async fn control_session(
                             }).await.context("report invalid signed tunnel offer")?;
                             continue;
                         }
-                        let endpoint = endpoints.lock().await.get(&relay_mode).cloned()
+                        let endpoint = runtime.endpoints.lock().await.get(&relay_mode).cloned()
                             .context("offer relay endpoint has not been prepared")?;
-                        let relay_choice = match endpoint_options(context, transport_info, relay_mode) {
+                        let relay_choice = match endpoint_options(context, &runtime.transport_info, relay_mode) {
                             Ok(options) => options.relay_choice,
                             Err(error) => {
                                 outbound_tx.send(ControlMessage::Error {
@@ -475,7 +469,7 @@ async fn control_session(
                         anyhow::ensure!(!sessions.contains_key(&session_id), "duplicate offer for session {session_id}");
                         let (peer_tx, peer_rx) = mpsc::channel(1);
                         {
-                            let mut peers = pending_peers.lock().await;
+                            let mut peers = runtime.pending_peers.lock().await;
                             anyhow::ensure!(peers.insert((relay_mode, offer.client_endpoint_id.clone()), peer_tx).is_none(), "client EndpointId already has a pending offer");
                         }
                         let (session_tx, session_rx) = mpsc::channel(16);
@@ -483,9 +477,9 @@ async fn control_session(
                         let context = context.clone();
                         let outbound_tx = outbound_tx.clone();
                         let done_tx = done_tx.clone();
-                        let completed_sessions = completed_sessions.clone();
-                        let pending_peers = pending_peers.clone();
-                        active_sessions.spawn(async move {
+                        let completed_sessions = runtime.completed_sessions.clone();
+                        let pending_peers = runtime.pending_peers.clone();
+                        runtime.active_sessions.spawn(async move {
                             let peer_endpoint_id = offer.client_endpoint_id.clone();
                             let result = handle_offer(
                                 &context,
@@ -772,8 +766,10 @@ mod tests {
     use super::*;
 
     async fn context(server_url: &str) -> ClientContext {
-        let mut config = crate::config::Config::default();
-        config.server_url = server_url.to_owned();
+        let config = crate::config::Config {
+            server_url: server_url.to_owned(),
+            ..crate::config::Config::default()
+        };
         let api = Api::new(&config).await.expect("build test API client");
         let profiles =
             profile::ProfileStore::new(&config.data_dir, &config.server_url, &config.profile);

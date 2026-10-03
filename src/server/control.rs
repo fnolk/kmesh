@@ -707,7 +707,7 @@ async fn relay_choice(
         RelayMode::Private => {
             let relay_url = transport
                 .private_relay_url
-                .ok_or_else(|| ApiError::unauthorized())?;
+                .ok_or_else(ApiError::unauthorized)?;
             Ok(crate::transport::RelayChoice::Private {
                 url: reqwest::Url::parse(&relay_url).map_err(|_| ApiError::unauthorized())?,
                 qad_port: transport.qad_port,

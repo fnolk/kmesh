@@ -1,12 +1,14 @@
 # kmesh
 
-kmesh connects OpenSSH to a target machine through a direct QUIC path when the network allows it, then uses the server's WSS relay when direct UDP cannot be established. OpenSSH continues to handle host-key verification, SSH user authentication, shell sessions, SFTP, SCP, and port forwarding.
+kmesh gives OpenSSH an on-demand `ProxyCommand` to a target agent. Each SSH transport uses one Iroh QUIC bidirectional stream: Iroh establishes a direct peer path when possible and relays the same stream when the network requires it. OpenSSH continues to handle host-key verification, SSH account authentication, shell sessions, SFTP, SCP, and port forwarding.
 
-The client starts `kmesh proxy` on demand through `ProxyCommand`. A `kmesh agent` stays running on each target machine and forwards one authenticated stream to its locally configured `sshd`. The public server handles user/agent authentication, live RBAC checks, connection coordination, and relaying.
+The client starts `kmesh proxy` on demand through `ProxyCommand`; it does not need a resident kmesh agent. One `kmesh agent` stays running on each target machine and forwards authenticated streams to its locally configured `sshd`. The kmesh server handles user and device authentication, current RBAC, connection coordination, and the self-hosted relay.
+
+When configured, kmesh first uses the relay embedded at the same HTTPS origin as the control service. A network-only failure can start a fresh, separately authorized session through Iroh's default public relay set. The relay modes carry data only: login, authorization, ticket issuance, and activation continue to require the kmesh server. Certificate, identity, permission, and configuration failures stop the attempt without changing relay mode. The proxy reports the selected Iroh path to stderr; stdout carries only SSH bytes.
 
 ## Build and install
 
-Rust 1.94 or newer and OpenSSH are required. The public server needs a TLS certificate and private key supplied by the deployment. Each agent creates and persists its own QUIC certificate during enrollment. Build the binary with:
+Rust 1.94 or newer and OpenSSH are required. The public server needs a TLS certificate and private key supplied by the deployment. Each target agent creates and persists a stable Iroh endpoint identity during enrollment. Build the binary with:
 
 ```sh
 cargo build --locked --release
@@ -17,13 +19,13 @@ The CI workflow is configured to build Linux x86_64/aarch64 musl and macOS Intel
 
 ## Start the public server
 
-Choose a stable HTTPS origin. Use the same canonical origin as the issuer and client `server_url`; kmesh normalizes a trailing slash and the standard HTTPS port.
+Choose a stable HTTPS origin. The examples use `https://kmesh.example.com:9443`; use the same canonical origin for `--issuer` and client `server_url`, and issue a TLS certificate for its host.
 
 ```sh
 kmesh server init \
   --data-dir /var/lib/kmesh \
   --admin admin \
-  --issuer https://kmesh.example.com
+  --issuer https://kmesh.example.com:9443
 ```
 
 The command prompts for the initial admin password. Start the service with a certificate whose SAN covers the public server name:
@@ -31,34 +33,36 @@ The command prompts for the initial admin password. Start the service with a cer
 ```sh
 kmesh server run \
   --data-dir /var/lib/kmesh \
-  --issuer https://kmesh.example.com \
-  --bind 0.0.0.0:443 \
+  --issuer https://kmesh.example.com:9443 \
+  --bind 0.0.0.0:9443 \
   --tls-cert /etc/kmesh/tls.crt \
   --tls-key /etc/kmesh/tls.key \
-  --stun-bind 0.0.0.0:3478
+  --qad-bind 0.0.0.0:3478
 ```
 
 For automation, `--password-stdin` reads a password from piped stdin without echoing it or placing it in process arguments. The same option is available for password login and admin user creation/password reset; user creation and reset read two matching lines.
 
-The deployment needs TCP 443 and UDP 3478 reachable. If a network blocks UDP, client and agent carry SSH data over the server's WSS endpoint on 443.
+The default deployment listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for Iroh QAD. Direct peer paths also require outbound UDP between the client and target. If the self-hosted path cannot be reached for network reasons, the client and target may use Iroh's default public relay set; their HTTPS control connection to the kmesh server remains required. In public-relay-only mode, pass `--disable-private-relay`; this omits the server's private relay URL from `GET /v1/transport`.
+
+The current schema expects a fresh kmesh database. It does not migrate databases from the earlier STUN/Quinn/WSS-data implementation. Keep the old data directory as a backup and initialize the Iroh version with a separate, empty `--data-dir`.
 
 ## Configure a target and access
 
 On an administrator workstation, log in and create the target, user, role, and grant. The target ID is stable; its name becomes the OpenSSH alias.
 
 ```sh
-kmesh --server-url https://kmesh.example.com login --method password --username admin
-kmesh --server-url https://kmesh.example.com admin targets create build-machine
-kmesh --server-url https://kmesh.example.com admin users create alice
-kmesh --server-url https://kmesh.example.com admin roles create engineers
-kmesh --server-url https://kmesh.example.com admin users roles <alice-user-id> <engineers-role-id>
-kmesh --server-url https://kmesh.example.com admin grants add <engineers-role-id> <target-id>
+kmesh --server-url https://kmesh.example.com:9443 login --method password --username admin
+kmesh --server-url https://kmesh.example.com:9443 admin targets create build-machine
+kmesh --server-url https://kmesh.example.com:9443 admin users create alice
+kmesh --server-url https://kmesh.example.com:9443 admin roles create engineers
+kmesh --server-url https://kmesh.example.com:9443 admin users roles <alice-user-id> <engineers-role-id>
+kmesh --server-url https://kmesh.example.com:9443 admin grants add <engineers-role-id> <target-id>
 ```
 
 Commands that create or reset a password read it through a hidden prompt. Start the interactive shell with the same server origin:
 
 ```sh
-kmesh --server-url https://kmesh.example.com admin
+kmesh --server-url https://kmesh.example.com:9443 admin
 ```
 
 Inside the shell, `help` and Tab completion are available. One-shot admin commands accept `--json` for machine-readable output. The examples pass `--server-url` on each client command; setting `server_url` in the default config file removes that option from future commands.
@@ -66,59 +70,54 @@ Inside the shell, `help` and Tab completion are available. One-shot admin comman
 For public-key kmesh login, register the user's SSH public key and use `ssh-keygen` for the SSHSIG challenge:
 
 ```sh
-kmesh --server-url https://kmesh.example.com admin keys add <alice-user-id> ~/.ssh/id_ed25519.pub --label laptop
-kmesh --server-url https://kmesh.example.com login \
+kmesh --server-url https://kmesh.example.com:9443 admin keys add <alice-user-id> ~/.ssh/id_ed25519.pub --label laptop
+kmesh --server-url https://kmesh.example.com:9443 login \
   --method public-key --username alice --key ~/.ssh/id_ed25519
 ```
 
 The challenge signature binds the server-provided payload and uses the `kmesh-login` namespace. kmesh sends the public key and signature; the private key stays with OpenSSH or ssh-agent.
 
-On the target machine, enroll the persistent QUIC certificate and start the agent:
+On the target machine, enroll its persistent Iroh identity and start the agent:
 
 ```sh
-kmesh --server-url https://kmesh.example.com agent enroll \
+kmesh --server-url https://kmesh.example.com:9443 agent enroll \
   --target-id <target-id> --enrollment-code <one-time-code>
-kmesh --server-url https://kmesh.example.com agent run --target-id <target-id>
+kmesh --server-url https://kmesh.example.com:9443 agent run --target-id <target-id>
 ```
 
 The agent uses `ssh.address` from its config, which defaults to `127.0.0.1:22`. A typical Linux config is `~/.local/share/kmesh/config.toml`; macOS stores it under `~/Library/Application Support/kmesh/config.toml`:
 
 ```toml
-server_url = "https://kmesh.example.com"
+server_url = "https://kmesh.example.com:9443"
 profile = "default"
 
 [ssh]
 address = "127.0.0.1:22"
 connect_timeout_secs = 10
-
-[stun]
-servers = []
-udp_bind_address = "0.0.0.0:0"
-probe_timeout_millis = 2000
 ```
 
-With no STUN override, kmesh uses the configured server host on UDP port 3478.
+The client and agent config only need the kmesh control URL plus their local SSH/TLS settings. There are no STUN server or UDP bind overrides. The proxy and agent discover the private relay URL and actual QAD port from the server's authenticated `/v1/transport` response.
 
 ## Connect with OpenSSH
 
 On the client, log in and write an OpenSSH host block:
 
 ```sh
-kmesh --server-url https://kmesh.example.com login --method password --username alice
-kmesh --server-url https://kmesh.example.com ssh-config build-machine >> ~/.ssh/config
+kmesh --server-url https://kmesh.example.com:9443 login --method password --username alice
+kmesh --server-url https://kmesh.example.com:9443 ssh-config build-machine >> ~/.ssh/config
 ssh build-machine
 ```
 
-The generated block sets `ProxyCommand`, a stable `HostKeyAlias`, and OpenSSH `ControlMaster` reuse. The first SSH connection establishes its path; subsequent SSH/SCP/SFTP commands can reuse the OpenSSH control connection. RBAC is checked when a new underlying transport is created; channels opened over an existing ControlMaster transport share that connection's established authorization. Standard SSH host-key checks remain active. Add the target's verified SSH host key to the client's `known_hosts` before connecting.
+The generated block sets `ProxyCommand`, a stable `HostKeyAlias`, and OpenSSH `ControlMaster` reuse. The first SSH connection establishes its path; subsequent SSH/SCP/SFTP commands can reuse the OpenSSH control connection. RBAC is checked for a new transport and again before activation. An already activated SSH stream runs to completion after permission changes or control-plane disconnection; a new stream still requires online authorization. Standard SSH host-key checks remain active. Add the target's verified SSH host key to the client's `known_hosts` before connecting.
 
 The kmesh client state is separated by server origin, profile, and normalized username. Token and agent identity files use mode `0600`, their directories use mode `0700`, and refresh tokens rotate under a cross-process file lock. A refresh with an uncertain network result clears the local login and asks the user to sign in again.
 
 ## Enterprise proxies and private CAs
 
-REST and WSS use the same proxy and CA settings. Add proxy and enterprise CA values to the client config:
+HTTPS control and Iroh relay connections use the same proxy and CA settings. Add proxy and enterprise CA values to the client config:
 
 ```toml
-server_url = "https://kmesh.example.com"
+server_url = "https://kmesh.example.com:9443"
 
 [tls]
 ca_certificates = ["/etc/ssl/certs/company-root.pem"]
@@ -129,7 +128,7 @@ username = "kmesh-client"
 password = "read-from-a-protected-config-file"
 ```
 
-The proxy supports HTTP or HTTPS CONNECT and Basic authentication. Keep config files containing proxy passwords readable only by the user. OpenSSH itself still verifies the target SSH host key independently of TLS and QUIC certificates.
+The proxy supports HTTP or HTTPS CONNECT and Basic authentication. Keep config files containing proxy passwords readable only by the user. OpenSSH verifies the target SSH host key independently of TLS and Iroh endpoint identity.
 
 ## Service files
 
@@ -152,8 +151,6 @@ TARGET_ID=00000000-0000-0000-0000-000000000000
 sudo systemctl enable --now "kmesh-agent@${TARGET_ID}.service"
 ```
 
-The Unix integration script [`scripts/e2e.sh`](scripts/e2e.sh) exercises direct QUIC, relay fallback, verified SSH host keys, remote exit codes, SCP/SFTP, ControlMaster reuse, RBAC revocation, concurrent token refresh, and SSHD disconnect propagation against a temporary `sshd` and local kmesh server. It requires `sshd`, OpenSSH tools, `openssl`, `curl`, Python 3, and Rust. Long idle-session and 1 GiB throughput runs require separate duration and capacity testing.
+Run the local checks with `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked --all-targets`. The self-hosted integration test starts local HTTPS and QAD listeners, verifies an observed UDP address, completes ticket authorization and activation, and transfers SSH-shaped bytes over a TCP fixture. Other tests cover mode-specific relay allowlists, fresh-session retry policy, and stream half-close. They do not contact a public relay or run against a live target.
 
-For a provisioned public server and target, [`scripts/verify_live.md`](scripts/verify_live.md) documents the isolated live profile and [`scripts/verify_live.py`](scripts/verify_live.py) runs CLI-based SSH/SCP/SFTP/RBAC checks.
-
-For a provisioned public server and target, [`scripts/verify_live.md`](scripts/verify_live.md) documents the isolated live-verification profile and [`scripts/verify_live.py`](scripts/verify_live.py) runs the CLI-based SSH/SCP/SFTP/RBAC checks.
+The old STUN-era shell, native, and live harnesses were removed because they do not match this release's protocol or server CLI. [`scripts/verify_live_report.md`](scripts/verify_live_report.md) is a historical report from the earlier implementation; it does not verify the current Iroh transport. No long-duration or public-server test is part of the current validation.

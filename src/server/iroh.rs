@@ -54,7 +54,7 @@ impl IrohServer {
     pub async fn run_until_shutdown(mut self) -> Result<()> {
         let outcome = tokio::select! {
             signal = tokio::signal::ctrl_c() => {
-                signal.context("wait for shutdown signal").map(|()| ())
+                signal.context("wait for shutdown signal")
             }
             result = self.https_task.as_mut().expect("HTTPS task exists") => {
                 self.https_task.take();
@@ -222,10 +222,10 @@ async fn serve_https(
                 }
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
-                if let Err(error) = result {
-                    if error.is_panic() {
-                        return Err(error).context("HTTPS connection task panicked");
-                    }
+                if let Err(error) = result
+                    && error.is_panic()
+                {
+                    return Err(error).context("HTTPS connection task panicked");
                 }
             }
             accepted = listener.accept() => {
