@@ -41,6 +41,14 @@ The private-mode probe reported:
 
 These observations confirm that this run exchanged public target candidates and the client obtained a QAD IPv4 mapping. They show the paths selected for these SSH streams; they do not establish direct P2P success or the cause of relay selection. The target-side NetReport value was not captured separately.
 
+## Latest direct SSH result
+
+The reverse-dial PublicDefault SSH run recorded fresh A and C NetReports. Across three reflectors, A reported the same `192.0.2.19:4152` with `mapping_varies_by_dest_ipv4=Some(false)`; C reported the same `192.0.2.12:12632` with `Some(false)`. The endpoints exchanged their public and local candidates, and C logged 23 off-path probes per A candidate. OpenSSH still selected `relay:https://euc1-1.relay.n0.iroh.link./`; this run did not achieve P2P.
+
+The subsequent portmapper-enabled Private SSH check used Linux agent SHA-256 `45b6c9dd8b6a1c92b6385860978925c84e535b92625382fd2b31aecf897040b8` and macOS ARM64 client SHA-256 `bac2df1e0afbe128f961d0d480dfb8108c536ccc9b24dd961cbffb85ac6800bb`. SSH returned `server-1`, the completion marker, and expected exit code 23 after no Direct path was selected within 10.06 seconds. Its path remained `relay:https://192.0.2.11:9443/`, so `ssh_status=passed` and `p2p_status=failed`. The private-relay QAD observations were `192.0.2.19:4187` on A and `192.0.2.12:12484` on C; each used one reflector, so both `mapping_varies_by_dest_ipv4` values were `None`. Neither endpoint logged a portmapper mapping event or mapped external address during the attempt; these QAD addresses are not evidence of a portmapper mapping. The direct-P2P objective remains unmet.
+
+After the run, the private server and new agent were active, the public server was inactive, the agent environment was empty, and server B retained its 763 binary. The full report is `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-private-portmapper-gated/report.json`; raw client and filtered agent logs are mode `0600` beside it.
+
 ## Evidence files
 
 The preflight, stage, 423 baseline, login, and 548 refresh reports are under `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/`. The 548 public extended report is `runs/run-20261003-iroh-upgrade-548523f/public-extended/ssh-public-default-20261003T033346Z-9cb0e000/report.json`. The 548 public and private debug reports are `runs/run-20261003-public548-debugprobe-2/report.json` and `runs/run-20261003-private548-debugprobe/report.json`. Their original stderr files are mode `0600` beside each report. Reports contain no password, refresh token, enrollment token, or private-key contents.
