@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::{BufReader, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -27,7 +28,9 @@ use tokio::{
 
 const B_RELAY_URL: &str = "https://192.0.2.11:9443";
 const B_QAD_PORT: u16 = 3478;
-const ALPN: &[u8] = b"kmesh/udp-ac-check/1";
+const PRIVATE_ALPN: &[u8] = b"kmesh/udp-ac-check/1";
+// Matches the ALPN used by the archived successful AC run.
+const PUBLIC_ALPN: &[u8] = b"kmesh/iroh-mechanism/1";
 const ROUND_TIMEOUT: Duration = Duration::from_secs(40);
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
 const NONCES_PER_DIRECTION: usize = 3;
@@ -53,20 +56,46 @@ impl Role {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelaySelection {
+    Private,
+    Public,
+}
+
+impl RelaySelection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Public => "public",
+        }
+    }
+
+    fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::Private => PRIVATE_ALPN,
+            Self::Public => PUBLIC_ALPN,
+        }
+    }
+}
+
 struct Args {
     role: Role,
-    ca_file: PathBuf,
-    local_ip: Ipv4Addr,
-    endpoint_secret_key_file: PathBuf,
+    relay_selection: RelaySelection,
+    ca_file: Option<PathBuf>,
+    local_ip: Option<Ipv4Addr>,
+    endpoint_secret_key_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
 struct PeerReady {
     event: String,
     role: String,
+    relay_mode: String,
     endpoint_id: String,
     global_v4: String,
     local_socket: String,
+    relay_url: String,
+    endpoint_addr: EndpointAddr,
 }
 
 #[derive(Clone)]
@@ -105,40 +134,72 @@ async fn run() -> Result<()> {
             .map_err(|_| anyhow!("install ring provider"))?;
     }
 
-    let mut ca_reader = BufReader::new(File::open(&args.ca_file).context("open B CA file")?);
-    let certs = rustls_pemfile::certs(&mut ca_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("parse B CA file")?;
-    ensure!(!certs.is_empty(), "B CA file contains no certificates");
-    let ca_tls = CaTlsConfig::default().with_extra_roots(certs);
-    let secret_key_b64 = fs::read_to_string(&args.endpoint_secret_key_file)
-        .context("read temporary enrolled Endpoint secret key")?;
-    let secret_key_bytes = URL_SAFE_NO_PAD
-        .decode(secret_key_b64.trim())
-        .context("decode temporary enrolled Endpoint secret key")?;
-    let secret_key_bytes: [u8; 32] = secret_key_bytes
-        .try_into()
-        .map_err(|_| anyhow!("temporary Endpoint secret key must contain 32 bytes"))?;
-    let secret_key = SecretKey::from_bytes(&secret_key_bytes);
-    let relay_url: iroh::RelayUrl = B_RELAY_URL.parse().context("parse fixed B relay URL")?;
-    let relay = RelayConfig::new(relay_url.clone(), Some(RelayQuicConfig::new(B_QAD_PORT)));
-    let builder = Endpoint::builder(presets::Minimal)
-        .secret_key(secret_key)
-        .alpns(vec![ALPN.to_vec()])
-        .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay])))
-        .ca_tls_config(ca_tls)
-        .portmapper_config(PortmapperConfig::Disabled)
-        .net_report_config(NetReportConfig::minimal())
-        .clear_ip_transports()
-        .bind_addr(SocketAddr::new(IpAddr::V4(args.local_ip), 0))
-        .context("bind IPv4 UDP socket")?;
+    let secret_key = match args.relay_selection {
+        RelaySelection::Private => {
+            let path = args
+                .endpoint_secret_key_file
+                .as_ref()
+                .context("private relay mode requires an enrolled Endpoint secret key file")?;
+            let encoded = fs::read_to_string(path).context("read enrolled Endpoint secret key")?;
+            let bytes = URL_SAFE_NO_PAD
+                .decode(encoded.trim())
+                .context("decode enrolled Endpoint secret key")?;
+            let bytes: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow!("Endpoint secret key must contain 32 bytes"))?;
+            SecretKey::from_bytes(&bytes)
+        }
+        RelaySelection::Public => SecretKey::generate(),
+    };
+    let private_relay_url: iroh::RelayUrl =
+        B_RELAY_URL.parse().context("parse fixed B relay URL")?;
+    let builder = match args.relay_selection {
+        RelaySelection::Private => {
+            let ca_file = args
+                .ca_file
+                .as_ref()
+                .context("private relay mode requires --ca-file")?;
+            let mut ca_reader = BufReader::new(File::open(ca_file).context("open B CA file")?);
+            let certs = rustls_pemfile::certs(&mut ca_reader)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("parse B CA file")?;
+            ensure!(!certs.is_empty(), "B CA file contains no certificates");
+            let ca_tls = CaTlsConfig::default().with_extra_roots(certs);
+            let local_ip = args
+                .local_ip
+                .context("private relay mode requires --local-ip")?;
+            Endpoint::builder(presets::Minimal)
+                .secret_key(secret_key)
+                .alpns(vec![args.relay_selection.alpn().to_vec()])
+                .relay_mode(RelayMode::Custom(RelayMap::from_iter([RelayConfig::new(
+                    private_relay_url.clone(),
+                    Some(RelayQuicConfig::new(B_QAD_PORT)),
+                )])))
+                .ca_tls_config(ca_tls)
+                .portmapper_config(PortmapperConfig::Disabled)
+                .net_report_config(NetReportConfig::minimal())
+                .clear_ip_transports()
+                .bind_addr(SocketAddr::new(IpAddr::V4(local_ip), 0))
+                .context("bind private diagnostic endpoint to IPv4")?
+        }
+        RelaySelection::Public => Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
+            .alpns(vec![args.relay_selection.alpn().to_vec()])
+            .relay_mode(RelayMode::Default)
+            .portmapper_config(PortmapperConfig::Disabled),
+    };
     let endpoint = timeout_at(deadline, builder.bind())
         .await
         .context("bind endpoint before round deadline")??;
     let bound_socket = endpoint
         .bound_sockets()
         .into_iter()
-        .find(|addr| addr.is_ipv4() && addr.ip() == IpAddr::V4(args.local_ip))
+        .find(|addr| {
+            addr.is_ipv4()
+                && args
+                    .local_ip
+                    .is_none_or(|local_ip| addr.ip() == IpAddr::V4(local_ip))
+        })
         .context("read bound IPv4 UDP socket")?;
 
     let mut relay_status = endpoint.home_relay_status();
@@ -148,13 +209,15 @@ async fn run() -> Result<()> {
             break;
         }
         if let Some(reason) = statuses.iter().find_map(|relay| relay.auth_denied_reason()) {
-            emit(json!({"event":"relay_auth_denied","role":args.role.as_str(),"reason":reason}))?;
-            bail!("B private relay denied the registered EndpointId: {reason}");
+            emit(
+                json!({"event":"relay_auth_denied","role":args.role.as_str(),"relay_mode":args.relay_selection.as_str(),"reason":reason}),
+            )?;
+            bail!("selected Iroh relay denied the registered EndpointId: {reason}");
         }
         timeout_at(deadline, relay_status.updated())
             .await
-            .context("wait for B private relay readiness")?
-            .map_err(|_| anyhow!("B private relay status watcher disconnected"))?;
+            .context("wait for Iroh relay readiness")?
+            .map_err(|_| anyhow!("Iroh relay status watcher disconnected"))?;
     }
     let mut report_watcher = endpoint.net_report();
     let report = timeout_at(deadline, report_watcher.initialized())
@@ -162,7 +225,7 @@ async fn run() -> Result<()> {
         .context("wait for initialized QAD report")?;
     let global_v4: SocketAddrV4 = report
         .global_v4
-        .context("B QAD report has no global IPv4 mapping")?;
+        .context("QAD report has no global IPv4 mapping")?;
     let observed_v4 = SocketAddr::V4(global_v4);
     let mut address_watcher = endpoint.watch_addr();
     loop {
@@ -178,68 +241,164 @@ async fn run() -> Result<()> {
             .context("wait for QAD address publication")?
             .map_err(|_| anyhow!("endpoint address watcher disconnected"))?;
     }
-    let own_addr = EndpointAddr::new(endpoint.id())
-        .with_ip_addr(SocketAddr::V4(global_v4))
-        .with_relay_url(relay_url.clone());
+    let own_addr = match args.relay_selection {
+        RelaySelection::Private => EndpointAddr::new(endpoint.id())
+            .with_ip_addr(SocketAddr::V4(global_v4))
+            .with_relay_url(private_relay_url.clone()),
+        RelaySelection::Public => endpoint.addr(),
+    };
+    let own_home_relay_url = own_addr
+        .relay_urls()
+        .next()
+        .cloned()
+        .context("ready endpoint address has no home relay URL")?;
     emit(json!({
-        "event":"ready", "role":args.role.as_str(), "endpoint_id":endpoint.id().to_string(),
+        "event":"ready", "role":args.role.as_str(), "relay_mode":args.relay_selection.as_str(), "endpoint_id":endpoint.id().to_string(),
         "global_v4":global_v4, "local_socket":bound_socket, "endpoint_addr":own_addr,
-        "relay_url":B_RELAY_URL, "qad_server":format!("192.0.2.11:{B_QAD_PORT}/udp")
+        "relay_url":own_home_relay_url,
+        "qad_server_config":match args.relay_selection {
+            RelaySelection::Private => format!("192.0.2.11:{B_QAD_PORT}/udp"),
+            RelaySelection::Public => "Iroh RelayMode::Default (UDP 7842)".to_owned(),
+        }
     }))?;
 
     let mut control = AsyncBufReader::new(tokio::io::stdin());
     let peer = read_peer(&mut control, deadline).await?;
     ensure!(peer.role == args.role.peer_role(), "peer role mismatch");
+    ensure!(
+        peer.relay_mode == args.relay_selection.as_str(),
+        "peer selected a different relay mode"
+    );
     let peer_id: EndpointId = peer.endpoint_id.parse().context("parse peer EndpointId")?;
     let peer_ip: SocketAddr = peer.global_v4.parse().context("parse peer QAD candidate")?;
     ensure!(peer_ip.is_ipv4(), "peer QAD candidate must be IPv4");
+    ensure!(
+        peer.endpoint_addr.id == peer_id,
+        "peer EndpointAddr identity differs from peer EndpointId"
+    );
+    ensure!(
+        peer.endpoint_addr
+            .ip_addrs()
+            .any(|candidate| candidate == &peer_ip),
+        "peer EndpointAddr does not contain its QAD global IPv4 candidate"
+    );
+    let peer_relay_url: iroh::RelayUrl = peer
+        .relay_url
+        .parse()
+        .context("parse peer home relay URL")?;
+    let allowed_relay_urls = match args.relay_selection {
+        RelaySelection::Private => BTreeSet::from([private_relay_url.clone()]),
+        RelaySelection::Public => RelayMode::Default.relay_map().urls::<BTreeSet<_>>(),
+    };
+    ensure!(
+        allowed_relay_urls.contains(&peer_relay_url)
+            && peer
+                .endpoint_addr
+                .relay_urls()
+                .all(|url| allowed_relay_urls.contains(url)),
+        "peer EndpointAddr includes a relay outside the selected library RelayMap"
+    );
+    ensure!(
+        peer.endpoint_addr
+            .relay_urls()
+            .any(|url| url == &peer_relay_url),
+        "peer home relay URL is absent from the full EndpointAddr"
+    );
     let peer_local: SocketAddr = peer
         .local_socket
         .parse()
         .context("parse peer local socket")?;
-    let peer_addr = EndpointAddr::new(peer_id)
-        .with_ip_addr(peer_ip)
-        .with_relay_url(relay_url);
+    let peer_addr = peer.endpoint_addr.clone();
     emit(json!({
         "event":"peer_received", "role":args.role.as_str(), "local_endpoint_id":endpoint.id().to_string(),
         "peer_endpoint_id":peer_id.to_string(), "peer_global_v4_candidate":peer_ip, "peer_bound_socket":peer_local,
-        "relay_url":B_RELAY_URL
+        "relay_mode":args.relay_selection.as_str(), "peer_home_relay_url":peer_relay_url
     }))?;
 
-    let outgoing_fut = endpoint.connect(peer_addr, ALPN);
-    let incoming_fut = async {
-        let incoming = endpoint
-            .accept()
-            .await
-            .context("endpoint closed while accepting reciprocal peer")?;
-        incoming.await.context("complete accepted connection")
-    };
-    let (outgoing, incoming) = tokio::join!(
-        timeout_at(deadline, outgoing_fut),
-        timeout_at(deadline, incoming_fut)
-    );
-    let outgoing = outgoing
-        .context("outgoing connection exceeded round deadline")?
-        .context("connect to peer")?;
-    let incoming = incoming.context("incoming connection exceeded round deadline")??;
-    ensure!(
-        outgoing.remote_id() == peer_id,
-        "outgoing peer EndpointId mismatch"
-    );
-    ensure!(
-        incoming.remote_id() == peer_id,
-        "incoming peer EndpointId mismatch"
-    );
-    let (data, auxiliary) = match args.role {
-        Role::Client => (outgoing.clone(), incoming.clone()),
-        Role::Target => (incoming.clone(), outgoing.clone()),
+    let (data, auxiliary, outgoing, incoming, data_role) = match args.relay_selection {
+        RelaySelection::Private => {
+            let outgoing_fut = endpoint.connect(peer_addr.clone(), args.relay_selection.alpn());
+            let incoming_fut = async {
+                let incoming = endpoint
+                    .accept()
+                    .await
+                    .context("endpoint closed while accepting reciprocal peer")?;
+                incoming.await.context("complete accepted connection")
+            };
+            let (outgoing, incoming) = tokio::join!(
+                timeout_at(deadline, outgoing_fut),
+                timeout_at(deadline, incoming_fut)
+            );
+            let outgoing = outgoing
+                .context("outgoing connection exceeded round deadline")?
+                .context("connect to peer")?;
+            let incoming = incoming.context("incoming connection exceeded round deadline")??;
+            ensure!(
+                outgoing.remote_id() == peer_id,
+                "outgoing peer EndpointId mismatch"
+            );
+            ensure!(
+                incoming.remote_id() == peer_id,
+                "incoming peer EndpointId mismatch"
+            );
+            let (data, auxiliary) = match args.role {
+                Role::Client => (outgoing.clone(), incoming.clone()),
+                Role::Target => (incoming.clone(), outgoing.clone()),
+            };
+            (
+                data,
+                Some(auxiliary),
+                Some(outgoing),
+                Some(incoming),
+                "client_outgoing",
+            )
+        }
+        RelaySelection::Public => {
+            let data = match args.role {
+                Role::Target => {
+                    let connection = timeout_at(
+                        deadline,
+                        endpoint.connect(peer_addr, args.relay_selection.alpn()),
+                    )
+                    .await
+                    .context("target outgoing connection deadline")?
+                    .context("target dial to public peer")?;
+                    ensure!(
+                        connection.remote_id() == peer_id,
+                        "target dialed an unexpected EndpointId"
+                    );
+                    connection
+                }
+                Role::Client => {
+                    let incoming = timeout_at(deadline, endpoint.accept())
+                        .await
+                        .context("client accept deadline")?
+                        .context("client endpoint closed before target dial")?;
+                    let connection = timeout_at(deadline, incoming)
+                        .await
+                        .context("complete accepted target connection deadline")?
+                        .context("accept target dial")?;
+                    ensure!(
+                        connection.remote_id() == peer_id,
+                        "client accepted an unexpected EndpointId"
+                    );
+                    connection
+                }
+            };
+            let (outgoing, incoming) = match args.role {
+                Role::Target => (Some(data.clone()), None),
+                Role::Client => (None, Some(data.clone())),
+            };
+            (data, None, outgoing, incoming, "target_outgoing")
+        }
     };
     emit(json!({
         "event":"connections_established", "role":args.role.as_str(),
         "local_endpoint_id":endpoint.id().to_string(), "peer_endpoint_id":peer_id.to_string(),
-        "data_connection_role":"client_outgoing", "auxiliary_connection_role":"target_outgoing",
-        "outgoing_paths":paths_json(&path_samples(&outgoing)),
-        "incoming_paths":paths_json(&path_samples(&incoming))
+        "relay_mode":args.relay_selection.as_str(), "data_connection_role":data_role,
+        "auxiliary_connection_role":if auxiliary.is_some() { Some("target_outgoing") } else { None },
+        "outgoing_paths":outgoing.as_ref().map(|connection| paths_json(&path_samples(connection))),
+        "incoming_paths":incoming.as_ref().map(|connection| paths_json(&path_samples(connection)))
     }))?;
 
     let direct_deadline = std::cmp::min(
@@ -265,9 +424,9 @@ async fn run() -> Result<()> {
     let selected_before =
         selected_direct(&before_direct).context("selected IPv4 direct path missing")?;
     emit(json!({
-        "event":"direct_selected","role":args.role.as_str(),"data_connection_role":"client_outgoing",
+        "event":"direct_selected","role":args.role.as_str(),"relay_mode":args.relay_selection.as_str(),"data_connection_role":data_role,
         "elapsed_ms":direct_started.elapsed().as_millis(),"selected_path":sample_json(selected_before),
-        "paths":paths_json(&before_direct),"auxiliary_paths":paths_json(&path_samples(&auxiliary))
+        "paths":paths_json(&before_direct),"auxiliary_paths":auxiliary.as_ref().map(|connection| paths_json(&path_samples(connection)))
     }))?;
 
     ensure!(
@@ -281,18 +440,26 @@ async fn run() -> Result<()> {
         payload_path.id == selected_before.id,
         "selected direct path changed before payload"
     );
-    let (mut send, mut recv) = match args.role {
-        Role::Client => timeout_at(deadline, data.open_bi())
+    let local_opens_stream = match args.relay_selection {
+        RelaySelection::Private => args.role == Role::Client,
+        RelaySelection::Public => args.role == Role::Target,
+    };
+    let (mut send, mut recv) = if local_opens_stream {
+        timeout_at(deadline, data.open_bi())
             .await
-            .context("open stream timeout")??,
-        Role::Target => timeout_at(deadline, data.accept_bi())
+            .context("open stream timeout")??
+    } else {
+        timeout_at(deadline, data.accept_bi())
             .await
-            .context("accept stream timeout")??,
+            .context("accept stream timeout")??
     };
     let nonce_started = Instant::now();
-    let nonces = timeout_at(deadline, exchange_nonces(args.role, &mut send, &mut recv))
-        .await
-        .context("nonce exchange timeout")??;
+    let nonces = timeout_at(
+        deadline,
+        exchange_nonces(args.role, args.relay_selection, &mut send, &mut recv),
+    )
+    .await
+    .context("nonce exchange timeout")??;
     drop(send);
     drop(recv);
 
@@ -321,13 +488,13 @@ async fn run() -> Result<()> {
         && selected_after.is_some_and(|selected| selected.id == payload_path.id)
         && direct_bytes_grew;
     emit(json!({
-        "event":"nonce_result","role":args.role.as_str(),"data_connection_role":"client_outgoing",
+        "event":"nonce_result","role":args.role.as_str(),"relay_mode":args.relay_selection.as_str(),"data_connection_role":data_role,
         "nonce_bytes_per_direction":20*NONCES_PER_DIRECTION,"nonce_rounds":nonces,
         "nonce_echoes_match":echoes_match,"selected_direct_before":sample_json(payload_path),
         "selected_direct_after":selected_after.map(sample_json),"paths_before":paths_json(&paths_before),
         "paths_after":paths_json(&paths_after),"direct_path_udp_deltas":deltas,
         "direct_bytes_grew_both_directions":direct_bytes_grew,
-        "auxiliary_paths_after":paths_json(&path_samples(&auxiliary)),
+        "auxiliary_paths_after":auxiliary.as_ref().map(|connection| paths_json(&path_samples(connection))),
         "nonce_elapsed_ms":nonce_started.elapsed().as_millis(),"pass":pass
     }))?;
     ensure!(
@@ -336,7 +503,9 @@ async fn run() -> Result<()> {
     );
 
     data.close(VarInt::from_u32(0), b"AC diagnostic complete");
-    auxiliary.close(VarInt::from_u32(0), b"AC diagnostic complete");
+    if let Some(auxiliary) = auxiliary {
+        auxiliary.close(VarInt::from_u32(0), b"AC diagnostic complete");
+    }
     timeout_at(deadline, endpoint.close())
         .await
         .context("endpoint cleanup deadline")?;
@@ -348,6 +517,7 @@ async fn run() -> Result<()> {
 
 fn parse_args() -> Result<Args> {
     let mut role = None;
+    let mut relay_selection = None;
     let mut ca_file = None;
     let mut local_ip = None;
     let mut endpoint_secret_key_file = None;
@@ -359,6 +529,13 @@ fn parse_args() -> Result<Args> {
                     Some("target") => Role::Target,
                     Some("client") => Role::Client,
                     _ => bail!("--role must be target or client"),
+                })
+            }
+            "--relay-mode" => {
+                relay_selection = Some(match args.next().as_deref() {
+                    Some("private") => RelaySelection::Private,
+                    Some("public") => RelaySelection::Public,
+                    _ => bail!("--relay-mode must be private or public"),
                 })
             }
             "--ca-file" => ca_file = args.next().map(PathBuf::from),
@@ -375,17 +552,32 @@ fn parse_args() -> Result<Args> {
             }
             _ => {
                 bail!(
-                    "usage: udp_ac_check --role target|client --ca-file <PEM> --local-ip <IPv4> --endpoint-secret-key-file <FILE>"
+                    "usage: udp_ac_check --role target|client --relay-mode private|public [--ca-file <PEM>] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
                 )
             }
         }
     }
+    let relay_selection = relay_selection.context("--relay-mode is required")?;
+    match relay_selection {
+        RelaySelection::Private => {
+            ensure!(ca_file.is_some(), "private relay mode requires --ca-file");
+            ensure!(local_ip.is_some(), "private relay mode requires --local-ip");
+            ensure!(
+                endpoint_secret_key_file.is_some(),
+                "private relay mode requires --endpoint-secret-key-file"
+            );
+        }
+        RelaySelection::Public => ensure!(
+            local_ip.is_none() && endpoint_secret_key_file.is_none(),
+            "public mode uses a fresh key and the library's default socket bind"
+        ),
+    }
     Ok(Args {
         role: role.context("--role is required")?,
-        ca_file: ca_file.context("--ca-file is required")?,
-        local_ip: local_ip.context("--local-ip is required")?,
-        endpoint_secret_key_file: endpoint_secret_key_file
-            .context("--endpoint-secret-key-file is required")?,
+        relay_selection,
+        ca_file,
+        local_ip,
+        endpoint_secret_key_file,
     })
 }
 
@@ -489,13 +681,14 @@ fn path_deltas(before: &[PathSample], after: &[PathSample]) -> Vec<Value> {
 
 async fn exchange_nonces(
     role: Role,
+    relay_selection: RelaySelection,
     send: &mut SendStream,
     recv: &mut RecvStream,
 ) -> Result<Vec<Value>> {
     let mut out = Vec::with_capacity(NONCES_PER_DIRECTION * 2);
     for round in 1..=NONCES_PER_DIRECTION {
-        match role {
-            Role::Client => {
+        match (relay_selection, role) {
+            (RelaySelection::Private, Role::Client) => {
                 let nonce = rand::random::<[u8; 20]>();
                 send.write_all(&nonce).await?;
                 send.flush().await?;
@@ -509,7 +702,7 @@ async fn exchange_nonces(
                 send.flush().await?;
                 out.push(json!({"round":round,"direction":"target_to_client","nonce_sha256":URL_SAFE_NO_PAD.encode(Sha256::digest(target_nonce)),"echo_sent":true}));
             }
-            Role::Target => {
+            (RelaySelection::Private, Role::Target) => {
                 let mut client_nonce = [0; 20];
                 recv.read_exact(&mut client_nonce).await?;
                 send.write_all(&client_nonce).await?;
@@ -522,6 +715,34 @@ async fn exchange_nonces(
                 recv.read_exact(&mut echo).await?;
                 ensure!(echo == nonce, "target nonce echo mismatch");
                 out.push(json!({"round":round,"direction":"target_to_client","nonce_sha256":URL_SAFE_NO_PAD.encode(Sha256::digest(nonce)),"echo_matches":true}));
+            }
+            (RelaySelection::Public, Role::Target) => {
+                let nonce = rand::random::<[u8; 20]>();
+                send.write_all(&nonce).await?;
+                send.flush().await?;
+                let mut echo = [0; 20];
+                recv.read_exact(&mut echo).await?;
+                ensure!(echo == nonce, "target nonce echo mismatch");
+                out.push(json!({"round":round,"direction":"target_to_client","nonce_sha256":URL_SAFE_NO_PAD.encode(Sha256::digest(nonce)),"echo_matches":true}));
+                let mut client_nonce = [0; 20];
+                recv.read_exact(&mut client_nonce).await?;
+                send.write_all(&client_nonce).await?;
+                send.flush().await?;
+                out.push(json!({"round":round,"direction":"client_to_target","nonce_sha256":URL_SAFE_NO_PAD.encode(Sha256::digest(client_nonce)),"echo_sent":true}));
+            }
+            (RelaySelection::Public, Role::Client) => {
+                let mut target_nonce = [0; 20];
+                recv.read_exact(&mut target_nonce).await?;
+                send.write_all(&target_nonce).await?;
+                send.flush().await?;
+                out.push(json!({"round":round,"direction":"target_to_client","nonce_sha256":URL_SAFE_NO_PAD.encode(Sha256::digest(target_nonce)),"echo_sent":true}));
+                let nonce = rand::random::<[u8; 20]>();
+                send.write_all(&nonce).await?;
+                send.flush().await?;
+                let mut echo = [0; 20];
+                recv.read_exact(&mut echo).await?;
+                ensure!(echo == nonce, "client nonce echo mismatch");
+                out.push(json!({"round":round,"direction":"client_to_target","nonce_sha256":URL_SAFE_NO_PAD.encode(Sha256::digest(nonce)),"echo_matches":true}));
             }
         }
     }
