@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import select
+import signal
 import shlex
 import ssl
 import socket
@@ -1604,6 +1605,7 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
         stderr=subprocess.PIPE,
         env={**os.environ, **env},
         bufsize=0,
+        start_new_session=True,
     )
     stdout_chunks = []
     stderr_chunks = []
@@ -1638,7 +1640,7 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
                     pass
         if command_sent_at is not None and process.poll() is None and now >= process_deadline:
             try:
-                process.kill()
+                os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             process_timed_out = True
