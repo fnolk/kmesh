@@ -967,7 +967,7 @@ async fn register_agent_identity(
         .map_err(|_| ApiError::bad_request("target data EndpointId is invalid"))?;
     let canonical_data_endpoint_id = data_endpoint_id.to_string();
 
-    let mut tunnels = state.inner.tunnels.write().await;
+    let tunnels = state.inner.tunnels.write().await;
     let runtime = tunnels
         .get(&session_id)
         .cloned()
@@ -993,7 +993,7 @@ async fn register_agent_identity(
     )
     .map_err(|_| ApiError::unauthorized())?;
 
-    let mut phase = runtime.phase.lock().await;
+    let phase = runtime.phase.lock().await;
     if *phase != TunnelPhase::Pending || runtime.expires_at <= unix_time() {
         return Err(ApiError::conflict("SSH session is no longer pending"));
     }
@@ -1413,7 +1413,7 @@ async fn register_discovery(
                     client: ControlMessage::PunchPair {
                         session_id,
                         relay_mode,
-                        target_endpoint_id,
+                        target_endpoint_id: target_data_endpoint_id,
                         client_endpoint_id: runtime.client_endpoint_id.clone(),
                         peer_discovery: target_discovery,
                     },
