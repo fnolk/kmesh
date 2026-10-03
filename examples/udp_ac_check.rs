@@ -99,6 +99,8 @@ struct PeerReady {
     local_socket: String,
     relay_url: String,
     endpoint_addr: EndpointAddr,
+    #[serde(default)]
+    receiver_self_observed_candidates: Vec<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -238,10 +240,11 @@ async fn run() -> Result<()> {
     let mut relay_status = endpoint.home_relay_status();
     loop {
         let statuses = relay_status.get();
-        let b_relay_connected = statuses
+        let b_connected_now = statuses
             .iter()
             .any(|relay| relay.url() == &private_relay_url && relay.is_connected());
-        if args.mapping_candidates && b_relay_connected {
+        if args.mapping_candidates && b_connected_now {
+            let b_relay_connected = true;
             let actual_home_relay_url =
                 endpoint.addr().relay_urls().next().map(ToString::to_string);
             emit(json!({
@@ -430,6 +433,65 @@ async fn run() -> Result<()> {
         .local_socket
         .parse()
         .context("parse peer local socket")?;
+    if args.mapping_candidates {
+        ensure!(
+            !peer.receiver_self_observed_candidates.is_empty(),
+            "mapping-candidates requires this endpoint's successful QAD observations"
+        );
+        let mut own_candidates = Vec::new();
+        for candidate in peer.receiver_self_observed_candidates.iter().copied() {
+            ensure!(candidate.is_ipv4(), "own QAD observation must be IPv4");
+            ensure!(
+                candidate.ip() == IpAddr::V4(*global_v4.ip()),
+                "own QAD observation public IP differs from the B QAD address"
+            );
+            if !own_candidates.contains(&candidate) {
+                own_candidates.push(candidate);
+            }
+        }
+        ensure!(
+            own_candidates.contains(&SocketAddr::V4(global_v4)),
+            "own QAD observations omit the B QAD primary address"
+        );
+        let endpoint_addr_before = endpoint.addr();
+        for candidate in own_candidates.iter().copied() {
+            endpoint.add_external_addr(candidate).await;
+        }
+        let mut address_watcher = endpoint.watch_addr();
+        loop {
+            let current = address_watcher.get();
+            if own_candidates
+                .iter()
+                .all(|candidate| current.ip_addrs().any(|published| published == candidate))
+            {
+                break;
+            }
+            timeout_at(deadline, address_watcher.updated())
+                .await
+                .context("wait for same-endpoint QAD candidates to publish")?
+                .map_err(|_| anyhow!("endpoint address watcher disconnected"))?;
+        }
+        let endpoint_addr_after = endpoint.addr();
+        let actual_home_relay_url = endpoint_addr_after
+            .relay_urls()
+            .next()
+            .map(ToString::to_string);
+        let b_relay_connected = relay_status
+            .get()
+            .iter()
+            .any(|relay| relay.url() == &private_relay_url && relay.is_connected());
+        emit(json!({
+            "event": "local_candidates_published",
+            "role": args.role.as_str(),
+            "endpoint_id": endpoint.id().to_string(),
+            "bound_socket": bound_socket,
+            "actual_home_relay_url": actual_home_relay_url,
+            "b_relay_connected": b_relay_connected,
+            "receiver_self_observed_candidates": own_candidates,
+            "endpoint_addr_before": endpoint_addr_before,
+            "endpoint_addr_after": endpoint_addr_after
+        }))?;
+    }
     let peer_addr = peer.endpoint_addr.clone();
     emit(json!({
         "event":"peer_received", "role":args.role.as_str(), "local_endpoint_id":endpoint.id().to_string(),
