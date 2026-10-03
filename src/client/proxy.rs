@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use iroh::{Endpoint, EndpointAddr, SecretKey, Watcher, endpoint::PathEvent};
-use tokio::io::AsyncWriteExt;
+use iroh::{Endpoint, SecretKey, Watcher, endpoint::PathEvent};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ use crate::{
     protocol::{ControlMessage, RelayMode, TransportInfo, TunnelTicketClaims},
     transport::{
         IrohByteStream, IrohEndpointOptions, IrohPathKind, RelayChoice, TransportError,
-        connect_peer, create_endpoint, is_auth_failure_source, validate_endpoint_addr,
+        accept_peer, create_endpoint, is_auth_failure_source, wait_endpoint_ready,
     },
 };
 
@@ -29,7 +29,7 @@ const MAX_TICKET_FRAME: usize = 8 * 1024;
 
 struct TunnelOffer {
     ticket: String,
-    target_endpoint_addr: EndpointAddr,
+    target_endpoint_id: String,
     relay_mode: RelayMode,
 }
 
@@ -210,7 +210,6 @@ async fn open_ssh_session(
             target_id,
             &client_endpoint_id,
             context.api.issuer(),
-            &relay_choice,
             relay_mode,
         ),
     )
@@ -228,22 +227,9 @@ async fn open_ssh_session(
         offer.relay_mode == relay_mode,
         "offer relay mode differs from request"
     );
-    let target_ip_addrs = offer
-        .target_endpoint_addr
-        .ip_addrs()
-        .copied()
-        .collect::<Vec<_>>();
-    tracing::debug!(
-        session = %session_id,
-        relay_mode = ?offer.relay_mode,
-        target_endpoint_id = %offer.target_endpoint_addr.id,
-        target_ip_addrs = ?target_ip_addrs,
-        "received authenticated Iroh target candidates"
-    );
-
     let endpoint = create_endpoint(
         secret_key,
-        false,
+        true,
         IrohEndpointOptions {
             relay_choice: relay_choice.clone(),
             tls: context.config.tls.clone(),
@@ -252,59 +238,153 @@ async fn open_ssh_session(
     .await
     .map_err(anyhow::Error::new)
     .context("create client Iroh endpoint")?;
-    let connection = match tokio::time::timeout(
-        SESSION_SETUP_TIMEOUT,
-        connect_peer(&endpoint, offer.target_endpoint_addr.clone(), &relay_choice),
+    let mut activated = false;
+    wait_setup_step(
+        control,
+        &endpoint,
+        session_id,
+        relay_mode,
+        "waiting for client Iroh endpoint readiness",
+        &mut activated,
+        async {
+            wait_endpoint_ready(&endpoint, Duration::from_secs(20))
+                .await
+                .map_err(|error| classify_client_transport_error(&endpoint, error, relay_mode))
+        },
     )
-    .await
-    {
-        Ok(Ok(connection)) => connection,
-        Ok(Err(error)) => {
-            return Err(classify_client_transport_error(
-                &endpoint, error, relay_mode,
-            ));
-        }
-        Err(_) => {
-            if let Some(error) = private_relay_auth_failure(&endpoint, relay_mode) {
-                return Err(error);
-            }
-            return Err(private_network_timeout(
-                relay_mode,
-                "connecting to target Iroh endpoint",
-            ));
-        }
-    };
-    let mut stream = IrohByteStream::open_bi(connection)
-        .await
-        .map_err(|error| classify_client_transport_error(&endpoint, error, relay_mode))
-        .context("open SSH Iroh stream")?;
-    if let Err(error) = write_ticket(&mut stream, &offer.ticket)
-        .await
-        .context("send signed SSH ticket to target")
-    {
-        let _ = stream.reset();
-        return Err(classify_anyhow_network_error(error, relay_mode));
-    }
-    let activated = match tokio::time::timeout(
-        SESSION_SETUP_TIMEOUT,
-        wait_activated(control, session_id, relay_mode),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(private_network_timeout(
+    .await?;
+    let client_endpoint_addr = endpoint.addr();
+    ensure_auth(
+        client_endpoint_addr.id.to_string() == client_endpoint_id,
+        "client EndpointId differs from the SSH attempt identity",
+    )?;
+    tracing::debug!(
+        session = %session_id,
+        relay_mode = ?relay_mode,
+        client_endpoint_id = %client_endpoint_addr.id,
+        client_ip_addrs = ?client_endpoint_addr.ip_addrs().copied().collect::<Vec<_>>(),
+        "publishing prepared client Iroh candidates"
+    );
+    Api::send_control(
+        control,
+        &ControlMessage::ClientReady {
+            session_id,
             relay_mode,
-            "waiting for SSH activation",
-        )),
-    };
-    if let Err(error) = activated {
-        let _ = stream.reset();
-        return Err(error);
+            client_endpoint_addr,
+        },
+    )
+    .await?;
+
+    let connection = wait_setup_step(
+        control,
+        &endpoint,
+        session_id,
+        relay_mode,
+        "waiting for target Iroh connection",
+        &mut activated,
+        async {
+            accept_peer(&endpoint)
+                .await
+                .map_err(|error| classify_client_transport_error(&endpoint, error, relay_mode))
+        },
+    )
+    .await?;
+    ensure_auth(
+        connection.remote_id().to_string() == offer.target_endpoint_id,
+        "Iroh peer EndpointId differs from the signed target EndpointId",
+    )?;
+    let mut stream = wait_setup_step(
+        control,
+        &endpoint,
+        session_id,
+        relay_mode,
+        "waiting for target SSH stream",
+        &mut activated,
+        async {
+            IrohByteStream::accept_bi(connection)
+                .await
+                .map_err(|error| classify_client_transport_error(&endpoint, error, relay_mode))
+        },
+    )
+    .await?;
+    let received_ticket = wait_setup_step(
+        control,
+        &endpoint,
+        session_id,
+        relay_mode,
+        "waiting for signed SSH ticket",
+        &mut activated,
+        async { read_ticket(&mut stream).await },
+    )
+    .await?;
+    ensure_auth(
+        received_ticket == offer.ticket,
+        "Iroh stream ticket differs from the signed client offer",
+    )?;
+    if !activated {
+        tokio::time::timeout(
+            SESSION_SETUP_TIMEOUT,
+            wait_activated(control, session_id, relay_mode),
+        )
+        .await
+        .map_err(|_| {
+            private_relay_auth_failure(&endpoint, relay_mode).unwrap_or_else(|| {
+                private_network_timeout(relay_mode, "waiting for SSH activation")
+            })
+        })?
+        .map_err(|error| classify_anyhow_network_error(error, relay_mode))?;
     }
     Ok(OpenSshSession {
         _endpoint: endpoint,
         stream,
     })
+}
+
+async fn wait_setup_step<T>(
+    control: &mut WsStream,
+    endpoint: &Endpoint,
+    session_id: Uuid,
+    relay_mode: RelayMode,
+    stage: &'static str,
+    activated: &mut bool,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let mut operation = Box::pin(operation);
+    let wait = async {
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut operation => {
+                    return result.map_err(|error| classify_anyhow_network_error(error, relay_mode));
+                }
+                message = control.next() => {
+                    let message = message
+                        .context("control WebSocket ended during SSH setup")
+                        .and_then(|message| message.context("read control WebSocket during SSH setup"))
+                        .map_err(|error| classify_anyhow_network_error(error, relay_mode))?;
+                    if matches!(message, Message::Ping(_) | Message::Pong(_)) {
+                        continue;
+                    }
+                    match Api::control_message(message)? {
+                        ControlMessage::Activated { session_id: received } if received == session_id => {
+                            *activated = true;
+                        }
+                        ControlMessage::Error { session_id: Some(received), code, message }
+                            if received == session_id => return Err(server_setup_error(code, message, relay_mode)),
+                        ControlMessage::Close { session_id: received, reason }
+                            if received == session_id => bail!("server closed SSH session during setup: {reason}"),
+                        _ => tracing::debug!(session = %session_id, "ignoring unexpected control message during Iroh setup"),
+                    }
+                }
+            }
+        }
+    };
+    tokio::time::timeout(SESSION_SETUP_TIMEOUT, wait)
+        .await
+        .map_err(|_| {
+            private_relay_auth_failure(endpoint, relay_mode)
+                .unwrap_or_else(|| private_network_timeout(relay_mode, stage))
+        })?
 }
 
 fn endpoint_relay_choice(
@@ -431,7 +511,6 @@ async fn next_offer(
     target_id: Uuid,
     client_endpoint_id: &str,
     issuer: &str,
-    relay_choice: &RelayChoice,
     expected_mode: RelayMode,
 ) -> Result<TunnelOffer> {
     loop {
@@ -444,12 +523,12 @@ async fn next_offer(
             continue;
         }
         match Api::control_message(message)? {
-            ControlMessage::Offer {
+            ControlMessage::ClientOffer {
                 session_id: received,
                 target_id: offered_target,
                 ticket,
                 client_endpoint_id: offered_client,
-                target_endpoint_addr,
+                target_endpoint_id,
                 ticket_public_key_pem,
                 relay_mode,
             } if received == session_id => {
@@ -472,13 +551,12 @@ async fn next_offer(
                     session_id,
                     target_id,
                     client_endpoint_id,
-                    &target_endpoint_addr,
-                    relay_choice,
+                    &target_endpoint_id,
                     expected_mode,
                 )?;
                 return Ok(TunnelOffer {
                     ticket,
-                    target_endpoint_addr,
+                    target_endpoint_id,
                     relay_mode,
                 });
             }
@@ -488,6 +566,12 @@ async fn next_offer(
                 message,
             } if received == session_id => {
                 return Err(server_setup_error(code, message, expected_mode));
+            }
+            ControlMessage::Close {
+                session_id: received,
+                reason,
+            } if received == session_id => {
+                bail!("server closed SSH session before target offer: {reason}");
             }
             _ => {
                 tracing::debug!(session = %session_id, "ignoring unexpected control message before target offer")
@@ -501,8 +585,7 @@ fn validate_offer(
     session_id: Uuid,
     target_id: Uuid,
     client_endpoint_id: &str,
-    target_endpoint_addr: &EndpointAddr,
-    relay_choice: &RelayChoice,
+    target_endpoint_id: &str,
     expected_mode: RelayMode,
 ) -> Result<()> {
     ensure_auth(
@@ -515,15 +598,13 @@ fn validate_offer(
         "ticket client EndpointId mismatch",
     )?;
     ensure_auth(
-        claims.target_endpoint_id == target_endpoint_addr.id.to_string(),
+        claims.target_endpoint_id == target_endpoint_id,
         "ticket target EndpointId mismatch",
     )?;
     ensure_auth(
         claims.relay_mode == expected_mode,
         "ticket relay mode differs from the requested mode",
     )?;
-    validate_endpoint_addr(target_endpoint_addr, relay_choice)
-        .map_err(|error| anyhow!(SshAuthenticationFailure(error.to_string())))?;
     ensure_auth(
         claims.aud == TUNNEL_TICKET_AUDIENCE,
         "ticket audience mismatch",
@@ -543,24 +624,38 @@ fn validate_offer(
                 "client EndpointId is invalid".to_owned()
             ))
         })?;
+    target_endpoint_id
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| {
+            anyhow!(SshAuthenticationFailure(
+                "target EndpointId is invalid".to_owned()
+            ))
+        })?;
     Ok(())
 }
 
-async fn write_ticket(stream: &mut IrohByteStream, ticket: &str) -> Result<()> {
-    let bytes = ticket.as_bytes();
-    anyhow::ensure!(
-        bytes.len() <= MAX_TICKET_FRAME,
-        "signed ticket exceeds the handshake frame limit"
-    );
+async fn read_ticket(stream: &mut IrohByteStream) -> Result<String> {
+    let mut length_bytes = [0; 4];
     stream
-        .write_u32(bytes.len() as u32)
+        .read_exact(&mut length_bytes)
         .await
-        .context("write ticket frame length")?;
+        .context("read ticket frame length")?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    if length == 0 || length > MAX_TICKET_FRAME {
+        return Err(anyhow!(SshAuthenticationFailure(
+            "ticket frame length is invalid".to_owned()
+        )));
+    }
+    let mut bytes = vec![0; length];
     stream
-        .write_all(bytes)
+        .read_exact(&mut bytes)
         .await
-        .context("write ticket frame")?;
-    stream.flush().await.context("flush ticket frame")
+        .context("read ticket frame")?;
+    String::from_utf8(bytes).map_err(|error| {
+        anyhow!(SshAuthenticationFailure(format!(
+            "ticket frame is not UTF-8: {error}"
+        )))
+    })
 }
 
 async fn wait_activated(
@@ -628,11 +723,11 @@ async fn copy_stdio(stream: &mut IrohByteStream) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PrivateNetworkFailure, classify_transport_error, new_attempt_identity, server_setup_error,
-    };
+    use super::*;
     use crate::{protocol::RelayMode, transport::TransportError};
+    use iroh::{Endpoint, SecretKey, endpoint::presets};
     use std::io;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn retryable_private_failures_use_a_fresh_session_and_endpoint_key() {
@@ -682,6 +777,81 @@ mod tests {
             server_auth
                 .downcast_ref::<PrivateNetworkFailure>()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_ticket_disconnect_is_retryable_but_invalid_frame_is_authentication() {
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![crate::transport::IROH_SSH_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind local client endpoint");
+        let agent = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind local target endpoint");
+        let client_addr = client.addr();
+        let accepting = tokio::spawn(async move { accept_peer(&client).await });
+        let connection = connect_peer(&agent, client_addr, &RelayChoice::PublicDefault)
+            .await
+            .expect("target connects to accepting client");
+        let incoming = tokio::time::timeout(Duration::from_secs(5), accepting)
+            .await
+            .expect("client did not accept target")
+            .expect("client accept task panicked")
+            .expect("accept target connection");
+        let mut target_stream = IrohByteStream::open_bi(connection)
+            .await
+            .expect("target opens ticket stream");
+        let mut client_stream = IrohByteStream::accept_bi(incoming)
+            .await
+            .expect("client accepts ticket stream");
+
+        target_stream
+            .write_u32(0)
+            .await
+            .expect("write invalid ticket frame length");
+        target_stream
+            .write_u32(32)
+            .await
+            .expect("write partial ticket frame length");
+        target_stream
+            .write_all(b"partial")
+            .await
+            .expect("write partial ticket frame");
+        target_stream.flush().await.expect("flush ticket frames");
+
+        let invalid = read_ticket(&mut client_stream)
+            .await
+            .expect_err("zero-length ticket frame must be rejected");
+        assert!(invalid.downcast_ref::<SshAuthenticationFailure>().is_some());
+        assert!(
+            classify_anyhow_network_error(invalid, RelayMode::Private)
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_none()
+        );
+
+        let pending_read = read_ticket(&mut client_stream);
+        tokio::pin!(pending_read);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending_read)
+                .await
+                .is_err()
+        );
+        target_stream.reset().expect("reset partial ticket stream");
+        let network = pending_read
+            .await
+            .expect_err("reset during a partial ticket must fail");
+        assert!(network.downcast_ref::<SshAuthenticationFailure>().is_none());
+        assert!(
+            classify_anyhow_network_error(network, RelayMode::Private)
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_some()
         );
     }
 }

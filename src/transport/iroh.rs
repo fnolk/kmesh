@@ -2,12 +2,14 @@ use std::{
     collections::BTreeSet,
     fs::File,
     io::{self, BufReader},
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use iroh::{
-    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey,
+    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey, Watcher as _,
     endpoint::{
         Connection, NetReportConfig, PortmapperConfig, RecvStream, SendStream, VarInt, presets,
     },
@@ -122,6 +124,76 @@ pub async fn accept_peer(endpoint: &Endpoint) -> Result<Connection, TransportErr
         .await
         .ok_or(TransportError::EndpointClosed)?;
     incoming.await.map_err(TransportError::IrohConnecting)
+}
+
+pub async fn wait_endpoint_ready(
+    endpoint: &Endpoint,
+    timeout: Duration,
+) -> Result<(), TransportError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut status = endpoint.home_relay_status();
+    loop {
+        let relays = status.get();
+        if relays.iter().any(|relay| relay.is_connected()) {
+            break;
+        }
+        if let Some(reason) = relays.iter().find_map(|relay| relay.auth_denied_reason()) {
+            return Err(TransportError::Authentication(reason.to_owned()));
+        }
+        if let Some(error) = relays
+            .iter()
+            .filter_map(|relay| relay.last_error())
+            .find(|error| crate::transport::is_auth_failure_source(*error))
+        {
+            return Err(TransportError::Authentication(error.to_string()));
+        }
+        tokio::select! {
+            update = status.updated() => {
+                if update.is_err() {
+                    return Err(TransportError::EndpointClosed);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(TransportError::Timeout("Iroh relay registration"));
+            }
+        }
+    }
+
+    let mut report = endpoint.net_report();
+    let report = tokio::time::timeout_at(deadline, report.initialized())
+        .await
+        .map_err(|_| TransportError::Timeout("Iroh initial network report"))?;
+
+    let observed = [
+        report.global_v4.map(SocketAddr::V4),
+        report.global_v6.map(SocketAddr::V6),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !observed.is_empty() {
+        let mut address = endpoint.watch_addr();
+        loop {
+            let current = address.get();
+            if observed
+                .iter()
+                .all(|observed| current.ip_addrs().any(|candidate| candidate == observed))
+            {
+                break;
+            }
+            tokio::select! {
+                update = address.updated() => {
+                    if update.is_err() {
+                        return Err(TransportError::EndpointClosed);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(TransportError::Timeout("publishing Iroh observed addresses"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct IrohByteStream {

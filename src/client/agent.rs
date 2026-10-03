@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs, io,
+    fs,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
@@ -8,10 +8,9 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
-use iroh::Watcher;
-use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::Connection};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 use tokio::{
-    io::AsyncReadExt,
+    io::AsyncWriteExt,
     net::TcpStream,
     sync::{Mutex, mpsc},
     task::JoinSet,
@@ -27,8 +26,8 @@ use crate::{
         TunnelTicketClaims,
     },
     transport::{
-        IrohByteStream, IrohEndpointOptions, RelayChoice, TransportError, accept_peer,
-        create_endpoint,
+        IrohByteStream, IrohEndpointOptions, RelayChoice, TransportError, connect_peer,
+        create_endpoint, validate_endpoint_addr, wait_endpoint_ready,
     },
 };
 
@@ -54,20 +53,17 @@ struct TunnelOffer {
     target_id: Uuid,
     ticket: String,
     client_endpoint_id: String,
-    target_endpoint_addr: EndpointAddr,
+    client_endpoint_addr: EndpointAddr,
     ticket_public_key_pem: String,
     relay_mode: RelayMode,
 }
 
 type EndpointMap = Arc<Mutex<HashMap<RelayMode, Endpoint>>>;
-type PendingPeers = Arc<Mutex<HashMap<(RelayMode, String), mpsc::Sender<Connection>>>>;
 
 struct AgentRuntime {
     endpoint_secret_key: SecretKey,
     transport_info: TransportInfo,
     endpoints: EndpointMap,
-    pending_peers: PendingPeers,
-    accept_tasks: JoinSet<()>,
     active_sessions: JoinSet<()>,
     completed_sessions: Arc<StdMutex<Vec<Uuid>>>,
 }
@@ -79,18 +75,6 @@ struct AgentAuthenticationFailure(String);
 #[derive(Debug, thiserror::Error)]
 #[error("server selected an authentication failure: {0}")]
 struct ServerAuthenticationFailure(String);
-
-#[derive(Debug, thiserror::Error)]
-enum TicketReadError {
-    #[error("{context}: {source}")]
-    Io {
-        context: &'static str,
-        #[source]
-        source: io::Error,
-    },
-    #[error("invalid ticket frame: {0}")]
-    Invalid(String),
-}
 
 pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &str) -> Result<()> {
     let credential_path = profile::agent_credentials_path(&context.config.data_dir, target_id);
@@ -149,8 +133,6 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
         endpoint_secret_key: decode_secret_key(&credentials.endpoint_secret_key)?,
         transport_info: context.api.transport_info().await?,
         endpoints: Arc::new(Mutex::new(HashMap::new())),
-        pending_peers: Arc::new(Mutex::new(HashMap::new())),
-        accept_tasks: JoinSet::new(),
         active_sessions: JoinSet::new(),
         completed_sessions: Arc::new(StdMutex::new(Vec::new())),
     };
@@ -165,7 +147,6 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                         tracing::warn!(target = %target_id, error = %error, "active SSH session ended");
                     }
                 }
-                runtime.accept_tasks.abort_all();
                 return Err(error);
             }
             Err(error) => {
@@ -234,42 +215,12 @@ async fn send_control_sink(
         .context("send agent control message")
 }
 
-async fn accept_connections(
-    endpoint: Endpoint,
-    relay_mode: RelayMode,
-    pending_peers: PendingPeers,
-) {
-    loop {
-        let connection = match accept_peer(&endpoint).await {
-            Ok(connection) => connection,
-            Err(error) => {
-                tracing::warn!(error = %error, "accepting Iroh SSH connection failed");
-                sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        let remote_id = connection.remote_id().to_string();
-        let sender = pending_peers
-            .lock()
-            .await
-            .get(&(relay_mode, remote_id.clone()))
-            .cloned();
-        if let Some(sender) = sender
-            && sender.send(connection).await.is_err()
-        {
-            tracing::debug!(remote = %remote_id, "Iroh connection arrived after its offer expired");
-        }
-    }
-}
-
 async fn prepare_endpoint(
     context: &ClientContext,
     endpoint_secret_key: &SecretKey,
     transport_info: &TransportInfo,
     relay_mode: RelayMode,
     endpoints: &EndpointMap,
-    pending_peers: &PendingPeers,
-    accept_tasks: &mut JoinSet<()>,
 ) -> std::result::Result<EndpointAddr, TransportError> {
     let endpoint = {
         let mut endpoints = endpoints.lock().await;
@@ -278,49 +229,13 @@ async fn prepare_endpoint(
         } else {
             let options = endpoint_options(context, transport_info, relay_mode)
                 .map_err(|error| TransportError::Configuration(error.to_string()))?;
-            let endpoint = create_endpoint(endpoint_secret_key.clone(), true, options).await?;
+            let endpoint = create_endpoint(endpoint_secret_key.clone(), false, options).await?;
             endpoints.insert(relay_mode, endpoint.clone());
-            let accept_endpoint = endpoint.clone();
-            let accept_peers = pending_peers.clone();
-            accept_tasks.spawn(async move {
-                accept_connections(accept_endpoint, relay_mode, accept_peers).await;
-            });
             endpoint
         }
     };
-    wait_endpoint_online(&endpoint).await?;
+    wait_endpoint_ready(&endpoint, RELAY_ENDPOINT_TIMEOUT).await?;
     Ok(endpoint.addr())
-}
-
-async fn wait_endpoint_online(endpoint: &Endpoint) -> std::result::Result<(), TransportError> {
-    let deadline = tokio::time::Instant::now() + RELAY_ENDPOINT_TIMEOUT;
-    let mut status = endpoint.home_relay_status();
-    loop {
-        let relays = status.get();
-        if relays.iter().any(|relay| relay.is_connected()) {
-            return Ok(());
-        }
-        if let Some(reason) = relays.iter().find_map(|relay| relay.auth_denied_reason()) {
-            return Err(TransportError::Authentication(reason.to_owned()));
-        }
-        if let Some(error) = relays
-            .iter()
-            .filter_map(|relay| relay.last_error())
-            .find(|error| crate::transport::is_auth_failure_source(*error))
-        {
-            return Err(TransportError::Authentication(error.to_string()));
-        }
-        tokio::select! {
-            update = status.updated() => {
-                if update.is_err() {
-                    return Err(TransportError::EndpointClosed);
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                return Err(TransportError::Timeout("target Iroh relay registration"));
-            }
-        }
-    }
 }
 
 async fn control_session(
@@ -383,10 +298,15 @@ async fn control_session(
                             &runtime.transport_info,
                             relay_mode,
                             &runtime.endpoints,
-                            &runtime.pending_peers,
-                            &mut runtime.accept_tasks,
                         ).await {
                             Ok(endpoint_addr) => {
+                                tracing::debug!(
+                                    session = %session_id,
+                                    relay_mode = ?relay_mode,
+                                    target_endpoint_id = %endpoint_addr.id,
+                                    target_ip_addrs = ?endpoint_addr.ip_addrs().copied().collect::<Vec<_>>(),
+                                    "prepared target Iroh dial endpoint"
+                                );
                                 send_control_sink(&mut writer, &ControlMessage::AgentReady {
                                     session_id: Some(session_id),
                                     relay_mode,
@@ -411,12 +331,12 @@ async fn control_session(
                             }
                         }
                     }
-                    ControlMessage::Offer {
+                    ControlMessage::DialOffer {
                         session_id,
                         target_id,
                         ticket,
                         client_endpoint_id,
-                        target_endpoint_addr,
+                        client_endpoint_addr,
                         ticket_public_key_pem,
                         relay_mode,
                     } => {
@@ -425,20 +345,28 @@ async fn control_session(
                             target_id,
                             ticket,
                             client_endpoint_id,
-                            target_endpoint_addr,
+                            client_endpoint_addr,
                             ticket_public_key_pem,
                             relay_mode,
                         };
-                        let claims = decode_tunnel_ticket(
+                        let claims = match decode_tunnel_ticket(
                             &offer.ticket,
                             &offer.ticket_public_key_pem,
                             context.api.issuer(),
-                        )
-                        .map_err(|error| AgentAuthenticationFailure(error.to_string()));
-                        let validation = claims
-                            .map_err(anyhow::Error::new)
-                            .and_then(|claims| validate_ticket(&claims, &offer, credentials));
-                        if let Err(error) = validation {
+                        ) {
+                            Ok(claims) => claims,
+                            Err(error) => {
+                                outbound_tx.send(ControlMessage::Error {
+                                    session_id: Some(session_id),
+                                    code: "authentication".to_owned(),
+                                    message: error.to_string(),
+                                }).await.context("report invalid signed tunnel offer")?;
+                                continue;
+                            }
+                        };
+                        let endpoint = runtime.endpoints.lock().await.get(&relay_mode).cloned()
+                            .context("offer relay endpoint has not been prepared")?;
+                        if let Err(error) = validate_ticket(&claims, &offer, credentials, endpoint.id()) {
                             outbound_tx.send(ControlMessage::Error {
                                 session_id: Some(session_id),
                                 code: "authentication".to_owned(),
@@ -446,8 +374,6 @@ async fn control_session(
                             }).await.context("report invalid signed tunnel offer")?;
                             continue;
                         }
-                        let endpoint = runtime.endpoints.lock().await.get(&relay_mode).cloned()
-                            .context("offer relay endpoint has not been prepared")?;
                         let relay_choice = match endpoint_options(context, &runtime.transport_info, relay_mode) {
                             Ok(options) => options.relay_choice,
                             Err(error) => {
@@ -459,44 +385,42 @@ async fn control_session(
                                 continue;
                             }
                         };
-                        if let Err(error) = crate::transport::validate_endpoint_addr(
-                            &offer.target_endpoint_addr,
+                        if offer.client_endpoint_addr.id.to_string() != offer.client_endpoint_id
+                            || offer.client_endpoint_addr.ip_addrs().count() > 32
+                            || offer.client_endpoint_addr.relay_urls().next().is_none()
+                        {
+                            outbound_tx.send(ControlMessage::Error {
+                                session_id: Some(session_id),
+                                code: "authentication".to_owned(),
+                                message: "client EndpointAddr differs from the ticket identity or exceeds limits".to_owned(),
+                            }).await.context("reject invalid client EndpointAddr")?;
+                            continue;
+                        }
+                        if let Err(error) = validate_endpoint_addr(
+                            &offer.client_endpoint_addr,
                             &relay_choice,
                         ) {
                             outbound_tx.send(ControlMessage::Error {
                                 session_id: Some(session_id),
                                 code: "authentication".to_owned(),
                                 message: error.to_string(),
-                            }).await.context("reject untrusted target relay address")?;
-                            continue;
-                        }
-                        if offer.target_endpoint_addr.id != endpoint.id() {
-                            outbound_tx.send(ControlMessage::Error {
-                                session_id: Some(session_id),
-                                code: "authentication".to_owned(),
-                                message: "offer EndpointId differs from this agent".to_owned(),
-                            }).await.context("reject offer for another target EndpointId")?;
+                            }).await.context("reject untrusted client relay address")?;
                             continue;
                         }
                         anyhow::ensure!(!sessions.contains_key(&session_id), "duplicate offer for session {session_id}");
-                        let (peer_tx, peer_rx) = mpsc::channel(1);
-                        {
-                            let mut peers = runtime.pending_peers.lock().await;
-                            anyhow::ensure!(peers.insert((relay_mode, offer.client_endpoint_id.clone()), peer_tx).is_none(), "client EndpointId already has a pending offer");
-                        }
                         let (session_tx, session_rx) = mpsc::channel(16);
                         sessions.insert(session_id, session_tx);
                         let context = context.clone();
+                        let relay_choice = relay_choice.clone();
                         let outbound_tx = outbound_tx.clone();
                         let done_tx = done_tx.clone();
                         let completed_sessions = runtime.completed_sessions.clone();
-                        let pending_peers = runtime.pending_peers.clone();
                         runtime.active_sessions.spawn(async move {
-                            let peer_endpoint_id = offer.client_endpoint_id.clone();
-                            let result = handle_offer(
+                            let result = handle_dial_offer(
                                 &context,
                                 offer,
-                                peer_rx,
+                                endpoint,
+                                relay_choice,
                                 session_rx,
                                 outbound_tx.clone(),
                             )
@@ -512,14 +436,8 @@ async fn control_session(
                                     remember_completed(&completed_sessions, session_id);
                                 }
                             }
-                            pending_peers
-                                .lock()
-                                .await
-                                .remove(&(relay_mode, peer_endpoint_id));
                             let _ = done_tx.send(session_id).await;
                         });
-                        send_control_sink(&mut writer, &ControlMessage::OfferReady { session_id, relay_mode })
-                            .await.context("confirm target is ready for Iroh connection")?;
                     }
                     ControlMessage::Error { session_id: None, code, message }
                         if code == "authentication" || code == "authorization" =>
@@ -539,10 +457,11 @@ async fn control_session(
     }
 }
 
-async fn handle_offer(
+async fn handle_dial_offer(
     context: &ClientContext,
     offer: TunnelOffer,
-    mut peer_rx: mpsc::Receiver<Connection>,
+    endpoint: Endpoint,
+    relay_choice: RelayChoice,
     mut control_rx: mpsc::Receiver<ControlMessage>,
     outbound: mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
@@ -552,11 +471,13 @@ async fn handle_offer(
             control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
                 control.map(|()| None)
             },
-            connection = peer_rx.recv() => connection.context("agent peer listener stopped").map(Some),
+            connection = connect_peer(&endpoint, offer.client_endpoint_addr.clone(), &relay_choice) => {
+                connection.map(Some).map_err(transport_error)
+            },
         }
     })
         .await
-        .context("timed out waiting for the authenticated Iroh peer")?
+        .context("timed out connecting to the client Iroh endpoint")?
         ?;
     let Some(connection) = connection else {
         return Ok(());
@@ -573,23 +494,16 @@ async fn handle_offer(
             control?;
             return Ok(());
         },
-        result = IrohByteStream::accept_bi(connection) => result.map_err(transport_error)?,
+        result = IrohByteStream::open_bi(connection) => result.map_err(transport_error)?,
     };
-    let ticket_in_stream = tokio::select! {
+    tokio::select! {
         biased;
         control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
             control?;
             return Ok(());
         },
-        result = read_ticket(&mut stream) => result.map_err(|error| match error {
-            TicketReadError::Io { .. } => anyhow!(error),
-            TicketReadError::Invalid(message) => anyhow!(AgentAuthenticationFailure(message)),
-        })?,
-    };
-    ensure_auth(
-        ticket_in_stream == offer.ticket,
-        "Iroh stream ticket differs from its offer",
-    )?;
+        result = write_ticket(&mut stream, &offer.ticket) => result.context("send signed tunnel ticket to client")?,
+    }
     outbound
         .send(ControlMessage::IrohReady {
             session_id: offer.session_id,
@@ -638,6 +552,23 @@ async fn handle_offer(
     }
 }
 
+async fn write_ticket(stream: &mut IrohByteStream, ticket: &str) -> Result<()> {
+    let bytes = ticket.as_bytes();
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_TICKET_FRAME,
+        "signed ticket exceeds the handshake frame limit"
+    );
+    stream
+        .write_u32(bytes.len() as u32)
+        .await
+        .context("write ticket frame length")?;
+    stream
+        .write_all(bytes)
+        .await
+        .context("write ticket frame")?;
+    stream.flush().await.context("flush ticket frame")
+}
+
 async fn wait_for_setup_cancellation(
     session_id: Uuid,
     inbound: &mut mpsc::Receiver<ControlMessage>,
@@ -668,6 +599,7 @@ fn validate_ticket(
     claims: &TunnelTicketClaims,
     offer: &TunnelOffer,
     credentials: &AgentCredentials,
+    target_endpoint_id: iroh::EndpointId,
 ) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -690,8 +622,12 @@ fn validate_ticket(
         "ticket client EndpointId mismatch",
     )?;
     ensure_auth(
-        claims.target_endpoint_id == offer.target_endpoint_addr.id.to_string(),
+        claims.target_endpoint_id == target_endpoint_id.to_string(),
         "ticket target EndpointId mismatch",
+    )?;
+    ensure_auth(
+        offer.client_endpoint_addr.id.to_string() == offer.client_endpoint_id,
+        "client EndpointAddr differs from the ticket client EndpointId",
     )?;
     ensure_auth(
         claims.relay_mode == offer.relay_mode,
@@ -754,43 +690,17 @@ async fn wait_activated(
     }
 }
 
-async fn read_ticket(stream: &mut IrohByteStream) -> std::result::Result<String, TicketReadError> {
-    let mut length_bytes = [0; 4];
-    stream
-        .read_exact(&mut length_bytes)
-        .await
-        .map_err(|source| TicketReadError::Io {
-            context: "read ticket frame length",
-            source,
-        })?;
-    let length = u32::from_be_bytes(length_bytes) as usize;
-    if length == 0 || length > MAX_TICKET_FRAME {
-        return Err(TicketReadError::Invalid(
-            "ticket frame length is invalid".to_owned(),
-        ));
-    }
-    let mut bytes = vec![0; length];
-    stream
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|source| TicketReadError::Io {
-            context: "read ticket frame",
-            source,
-        })?;
-    String::from_utf8(bytes)
-        .map_err(|error| TicketReadError::Invalid(format!("ticket frame is not UTF-8: {error}")))
-}
-
 fn message_session_id(message: &ControlMessage) -> Option<Uuid> {
     match message {
         ControlMessage::Activated { session_id }
         | ControlMessage::IrohReady { session_id, .. }
-        | ControlMessage::OfferReady { session_id, .. }
+        | ControlMessage::DialOffer { session_id, .. }
         | ControlMessage::Prepare { session_id, .. }
         | ControlMessage::Close { session_id, .. } => Some(*session_id),
         ControlMessage::Error { session_id, .. } => *session_id,
         ControlMessage::Open { .. }
-        | ControlMessage::Offer { .. }
+        | ControlMessage::ClientOffer { .. }
+        | ControlMessage::ClientReady { .. }
         | ControlMessage::AgentReady {
             session_id: None, ..
         } => None,
@@ -833,8 +743,7 @@ fn transport_error(error: TransportError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh::{Endpoint, SecretKey, endpoint::presets};
-    use tokio::io::AsyncWriteExt;
+    use iroh::{Endpoint, endpoint::presets};
 
     async fn context(server_url: &str) -> ClientContext {
         let config = crate::config::Config {
@@ -852,79 +761,40 @@ mod tests {
         }
     }
 
-    async fn local_iroh_connections() -> (Endpoint, Endpoint, Connection, Connection) {
-        let target = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::generate())
-            .alpns(vec![crate::transport::IROH_SSH_ALPN.to_vec()])
-            .relay_mode(iroh::RelayMode::Disabled)
-            .bind()
-            .await
-            .expect("bind local target Iroh endpoint");
+    async fn local_endpoints() -> (Endpoint, Endpoint) {
         let client = Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::generate())
             .alpns(vec![crate::transport::IROH_SSH_ALPN.to_vec()])
             .relay_mode(iroh::RelayMode::Disabled)
             .bind()
             .await
-            .expect("bind local client Iroh endpoint");
-
-        let target_accept = {
-            let target = target.clone();
-            tokio::spawn(async move {
-                target
-                    .accept()
-                    .await
-                    .expect("target endpoint closed")
-                    .await
-                    .expect("accept local client connection")
-            })
-        };
-        let client_connection = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.connect(target.addr(), crate::transport::IROH_SSH_ALPN),
-        )
-        .await
-        .expect("local Iroh connection timed out")
-        .expect("connect local Iroh endpoints");
-        let target_connection = tokio::time::timeout(Duration::from_secs(5), target_accept)
+            .expect("bind local accepting client endpoint");
+        let target = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
             .await
-            .expect("target Iroh accept timed out")
-            .expect("target accept task failed");
-        (target, client, target_connection, client_connection)
+            .expect("bind local dialing target endpoint");
+        (client, target)
     }
 
-    fn offer(client_endpoint_id: String, ticket: &str) -> TunnelOffer {
+    fn offer(client: &Endpoint) -> TunnelOffer {
         TunnelOffer {
             session_id: Uuid::new_v4(),
             target_id: Uuid::new_v4(),
-            ticket: ticket.to_owned(),
-            client_endpoint_id,
-            target_endpoint_addr: EndpointAddr::new(SecretKey::generate().public()),
+            ticket: "signed-test-ticket".to_owned(),
+            client_endpoint_id: client.id().to_string(),
+            client_endpoint_addr: client.addr(),
             ticket_public_key_pem: String::new(),
-            relay_mode: RelayMode::Private,
+            relay_mode: RelayMode::PublicDefault,
         }
     }
 
     async fn await_offer(task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
-            .expect("agent offer did not finish promptly")
-            .expect("agent offer task panicked")
-    }
-
-    async fn handle_connected_offer(
-        context: &ClientContext,
-        offer: TunnelOffer,
-        target_connection: Connection,
-    ) -> Result<()> {
-        let (peer_tx, peer_rx) = mpsc::channel(1);
-        peer_tx
-            .send(target_connection)
-            .await
-            .expect("route local peer connection to agent");
-        let (_control_tx, control_rx) = mpsc::channel(1);
-        let (outbound, _outbound_rx) = mpsc::channel(1);
-        handle_offer(context, offer, peer_rx, control_rx, outbound).await
+            .expect("agent dial did not finish promptly")
+            .expect("agent dial task panicked")
     }
 
     #[tokio::test]
@@ -966,17 +836,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_cancels_waiting_for_peer() {
+    async fn target_dials_the_client_and_reports_only_after_ticket_write() {
         let context = context("https://kmesh.test:9443").await;
-        let offer = offer("client-endpoint".to_owned(), "ticket");
+        let (client, target) = local_endpoints().await;
+        let offer = offer(&client);
         let session_id = offer.session_id;
-        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let client_endpoint_id = client.id().to_string();
+        let client_task = tokio::spawn(async move {
+            let connection = accept_peer(&client)
+                .await
+                .expect("accept target connection");
+            let mut stream = IrohByteStream::accept_bi(connection)
+                .await
+                .expect("accept target ticket stream");
+            read_ticket(&mut stream).await.expect("read target ticket")
+        });
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        let task = tokio::spawn(handle_dial_offer(
+            &context,
+            offer,
+            target.clone(),
+            RelayChoice::PublicDefault,
+            control_rx,
+            outbound,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+                .await
+                .expect("target did not report Iroh readiness")
+            .expect("target control channel closed"),
+            ControlMessage::IrohReady { session_id: received, client_endpoint_id: reported_id, relay_mode: RelayMode::PublicDefault }
+                if received == session_id && reported_id == client_endpoint_id
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), client_task)
+                .await
+                .expect("client did not receive the ticket")
+                .expect("client accept task panicked"),
+            "signed-test-ticket"
+        );
+        control_tx
+            .send(ControlMessage::Close {
+                session_id,
+                reason: "test complete".to_owned(),
+            })
+            .await
+            .expect("cancel pending SSH activation");
+        assert!(await_offer(task).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_cancels_target_dial_before_client_accepts() {
+        let context = context("https://kmesh.test:9443").await;
+        let (client, target) = local_endpoints().await;
+        let offer = offer(&client);
+        let session_id = offer.session_id;
         let (control_tx, control_rx) = mpsc::channel(1);
         let (outbound, _outbound_rx) = mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
-        });
+        let task = tokio::spawn(handle_dial_offer(
+            &context,
+            offer,
+            target,
+            RelayChoice::PublicDefault,
+            control_rx,
+            outbound,
+        ));
 
+        tokio::task::yield_now().await;
         control_tx
             .send(ControlMessage::Close {
                 session_id,
@@ -988,229 +916,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_disconnect_cancels_waiting_for_peer() {
+    async fn control_disconnect_cancels_target_dial() {
         let context = context("https://kmesh.test:9443").await;
-        let offer = offer("client-endpoint".to_owned(), "ticket");
-        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let (client, target) = local_endpoints().await;
+        let offer = offer(&client);
         let (control_tx, control_rx) = mpsc::channel(1);
         let (outbound, _outbound_rx) = mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
-        });
-
+        let task = tokio::spawn(handle_dial_offer(
+            &context,
+            offer,
+            target,
+            RelayChoice::PublicDefault,
+            control_rx,
+            outbound,
+        ));
         drop(control_tx);
         assert!(await_offer(task).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn close_cancels_waiting_for_ticket_bytes() {
-        let context = context("https://kmesh.test:9443").await;
-        let (target, _client, target_connection, client_connection) =
-            local_iroh_connections().await;
-        let mut client_stream = IrohByteStream::open_bi(client_connection.clone())
-            .await
-            .expect("open local client stream");
-        client_stream
-            .write_u32(32)
-            .await
-            .expect("write ticket frame length");
-        client_stream
-            .write_all(b"partial")
-            .await
-            .expect("write partial ticket frame");
-        client_stream
-            .flush()
-            .await
-            .expect("flush partial ticket frame");
-
-        let offer = offer(target_connection.remote_id().to_string(), "expected-ticket");
-        let session_id = offer.session_id;
-        let (peer_tx, peer_rx) = mpsc::channel(1);
-        peer_tx
-            .send(target_connection)
-            .await
-            .expect("route local peer connection to agent");
-        drop(peer_tx);
-        let (control_tx, control_rx) = mpsc::channel(1);
-        let (outbound, _outbound_rx) = mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
-        });
-        // The frame is incomplete, so after the local stream is accepted the agent blocks in read_ticket.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        control_tx
-            .send(ControlMessage::Close {
-                session_id,
-                reason: "cancelled".to_owned(),
-            })
-            .await
-            .expect("send session close");
-        assert!(await_offer(task).await.is_ok());
-        drop(client_stream);
-        drop(target);
-    }
-
-    #[tokio::test]
-    async fn close_cancels_waiting_for_bidirectional_stream() {
-        let context = context("https://kmesh.test:9443").await;
-        let (target, _client, target_connection, client_connection) =
-            local_iroh_connections().await;
-        let offer = offer(target_connection.remote_id().to_string(), "expected-ticket");
-        let session_id = offer.session_id;
-        let (peer_tx, peer_rx) = mpsc::channel(1);
-        peer_tx
-            .send(target_connection)
-            .await
-            .expect("route local peer connection to agent");
-        drop(peer_tx);
-        let (control_tx, control_rx) = mpsc::channel(1);
-        let (outbound, _outbound_rx) = mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        control_tx
-            .send(ControlMessage::Close {
-                session_id,
-                reason: "cancelled".to_owned(),
-            })
-            .await
-            .expect("send session close");
-        assert!(await_offer(task).await.is_ok());
-        drop(client_connection);
-        drop(target);
-    }
-
-    #[tokio::test]
-    async fn ticket_stream_disconnect_is_a_network_error() {
-        let context = context("https://kmesh.test:9443").await;
-        let (target, _client, target_connection, client_connection) =
-            local_iroh_connections().await;
-        let mut client_stream = IrohByteStream::open_bi(client_connection.clone())
-            .await
-            .expect("open local client stream");
-        client_stream
-            .write_u32(32)
-            .await
-            .expect("write ticket frame length");
-        client_stream
-            .write_all(b"partial")
-            .await
-            .expect("write partial ticket frame");
-        client_stream
-            .flush()
-            .await
-            .expect("flush partial ticket frame");
-
-        let offer = offer(target_connection.remote_id().to_string(), "expected-ticket");
-        let (peer_tx, peer_rx) = mpsc::channel(1);
-        peer_tx
-            .send(target_connection)
-            .await
-            .expect("route local peer connection to agent");
-        let (control_tx, control_rx) = mpsc::channel(1);
-        let (outbound, _outbound_rx) = mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            handle_offer(&context, offer, peer_rx, control_rx, outbound).await
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        client_stream.reset().expect("reset partial ticket stream");
-
-        let error = await_offer(task)
-            .await
-            .expect_err("truncated ticket stream must fail");
-        assert!(
-            !is_authentication_error(&error),
-            "stream reset was classified as authentication: {error:#}"
-        );
-        assert!(
-            crate::transport::is_network_failure_source(error.as_ref()),
-            "stream reset did not preserve a classifiable network source: {error:#}"
-        );
-        drop(control_tx);
-        drop(target);
-    }
-
-    #[tokio::test]
-    async fn invalid_frame_ticket_and_peer_identity_remain_authentication_errors() {
-        let context = context("https://kmesh.test:9443").await;
-        let (target, _client, target_connection, client_connection) =
-            local_iroh_connections().await;
-        let client_endpoint_id = target_connection.remote_id().to_string();
-
-        let error = handle_connected_offer(
-            &context,
-            offer("different-endpoint".to_owned(), "expected-ticket"),
-            target_connection.clone(),
-        )
-        .await
-        .expect_err("wrong peer EndpointId must fail authentication");
-        assert!(is_authentication_error(&error), "{error:#}");
-
-        let mut invalid_frame = IrohByteStream::open_bi(client_connection.clone())
-            .await
-            .expect("open client stream for invalid frame");
-        invalid_frame
-            .write_u32(0)
-            .await
-            .expect("write invalid ticket frame length");
-        invalid_frame.flush().await.expect("flush invalid frame");
-        let error = handle_connected_offer(
-            &context,
-            offer(client_endpoint_id.clone(), "expected-ticket"),
-            target_connection.clone(),
-        )
-        .await
-        .expect_err("invalid ticket frame must fail authentication");
-        assert!(is_authentication_error(&error), "{error:#}");
-
-        let mut wrong_ticket = IrohByteStream::open_bi(client_connection.clone())
-            .await
-            .expect("open client stream for mismatched ticket");
-        wrong_ticket
-            .write_u32(5)
-            .await
-            .expect("write ticket frame length");
-        wrong_ticket
-            .write_all(b"wrong")
-            .await
-            .expect("write mismatched ticket");
-        wrong_ticket.flush().await.expect("flush mismatched ticket");
-        let error = handle_connected_offer(
-            &context,
-            offer(client_endpoint_id, "expected-ticket"),
-            target_connection,
-        )
-        .await
-        .expect_err("ticket differing from the signed offer must fail authentication");
-        assert!(is_authentication_error(&error), "{error:#}");
-        drop(target);
-    }
-
-    #[tokio::test]
-    async fn close_or_control_disconnect_before_activation_is_cancellation() {
-        let session_id = Uuid::new_v4();
-        let (close_tx, mut close_rx) = mpsc::channel(1);
-        close_tx
-            .send(ControlMessage::Close {
-                session_id,
-                reason: "cancelled".to_owned(),
-            })
-            .await
-            .expect("send session close");
-        assert!(
-            !wait_activated(session_id, &mut close_rx)
-                .await
-                .expect("close is a clean cancellation")
-        );
-
-        let (disconnected_tx, mut disconnected_rx) = mpsc::channel(1);
-        drop(disconnected_tx);
-        assert!(
-            !wait_activated(session_id, &mut disconnected_rx)
-                .await
-                .expect("control disconnect is a clean cancellation")
-        );
     }
 }
