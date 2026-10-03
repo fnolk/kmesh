@@ -121,9 +121,7 @@ pub async fn accept_peer(endpoint: &Endpoint) -> Result<Connection, TransportErr
         .accept()
         .await
         .ok_or(TransportError::EndpointClosed)?;
-    incoming
-        .await
-        .map_err(|error| TransportError::Iroh(error.to_string()))
+    incoming.await.map_err(TransportError::IrohConnecting)
 }
 
 pub struct IrohByteStream {
@@ -138,7 +136,7 @@ impl IrohByteStream {
         let (send, recv) = connection
             .open_bi()
             .await
-            .map_err(|error| TransportError::Iroh(error.to_string()))?;
+            .map_err(TransportError::IrohConnection)?;
         Ok(Self {
             connection,
             send,
@@ -151,7 +149,7 @@ impl IrohByteStream {
         let (send, recv) = connection
             .accept_bi()
             .await
-            .map_err(|error| TransportError::Iroh(error.to_string()))?;
+            .map_err(TransportError::IrohConnection)?;
         Ok(Self {
             connection,
             send,

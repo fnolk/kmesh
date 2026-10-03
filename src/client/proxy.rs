@@ -2,15 +2,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use iroh::{EndpointAddr, SecretKey, endpoint::PathEvent};
+use iroh::{Endpoint, EndpointAddr, SecretKey, Watcher, endpoint::PathEvent};
 use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use crate::{
     identity::{TUNNEL_TICKET_AUDIENCE, decode_tunnel_ticket},
-    protocol::{ControlMessage, TransportInfo, TunnelTicketClaims},
-    transport::{IrohByteStream, IrohEndpointOptions, IrohPathKind, connect_peer, create_endpoint},
+    protocol::{ControlMessage, RelayMode, TransportInfo, TunnelTicketClaims},
+    transport::{
+        IrohByteStream, IrohEndpointOptions, IrohPathKind, RelayChoice, TransportError,
+        connect_peer, create_endpoint, is_auth_failure_source, validate_endpoint_addr,
+    },
 };
 
 use super::{
@@ -27,74 +30,90 @@ const MAX_TICKET_FRAME: usize = 8 * 1024;
 struct TunnelOffer {
     ticket: String,
     target_endpoint_addr: EndpointAddr,
+    relay_mode: RelayMode,
+}
+
+struct OpenSshSession {
+    _endpoint: Endpoint,
+    stream: IrohByteStream,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("SSH access authentication failed: {0}")]
 struct SshAuthenticationFailure(String);
 
+#[derive(Debug, thiserror::Error)]
+#[error("private relay network path failed: {0}")]
+struct PrivateNetworkFailure(#[source] anyhow::Error);
+
 pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let access_token = auth::valid_access_token(context).await?;
-    let secret_key = SecretKey::generate();
-    let client_endpoint_id = secret_key.public().to_string();
-    let session_id = Uuid::new_v4();
+    let transport_info = context.api.transport_info().await?;
     let mut control = tokio::time::timeout(
         CONTROL_CONNECT_TIMEOUT,
         context.api.connect_control(&access_token),
     )
     .await
     .context("connecting to kmesh control channel timed out")??;
-    Api::send_control(
+    let relay_mode = if transport_info.private_relay_url.is_some() {
+        RelayMode::Private
+    } else {
+        RelayMode::PublicDefault
+    };
+    let (first_session_id, first_secret_key) = new_attempt_identity();
+    let (session_id, ssh_session) = match open_ssh_session(
+        context,
         &mut control,
-        &ControlMessage::Open {
-            session_id,
-            target_id,
-            client_endpoint_id: client_endpoint_id.clone(),
-        },
-    )
-    .await?;
-    let offer = tokio::time::timeout(
-        SESSION_SETUP_TIMEOUT,
-        next_offer(
-            &mut control,
-            session_id,
-            target_id,
-            &client_endpoint_id,
-            context.api.issuer(),
-        ),
+        &transport_info,
+        target_id,
+        first_session_id,
+        first_secret_key,
+        relay_mode,
     )
     .await
-    .context("waiting for target Iroh offer timed out")??;
-    let transport_info = context.api.transport_info().await?;
-    let endpoint = create_endpoint(
-        secret_key,
-        false,
-        endpoint_options(context, transport_info)?,
-    )
-    .await
-    .map_err(anyhow::Error::new)
-    .context("create client Iroh endpoint")?;
-    let connection = tokio::time::timeout(
-        SESSION_SETUP_TIMEOUT,
-        connect_peer(&endpoint, offer.target_endpoint_addr.clone()),
-    )
-    .await
-    .context("connecting to target Iroh endpoint timed out")?
-    .map_err(anyhow::Error::new)
-    .context("connect to target Iroh endpoint")?;
-    let mut stream = IrohByteStream::open_bi(connection)
-        .await
-        .map_err(anyhow::Error::new)
-        .context("open SSH Iroh stream")?;
-    write_ticket(&mut stream, &offer.ticket)
-        .await
-        .context("send signed SSH ticket to target")?;
-    tokio::time::timeout(
-        SESSION_SETUP_TIMEOUT,
-        wait_activated(&mut control, session_id),
-    )
-    .await
-    .context("waiting for SSH activation timed out")??;
+    {
+        Ok(session) => (first_session_id, session),
+        Err(error)
+            if relay_mode == RelayMode::Private
+                && error.downcast_ref::<PrivateNetworkFailure>().is_some() =>
+        {
+            close_session(&mut control, first_session_id, "private_relay_failed")
+                .await
+                .context("close pending private SSH session before public retry")?;
+            let (public_session_id, public_secret_key) = new_attempt_identity();
+            let session = match open_ssh_session(
+                context,
+                &mut control,
+                &transport_info,
+                target_id,
+                public_session_id,
+                public_secret_key,
+                RelayMode::PublicDefault,
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    close_session_best_effort(
+                        &mut control,
+                        public_session_id,
+                        "public_relay_setup_failed",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            (public_session_id, session)
+        }
+        Err(error) => {
+            close_session_best_effort(&mut control, first_session_id, "ssh_setup_failed").await;
+            return Err(error);
+        }
+    };
+    let OpenSshSession {
+        _endpoint,
+        mut stream,
+    } = ssh_session;
 
     match stream.selected_path() {
         Some(path) if path.kind == IrohPathKind::Direct => {
@@ -147,19 +166,240 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-fn endpoint_options(context: &ClientContext, info: TransportInfo) -> Result<IrohEndpointOptions> {
-    let relay_url = reqwest::Url::parse(&info.relay_url).context("parse Iroh relay URL")?;
-    let control_origin =
-        reqwest::Url::parse(context.api.issuer()).context("parse configured kmesh server URL")?;
+fn new_attempt_identity() -> (Uuid, SecretKey) {
+    (Uuid::new_v4(), SecretKey::generate())
+}
+
+async fn open_ssh_session(
+    context: &ClientContext,
+    control: &mut WsStream,
+    transport_info: &TransportInfo,
+    target_id: Uuid,
+    session_id: Uuid,
+    secret_key: SecretKey,
+    relay_mode: RelayMode,
+) -> Result<OpenSshSession> {
+    let relay_choice = endpoint_relay_choice(context, transport_info, relay_mode)?;
+    let client_endpoint_id = secret_key.public().to_string();
+    Api::send_control(
+        control,
+        &ControlMessage::Open {
+            session_id,
+            target_id,
+            client_endpoint_id: client_endpoint_id.clone(),
+            relay_mode,
+        },
+    )
+    .await?;
+    let offer = match tokio::time::timeout(
+        SESSION_SETUP_TIMEOUT,
+        next_offer(
+            control,
+            session_id,
+            target_id,
+            &client_endpoint_id,
+            context.api.issuer(),
+            &relay_choice,
+            relay_mode,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(private_network_timeout(
+                relay_mode,
+                "waiting for target Iroh offer",
+            ));
+        }
+    };
     anyhow::ensure!(
-        relay_url == control_origin,
-        "Iroh relay URL differs from the configured kmesh server"
+        offer.relay_mode == relay_mode,
+        "offer relay mode differs from request"
     );
-    Ok(IrohEndpointOptions {
-        relay_url,
-        qad_port: info.qad_port,
-        tls: context.config.tls.clone(),
+
+    let endpoint = create_endpoint(
+        secret_key,
+        false,
+        IrohEndpointOptions {
+            relay_choice: relay_choice.clone(),
+            tls: context.config.tls.clone(),
+        },
+    )
+    .await
+    .map_err(anyhow::Error::new)
+    .context("create client Iroh endpoint")?;
+    let connection = match tokio::time::timeout(
+        SESSION_SETUP_TIMEOUT,
+        connect_peer(&endpoint, offer.target_endpoint_addr.clone(), &relay_choice),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            return Err(classify_client_transport_error(
+                &endpoint, error, relay_mode,
+            ));
+        }
+        Err(_) => {
+            if let Some(error) = private_relay_auth_failure(&endpoint, relay_mode) {
+                return Err(error);
+            }
+            return Err(private_network_timeout(
+                relay_mode,
+                "connecting to target Iroh endpoint",
+            ));
+        }
+    };
+    let mut stream = IrohByteStream::open_bi(connection)
+        .await
+        .map_err(|error| classify_client_transport_error(&endpoint, error, relay_mode))
+        .context("open SSH Iroh stream")?;
+    if let Err(error) = write_ticket(&mut stream, &offer.ticket)
+        .await
+        .context("send signed SSH ticket to target")
+    {
+        let _ = stream.reset();
+        return Err(classify_anyhow_network_error(error, relay_mode));
+    }
+    let activated = match tokio::time::timeout(
+        SESSION_SETUP_TIMEOUT,
+        wait_activated(control, session_id, relay_mode),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(private_network_timeout(
+            relay_mode,
+            "waiting for SSH activation",
+        )),
+    };
+    if let Err(error) = activated {
+        let _ = stream.reset();
+        return Err(error);
+    }
+    Ok(OpenSshSession {
+        _endpoint: endpoint,
+        stream,
     })
+}
+
+fn endpoint_relay_choice(
+    context: &ClientContext,
+    info: &TransportInfo,
+    relay_mode: RelayMode,
+) -> Result<RelayChoice> {
+    match relay_mode {
+        RelayMode::Private => {
+            let relay_url = reqwest::Url::parse(
+                info.private_relay_url
+                    .as_deref()
+                    .context("private relay mode requested without a configured private relay")?,
+            )
+            .context("parse private Iroh relay URL")?;
+            let control_origin = reqwest::Url::parse(context.api.issuer())
+                .context("parse configured kmesh server URL")?;
+            anyhow::ensure!(
+                relay_url == control_origin,
+                "private Iroh relay URL differs from the configured kmesh server"
+            );
+            Ok(RelayChoice::Private {
+                url: relay_url,
+                qad_port: info.qad_port,
+            })
+        }
+        RelayMode::PublicDefault => Ok(RelayChoice::PublicDefault),
+    }
+}
+
+fn classify_transport_error(error: TransportError, relay_mode: RelayMode) -> anyhow::Error {
+    if relay_mode == RelayMode::Private && error.is_network_failure() {
+        anyhow::Error::new(PrivateNetworkFailure(anyhow::Error::new(error)))
+    } else {
+        anyhow::Error::new(error)
+    }
+}
+
+fn classify_client_transport_error(
+    endpoint: &Endpoint,
+    error: TransportError,
+    relay_mode: RelayMode,
+) -> anyhow::Error {
+    if let Some(error) = private_relay_auth_failure(endpoint, relay_mode) {
+        error
+    } else {
+        classify_transport_error(error, relay_mode)
+    }
+}
+
+fn private_relay_auth_failure(endpoint: &Endpoint, relay_mode: RelayMode) -> Option<anyhow::Error> {
+    if relay_mode != RelayMode::Private {
+        return None;
+    }
+    endpoint
+        .home_relay_status()
+        .get()
+        .into_iter()
+        .find_map(|status| {
+            if let Some(reason) = status.auth_denied_reason() {
+                return Some(anyhow!(SshAuthenticationFailure(format!(
+                    "private Iroh relay denied this endpoint: {reason}"
+                ))));
+            }
+            status.last_error().and_then(|error| {
+                is_auth_failure_source(error)
+                    .then(|| anyhow!(SshAuthenticationFailure(error.to_string())))
+            })
+        })
+}
+
+fn server_setup_error(code: String, message: String, relay_mode: RelayMode) -> anyhow::Error {
+    match code.as_str() {
+        "authentication" | "authorization" => {
+            anyhow!(SshAuthenticationFailure(message))
+        }
+        "network" if relay_mode == RelayMode::Private => {
+            anyhow::Error::new(PrivateNetworkFailure(anyhow!(message)))
+        }
+        _ => anyhow!("server could not prepare SSH access: {message}"),
+    }
+}
+
+fn classify_anyhow_network_error(error: anyhow::Error, relay_mode: RelayMode) -> anyhow::Error {
+    if relay_mode == RelayMode::Private
+        && error
+            .chain()
+            .any(crate::transport::is_network_failure_source)
+    {
+        anyhow::Error::new(PrivateNetworkFailure(error))
+    } else {
+        error
+    }
+}
+
+fn private_network_timeout(relay_mode: RelayMode, stage: &'static str) -> anyhow::Error {
+    let error = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("{stage} timed out"),
+    ));
+    classify_anyhow_network_error(error, relay_mode)
+}
+
+async fn close_session(control: &mut WsStream, session_id: Uuid, reason: &str) -> Result<()> {
+    Api::send_control(
+        control,
+        &ControlMessage::Close {
+            session_id,
+            reason: reason.to_owned(),
+        },
+    )
+    .await
+}
+
+async fn close_session_best_effort(control: &mut WsStream, session_id: Uuid, reason: &str) {
+    if let Err(error) = close_session(control, session_id, reason).await {
+        tracing::debug!(session = %session_id, error = %error, "failed to close pending SSH session");
+    }
 }
 
 async fn next_offer(
@@ -168,6 +408,8 @@ async fn next_offer(
     target_id: Uuid,
     client_endpoint_id: &str,
     issuer: &str,
+    relay_choice: &RelayChoice,
+    expected_mode: RelayMode,
 ) -> Result<TunnelOffer> {
     loop {
         let message = control
@@ -186,7 +428,12 @@ async fn next_offer(
                 client_endpoint_id: offered_client,
                 target_endpoint_addr,
                 ticket_public_key_pem,
+                relay_mode,
             } if received == session_id => {
+                ensure_auth(
+                    relay_mode == expected_mode,
+                    "offer relay mode differs from the requested mode",
+                )?;
                 ensure_auth(
                     offered_target == target_id,
                     "offer target ID differs from request",
@@ -203,11 +450,13 @@ async fn next_offer(
                     target_id,
                     client_endpoint_id,
                     &target_endpoint_addr,
-                    issuer,
+                    relay_choice,
+                    expected_mode,
                 )?;
                 return Ok(TunnelOffer {
                     ticket,
                     target_endpoint_addr,
+                    relay_mode,
                 });
             }
             ControlMessage::Error {
@@ -215,10 +464,7 @@ async fn next_offer(
                 code,
                 message,
             } if received == session_id => {
-                if code == "authentication" || code == "authorization" {
-                    bail!(SshAuthenticationFailure(message));
-                }
-                bail!("server could not prepare SSH access: {message}");
+                return Err(server_setup_error(code, message, expected_mode));
             }
             _ => {
                 tracing::debug!(session = %session_id, "ignoring unexpected control message before target offer")
@@ -233,11 +479,9 @@ fn validate_offer(
     target_id: Uuid,
     client_endpoint_id: &str,
     target_endpoint_addr: &EndpointAddr,
-    self_relay_url: &str,
+    relay_choice: &RelayChoice,
+    expected_mode: RelayMode,
 ) -> Result<()> {
-    let expected_relay: iroh::RelayUrl = reqwest::Url::parse(self_relay_url)
-        .context("parse configured self-relay URL")?
-        .into();
     ensure_auth(
         claims.session_id == session_id,
         "ticket session ID mismatch",
@@ -251,23 +495,12 @@ fn validate_offer(
         claims.target_endpoint_id == target_endpoint_addr.id.to_string(),
         "ticket target EndpointId mismatch",
     )?;
-    let relay_urls = target_endpoint_addr.relay_urls().collect::<Vec<_>>();
     ensure_auth(
-        relay_urls.len() == 1 && relay_urls[0] == &expected_relay,
-        "target offer does not use the configured private relay",
+        claims.relay_mode == expected_mode,
+        "ticket relay mode differs from the requested mode",
     )?;
-    ensure_auth(
-        target_endpoint_addr
-            .addrs
-            .iter()
-            .all(|address| match address {
-                iroh::TransportAddr::Ip(_) => true,
-                iroh::TransportAddr::Relay(url) => url == &expected_relay,
-                iroh::TransportAddr::Custom(_) => false,
-                _ => false,
-            }),
-        "target offer contains an unrecognized transport address",
-    )?;
+    validate_endpoint_addr(target_endpoint_addr, relay_choice)
+        .map_err(|error| anyhow!(SshAuthenticationFailure(error.to_string())))?;
     ensure_auth(
         claims.aud == TUNNEL_TICKET_AUDIENCE,
         "ticket audience mismatch",
@@ -307,7 +540,11 @@ async fn write_ticket(stream: &mut IrohByteStream, ticket: &str) -> Result<()> {
     stream.flush().await.context("flush ticket frame")
 }
 
-async fn wait_activated(control: &mut WsStream, session_id: Uuid) -> Result<()> {
+async fn wait_activated(
+    control: &mut WsStream,
+    session_id: Uuid,
+    relay_mode: RelayMode,
+) -> Result<()> {
     loop {
         let message = control
             .next()
@@ -326,10 +563,7 @@ async fn wait_activated(control: &mut WsStream, session_id: Uuid) -> Result<()> 
                 code,
                 message,
             } if received == session_id => {
-                if code == "authentication" || code == "authorization" {
-                    bail!(SshAuthenticationFailure(message));
-                }
-                bail!("server rejected SSH session before activation: {message}");
+                return Err(server_setup_error(code, message, relay_mode));
             }
             ControlMessage::Close {
                 session_id: received,
@@ -367,4 +601,64 @@ async fn copy_stdio(stream: &mut IrohByteStream) -> Result<()> {
         .connection()
         .close(iroh::endpoint::VarInt::from_u32(0), b"ssh session complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PrivateNetworkFailure, classify_transport_error, new_attempt_identity, server_setup_error,
+    };
+    use crate::{protocol::RelayMode, transport::TransportError};
+    use std::io;
+
+    #[test]
+    fn retryable_private_failures_use_a_fresh_session_and_endpoint_key() {
+        let (private_session, private_key) = new_attempt_identity();
+        let (public_session, public_key) = new_attempt_identity();
+
+        assert_ne!(private_session, public_session);
+        assert_ne!(private_key.public(), public_key.public());
+    }
+
+    #[test]
+    fn only_network_errors_in_private_mode_produce_the_retry_marker() {
+        let private_network = classify_transport_error(
+            TransportError::Network(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            RelayMode::Private,
+        );
+        assert!(
+            private_network
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_some()
+        );
+
+        let private_auth = classify_transport_error(
+            TransportError::Authentication("denied".to_owned()),
+            RelayMode::Private,
+        );
+        assert!(
+            private_auth
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_none()
+        );
+
+        let public_network =
+            classify_transport_error(TransportError::Timeout("relay"), RelayMode::PublicDefault);
+        assert!(
+            public_network
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_none()
+        );
+
+        let server_auth = server_setup_error(
+            "authorization".to_owned(),
+            "access denied".to_owned(),
+            RelayMode::Private,
+        );
+        assert!(
+            server_auth
+                .downcast_ref::<PrivateNetworkFailure>()
+                .is_none()
+        );
+    }
 }
