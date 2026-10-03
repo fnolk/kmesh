@@ -34,6 +34,10 @@ pub enum TransportError {
     Iroh(String),
     #[error("Iroh connection failed: {0}")]
     IrohConnect(#[source] ::iroh::endpoint::ConnectError),
+    #[error("Iroh connection handshake failed: {0}")]
+    IrohConnecting(#[source] ::iroh::endpoint::ConnectingError),
+    #[error("Iroh connection closed during setup: {0}")]
+    IrohConnection(#[source] ::iroh::endpoint::ConnectionError),
     #[error("WebSocket failed: {0}")]
     WebSocket(String),
     #[error("invalid transport configuration: {0}")]
@@ -49,6 +53,19 @@ impl TransportError {
         match self {
             Self::Authentication(_) => true,
             Self::IrohConnect(error) => is_auth_failure_source(error),
+            Self::IrohConnecting(error) => is_auth_failure_source(error),
+            Self::IrohConnection(error) => is_auth_failure_source(error),
+            _ => false,
+        }
+    }
+
+    pub fn is_network_failure(&self) -> bool {
+        match self {
+            Self::Timeout(_) => true,
+            Self::Network(error) => is_network_io_error(error.kind()),
+            Self::IrohConnect(error) => is_network_failure_source(error),
+            Self::IrohConnecting(error) => is_network_failure_source(error),
+            Self::IrohConnection(error) => is_network_failure_source(error),
             _ => false,
         }
     }
@@ -60,6 +77,12 @@ pub fn is_auth_failure_source(error: &(dyn StdError + 'static)) -> bool {
         if error
             .downcast_ref::<rustls::Error>()
             .is_some_and(|error| matches!(error, rustls::Error::InvalidCertificate(_)))
+        {
+            return true;
+        }
+        if error
+            .downcast_ref::<::iroh::endpoint::AuthenticationError>()
+            .is_some()
         {
             return true;
         }
@@ -95,6 +118,58 @@ pub fn is_auth_failure_source(error: &(dyn StdError + 'static)) -> bool {
         current = error.source();
     }
     false
+}
+
+pub fn is_network_failure_source(error: &(dyn StdError + 'static)) -> bool {
+    if is_auth_failure_source(error) {
+        return false;
+    }
+
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<iroh_relay::client::DialError>() {
+            match error {
+                iroh_relay::client::DialError::Dns { .. }
+                | iroh_relay::client::DialError::Timeout { .. } => return true,
+                iroh_relay::client::DialError::Io { source }
+                    if is_network_io_error(source.kind()) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if error
+            .downcast_ref::<::iroh::endpoint::ConnectionError>()
+            .is_some_and(|error| matches!(error, ::iroh::endpoint::ConnectionError::TimedOut))
+        {
+            return true;
+        }
+        if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| is_network_io_error(error.kind()))
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn is_network_io_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 impl From<io::Error> for TransportError {
