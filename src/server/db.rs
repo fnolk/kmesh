@@ -188,16 +188,28 @@ impl Database {
         let now = unix_time();
         let found = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(\
-                SELECT 1 FROM targets \
-                WHERE agent_endpoint_id = ?1 AND enabled = 1 AND deleted_at IS NULL \
-                  AND agent_token_hash IS NOT NULL\
-             ) OR EXISTS(\
                 SELECT 1 FROM tunnel_sessions \
-                WHERE (client_endpoint_id = ?1 OR target_endpoint_id = ?1) \
+                WHERE client_endpoint_id = ?1 \
                   AND (status = 'active' OR (status = 'pending' AND expires_at > ?2))\
              )",
         )
         .bind(endpoint_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(found != 0)
+    }
+
+    pub async fn tunnel_session_can_use_relay(&self, session_id: uuid::Uuid) -> Result<bool> {
+        let now = unix_time();
+        let found = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(\
+                SELECT 1 FROM tunnel_sessions \
+                WHERE id = ?1 AND \
+                  (status = 'active' OR (status = 'pending' AND expires_at > ?2))\
+             )",
+        )
+        .bind(session_id.to_string())
         .bind(now)
         .fetch_one(&self.pool)
         .await?;

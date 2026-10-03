@@ -28,7 +28,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
-use super::ServerState;
+use super::{ServerState, control};
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -183,9 +183,20 @@ impl AccessControl for ServerState {
             .await
         {
             Ok(true) => Access::Allow,
-            Ok(false) => Access::Deny {
-                reason: Some("EndpointId is not registered for kmesh".to_owned()),
-            },
+            Ok(false) => {
+                match control::allow_agent_data_endpoint(self, &endpoint_id.to_string()).await {
+                    Ok(true) => Access::Allow,
+                    Ok(false) => Access::Deny {
+                        reason: Some("EndpointId is not registered for kmesh".to_owned()),
+                    },
+                    Err(error) => {
+                        tracing::error!(endpoint = %endpoint_id, error = %error, "Iroh relay session authorization lookup failed");
+                        Access::Deny {
+                            reason: Some("EndpointId authorization failed".to_owned()),
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 tracing::error!(endpoint = %endpoint_id, error = %error, "Iroh relay authorization lookup failed");
                 Access::Deny {
