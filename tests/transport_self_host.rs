@@ -107,6 +107,7 @@ async fn self_hosted_https_and_qad_report_the_observed_ipv4_address() {
                 server_name: None,
                 proxy: None,
             },
+            handoff: None,
         },
     )
     .await

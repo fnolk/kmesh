@@ -30,7 +30,6 @@ use super::{
 use crate::config::TlsConfig;
 
 const PRIVATE_QAD_PORT: u16 = 3478;
-const OFFICIAL_QAD_PORT: u16 = 7842;
 const TARGET_SOCKET_COUNT: usize = 257;
 const CLIENT_RANDOM_PORT_PROBES: usize = 1000;
 const PROBE_CADENCE: Duration = Duration::from_millis(15);
