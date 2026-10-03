@@ -42,6 +42,17 @@ AGENT_UNIT = "kmesh-iroh-verification-agent@.service"
 ADMIN_PASSWORD_DEFAULT = Path("/Users/example/.cache/kmesh-live/server/admin-password")
 CA_DEFAULT = Path("/Users/example/.cache/kmesh-live/server/ca.pem")
 STATE_DEFAULT = Path("/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003")
+PATH_EVENT_RE = re.compile(
+    r"连接路径(?P<change>切换)?：(?P<label>P2P 直连|Iroh 中继) \((?P<address>[^)]+)\)"
+)
+NO_SELECTED_PATH_RE = re.compile(
+    r"(?:连接已建立；Iroh 正在选择网络路径|当前没有已选网络路径；Iroh 正在重新选择)。"
+)
+QUIC_PATH_SAMPLE_RE = re.compile(
+    r"QUIC path UDP (?P<sample>baseline|interval) \((?P<address>[^)]+)\) "
+    r"kind=(?P<kind>Direct|Relay) selected=(?P<selected>true|false) "
+    r"TX(?: delta)?=(?P<tx>\d+) RX(?: delta)?=(?P<rx>\d+)"
+)
 REMOTE_RUNNER = (
     "import json,subprocess,sys; "
     "secret=sys.stdin.buffer.read(); "
@@ -1303,9 +1314,6 @@ def write_ssh_config(
 
 def selected_paths(stderr: bytes) -> list[dict[str, str]]:
     text = stderr.decode("utf-8", "replace")
-    pattern = re.compile(
-        r"连接路径(?P<change>切换)?：(?P<label>P2P 直连|Iroh 中继) \((?P<address>[^)]+)\)"
-    )
     return [
         {
             "sequence": index,
@@ -1313,8 +1321,68 @@ def selected_paths(stderr: bytes) -> list[dict[str, str]]:
             "kind": "direct" if match.group("label") == "P2P 直连" else "relay",
             "remote_address": match.group("address"),
         }
-        for index, match in enumerate(pattern.finditer(text), start=1)
+        for index, match in enumerate(PATH_EVENT_RE.finditer(text), start=1)
     ]
+
+
+def path_state_observations(stderr: bytes) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(stderr.splitlines(), start=1):
+        text = raw_line.decode("utf-8", "replace")
+        timestamp = text.split(" ", 1)[0] if " " in text else None
+        for path_event in selected_paths(raw_line):
+            observations.append(
+                {
+                    "source": "path_event",
+                    "line_number": line_number,
+                    "timestamp": timestamp,
+                    "selected": True,
+                    **path_event,
+                }
+            )
+        if NO_SELECTED_PATH_RE.search(text):
+            observations.append(
+                {
+                    "source": "no_selected_path",
+                    "line_number": line_number,
+                    "timestamp": timestamp,
+                    "selected": False,
+                    "kind": None,
+                    "remote_address": None,
+                }
+            )
+        match = QUIC_PATH_SAMPLE_RE.search(text)
+        if match:
+            observations.append(
+                {
+                    "source": "udp_path_snapshot",
+                    "line_number": line_number,
+                    "timestamp": timestamp,
+                    "sample": match.group("sample"),
+                    "kind": "direct" if match.group("kind") == "Direct" else "relay",
+                    "selected": match.group("selected") == "true",
+                    "remote_address": match.group("address"),
+                    "udp_tx_bytes": int(match.group("tx")),
+                    "udp_rx_bytes": int(match.group("rx")),
+                }
+            )
+    return observations
+
+
+def update_selected_path_state(
+    selected_path_state: dict[str, Any] | None, observation: dict[str, Any]
+) -> dict[str, Any] | None:
+    if observation["selected"]:
+        return observation
+    if observation["source"] == "no_selected_path":
+        return None
+    if (
+        observation["source"] == "udp_path_snapshot"
+        and selected_path_state is not None
+        and observation["remote_address"] == selected_path_state["remote_address"]
+    ):
+        return None
+    return selected_path_state
 
 
 def auth_session_fingerprint(harness: Harness, profile: str, username: str) -> str:
@@ -1416,8 +1484,7 @@ def endpoint_diagnostics(stderr: bytes) -> dict[str, Any]:
                 "UDP delta",
                 "UDP snapshot",
                 "UDP interval",
-                "SSH QUIC path snapshots",
-                "SSH 数据路径统计",
+                "SSH 流量统计：",
             )
         ):
             udp_path_events.append({"source_line": line})
@@ -1648,11 +1715,13 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     stderr_chunks = []
     stderr_events = []
     pending_stderr = bytearray()
-    selected_kind = None
+    selected_path_state = None
     process_started_at = time.monotonic()
     direct_wait_deadline = time.monotonic() + seconds
     command_sent_at = None
     script_sent_after_direct = False
+    path_state_at_command = None
+    direct_gate_remote_address = None
     process_deadline = None
     process_timed_out = False
     open_streams = {process.stdout, process.stderr}
@@ -1660,9 +1729,23 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     while open_streams or process.poll() is None:
         now = time.monotonic()
         if command_sent_at is None and process.poll() is None and (
-            selected_kind == "direct" or now >= direct_wait_deadline
+            (selected_path_state is not None and selected_path_state["kind"] == "direct")
+            or now >= direct_wait_deadline
         ):
-            script_sent_after_direct = selected_kind == "direct"
+            script_sent_after_direct = (
+                selected_path_state is not None and selected_path_state["kind"] == "direct"
+            )
+            path_state_at_command = (
+                {
+                    key: selected_path_state.get(key)
+                    for key in ("source", "timestamp", "sample", "kind", "selected", "remote_address")
+                }
+                if selected_path_state
+                else None
+            )
+            direct_gate_remote_address = (
+                selected_path_state["remote_address"] if script_sent_after_direct else None
+            )
             command_sent_at = now
             process_deadline = now + 25
             try:
@@ -1689,8 +1772,10 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
                 if stream is process.stderr and pending_stderr:
                     line = bytes(pending_stderr)
                     stderr_events.append((time.monotonic(), line))
-                    for event in selected_paths(line):
-                        selected_kind = event["kind"]
+                    for event in path_state_observations(line):
+                        selected_path_state = update_selected_path_state(
+                            selected_path_state, event
+                        )
                     pending_stderr.clear()
                 continue
             if stream is process.stdout:
@@ -1703,8 +1788,10 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
                 line += b"\n"
                 pending_stderr[:] = remaining
                 stderr_events.append((time.monotonic(), line))
-                for event in selected_paths(line):
-                    selected_kind = event["kind"]
+                for event in path_state_observations(line):
+                    selected_path_state = update_selected_path_state(
+                        selected_path_state, event
+                    )
     if process.stdin and not process.stdin.closed:
         try:
             process.stdin.close()
@@ -1737,14 +1824,19 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     stderr_path.write_bytes(stderr)
     os.chmod(stderr_path, 0o600)
     path_events = selected_paths(stderr)
+    path_state_events = path_state_observations(stderr)
+    selected_path_events = [event for event in path_state_events if event["selected"]]
+    final_selected_path = None
+    for event in path_state_events:
+        final_selected_path = update_selected_path_state(final_selected_path, event)
     diagnostics = endpoint_diagnostics(stderr)
     ssh_transfer_bytes = None
     in_flight_deltas = {}
     for event_time, raw_line in stderr_events:
         line = raw_line.decode("utf-8", "replace")
-        if "SSH QUIC path snapshots" in line:
+        if "SSH 流量统计：" in line:
             transfer_match = re.search(
-                r"ssh_upload_bytes=(\d+)\s+ssh_download_bytes=(\d+)", line
+                r"SSH 流量统计：本地→目标=(\d+) bytes；目标→本地=(\d+) bytes", line
             )
             if transfer_match:
                 ssh_transfer_bytes = {
@@ -1753,19 +1845,25 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
                 }
         if command_sent_at is None or event_time < command_sent_at:
             continue
-        interval_match = re.search(
-            r"QUIC path UDP interval \((?P<address>[^)]+)\) kind=Direct "
-            r"selected=true TX delta=(?P<tx>\d+) RX delta=(?P<rx>\d+)",
-            line,
-        )
-        if interval_match:
+        interval_match = QUIC_PATH_SAMPLE_RE.search(line)
+        if (
+            interval_match
+            and interval_match.group("sample") == "interval"
+            and interval_match.group("kind") == "Direct"
+            and interval_match.group("selected") == "true"
+            and interval_match.group("address") == direct_gate_remote_address
+        ):
             remote_address = interval_match.group("address")
             delta = in_flight_deltas.setdefault(remote_address, {"udp_tx_bytes": 0, "udp_rx_bytes": 0})
             delta["udp_tx_bytes"] += int(interval_match.group("tx"))
             delta["udp_rx_bytes"] += int(interval_match.group("rx"))
     direct_selected_path_deltas = [{"remote_address": address, **delta} for address, delta in in_flight_deltas.items()]
     path_delta_source = "in_flight_interval" if in_flight_deltas else None
-    final_path_is_direct = bool(path_events and path_events[-1]["kind"] == "direct")
+    final_path_is_direct = bool(
+        final_selected_path
+        and final_selected_path["kind"] == "direct"
+        and final_selected_path["remote_address"] == direct_gate_remote_address
+    )
     p2p_status = (
         "passed"
         if ssh_status == "passed" and script_sent_after_direct and final_path_is_direct
@@ -1788,6 +1886,11 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
         "marker_observed": marker_observed,
         "ssh_command_exit_code": returncode,
         "direct_selected_before_script": script_sent_after_direct,
+        "direct_gate_remote_address": direct_gate_remote_address,
+        "direct_gate_observation": path_state_at_command,
+        "direct_gate_observation_source": (
+            path_state_at_command.get("source") if path_state_at_command else None
+        ),
         "process_timed_out": process_timed_out,
         "ssh_transfer_bytes": ssh_transfer_bytes,
         "ssh_transfer_summary_observed": ssh_transfer_bytes is not None,
@@ -1795,9 +1898,12 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
         "direct_selected_path_ssh_udp_deltas": direct_selected_path_deltas,
         "direct_selected_path_udp_delta_observed": bool(direct_selected_path_deltas),
         "path_events_in_stderr_order": path_events,
-        "initial_path": path_events[0] if path_events else None,
-        "selected_path": path_events[-1] if path_events else None,
-        "observed_direct_path": any(item["kind"] == "direct" for item in path_events),
+        "path_state_observations_in_stderr_order": path_state_events,
+        "initial_path": selected_path_events[0] if selected_path_events else None,
+        "selected_path": final_selected_path,
+        "observed_direct_path": any(
+            item["kind"] == "direct" for item in selected_path_events
+        ),
         "stderr_file": str(stderr_path),
         "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
         "stderr_bytes": len(stderr),
