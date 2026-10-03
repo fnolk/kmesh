@@ -23,10 +23,12 @@ use uuid::Uuid;
 use crate::{
     identity::{TUNNEL_TICKET_AUDIENCE, decode_tunnel_ticket},
     protocol::{
-        AgentCredentials, AgentEnrollmentRequest, ControlMessage, TransportInfo, TunnelTicketClaims,
+        AgentCredentials, AgentEnrollmentRequest, ControlMessage, RelayMode, TransportInfo,
+        TunnelTicketClaims,
     },
     transport::{
-        IrohByteStream, IrohEndpointOptions, TransportError, accept_peer, create_endpoint,
+        IrohByteStream, IrohEndpointOptions, RelayChoice, TransportError, accept_peer,
+        create_endpoint,
     },
 };
 
@@ -38,6 +40,7 @@ use super::{
 
 const CONTROL_RETRY_MAX: Duration = Duration::from_secs(30);
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TICKET_FRAME: usize = 8 * 1024;
 
@@ -53,6 +56,7 @@ struct TunnelOffer {
     client_endpoint_id: String,
     target_endpoint_addr: EndpointAddr,
     ticket_public_key_pem: String,
+    relay_mode: RelayMode,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,22 +122,13 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let credentials = profile::load_agent_credentials(&context.config.data_dir, target_id)?;
     let endpoint_secret_key = decode_secret_key(&credentials.endpoint_secret_key)?;
     let transport_info = context.api.transport_info().await?;
-    let endpoint = create_endpoint(
-        endpoint_secret_key,
-        true,
-        endpoint_options(&context, transport_info)?,
-    )
-    .await
-    .map_err(anyhow::Error::new)
-    .context("create target Iroh endpoint")?;
-
-    let pending_peers = Arc::new(Mutex::new(
-        HashMap::<String, mpsc::Sender<Connection>>::new(),
-    ));
-    let accept_endpoint = endpoint.clone();
-    let accept_peers = pending_peers.clone();
-    let accept_task =
-        tokio::spawn(async move { accept_connections(accept_endpoint, accept_peers).await });
+    let endpoint_secret_key = Arc::new(endpoint_secret_key);
+    let endpoints = Arc::new(Mutex::new(HashMap::<RelayMode, Endpoint>::new()));
+    let pending_peers = Arc::new(Mutex::new(HashMap::<
+        (RelayMode, String),
+        mpsc::Sender<Connection>,
+    >::new()));
+    let mut accept_tasks = JoinSet::new();
     let mut active_sessions = JoinSet::new();
     let completed_sessions = Arc::new(StdMutex::new(Vec::<Uuid>::new()));
     let mut retry_delay = Duration::from_secs(1);
@@ -141,8 +136,11 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
         match control_session(
             context,
             &credentials,
-            &endpoint,
+            &endpoint_secret_key,
+            &transport_info,
+            &endpoints,
             &pending_peers,
+            &mut accept_tasks,
             &mut active_sessions,
             &completed_sessions,
         )
@@ -156,7 +154,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                         tracing::warn!(target = %target_id, error = %error, "active SSH session ended");
                     }
                 }
-                accept_task.abort();
+                accept_tasks.abort_all();
                 return Err(error);
             }
             Err(error) => {
@@ -168,17 +166,34 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     }
 }
 
-fn endpoint_options(context: &ClientContext, info: TransportInfo) -> Result<IrohEndpointOptions> {
-    let relay_url = reqwest::Url::parse(&info.relay_url).context("parse Iroh relay URL")?;
-    let control_origin =
-        reqwest::Url::parse(context.api.issuer()).context("parse configured kmesh server URL")?;
-    anyhow::ensure!(
-        relay_url == control_origin,
-        "Iroh relay URL differs from the configured kmesh server"
-    );
+fn endpoint_options(
+    context: &ClientContext,
+    info: &TransportInfo,
+    relay_mode: RelayMode,
+) -> Result<IrohEndpointOptions> {
+    let relay_choice = match relay_mode {
+        RelayMode::Private => {
+            let relay_url = info
+                .private_relay_url
+                .as_deref()
+                .context("private Iroh relay is not configured")?;
+            let relay_url =
+                reqwest::Url::parse(relay_url).context("parse private Iroh relay URL")?;
+            let control_origin = reqwest::Url::parse(context.api.issuer())
+                .context("parse configured kmesh server URL")?;
+            anyhow::ensure!(
+                relay_url == control_origin,
+                "Iroh private relay URL differs from the configured kmesh server"
+            );
+            RelayChoice::Private {
+                url: relay_url,
+                qad_port: info.qad_port,
+            }
+        }
+        RelayMode::PublicDefault => RelayChoice::PublicDefault,
+    };
     Ok(IrohEndpointOptions {
-        relay_url,
-        qad_port: info.qad_port,
+        relay_choice,
         tls: context.config.tls.clone(),
     })
 }
@@ -210,7 +225,8 @@ async fn send_control_sink(
 
 async fn accept_connections(
     endpoint: Endpoint,
-    pending_peers: Arc<Mutex<HashMap<String, mpsc::Sender<Connection>>>>,
+    relay_mode: RelayMode,
+    pending_peers: Arc<Mutex<HashMap<(RelayMode, String), mpsc::Sender<Connection>>>>,
 ) {
     loop {
         let connection = match accept_peer(&endpoint).await {
@@ -222,7 +238,11 @@ async fn accept_connections(
             }
         };
         let remote_id = connection.remote_id().to_string();
-        let sender = pending_peers.lock().await.get(&remote_id).cloned();
+        let sender = pending_peers
+            .lock()
+            .await
+            .get(&(relay_mode, remote_id.clone()))
+            .cloned();
         if let Some(sender) = sender {
             if sender.send(connection).await.is_err() {
                 tracing::debug!(remote = %remote_id, "Iroh connection arrived after its offer expired");
@@ -231,11 +251,75 @@ async fn accept_connections(
     }
 }
 
+async fn prepare_endpoint(
+    context: &ClientContext,
+    endpoint_secret_key: &SecretKey,
+    transport_info: &TransportInfo,
+    relay_mode: RelayMode,
+    endpoints: &Arc<Mutex<HashMap<RelayMode, Endpoint>>>,
+    pending_peers: &Arc<Mutex<HashMap<(RelayMode, String), mpsc::Sender<Connection>>>>,
+    accept_tasks: &mut JoinSet<()>,
+) -> std::result::Result<EndpointAddr, TransportError> {
+    let endpoint = {
+        let mut endpoints = endpoints.lock().await;
+        if let Some(endpoint) = endpoints.get(&relay_mode).cloned() {
+            endpoint
+        } else {
+            let options = endpoint_options(context, transport_info, relay_mode)
+                .map_err(|error| TransportError::Configuration(error.to_string()))?;
+            let endpoint = create_endpoint(endpoint_secret_key.clone(), true, options).await?;
+            endpoints.insert(relay_mode, endpoint.clone());
+            let accept_endpoint = endpoint.clone();
+            let accept_peers = pending_peers.clone();
+            accept_tasks.spawn(async move {
+                accept_connections(accept_endpoint, relay_mode, accept_peers).await;
+            });
+            endpoint
+        }
+    };
+    wait_endpoint_online(&endpoint).await?;
+    Ok(endpoint.addr())
+}
+
+async fn wait_endpoint_online(endpoint: &Endpoint) -> std::result::Result<(), TransportError> {
+    let deadline = tokio::time::Instant::now() + RELAY_ENDPOINT_TIMEOUT;
+    let mut status = endpoint.home_relay_status();
+    loop {
+        let relays = status.get();
+        if relays.iter().any(|relay| relay.is_connected()) {
+            return Ok(());
+        }
+        if let Some(reason) = relays.iter().find_map(|relay| relay.auth_denied_reason()) {
+            return Err(TransportError::Authentication(reason.to_owned()));
+        }
+        if let Some(error) = relays
+            .iter()
+            .filter_map(|relay| relay.last_error())
+            .find(|error| crate::transport::is_auth_failure_source(*error))
+        {
+            return Err(TransportError::Authentication(error.to_string()));
+        }
+        tokio::select! {
+            update = status.updated() => {
+                if update.is_err() {
+                    return Err(TransportError::EndpointClosed);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(TransportError::Timeout("target Iroh relay registration"));
+            }
+        }
+    }
+}
+
 async fn control_session(
     context: &ClientContext,
     credentials: &AgentCredentials,
-    endpoint: &Endpoint,
-    pending_peers: &Arc<Mutex<HashMap<String, mpsc::Sender<Connection>>>>,
+    endpoint_secret_key: &SecretKey,
+    transport_info: &TransportInfo,
+    endpoints: &Arc<Mutex<HashMap<RelayMode, Endpoint>>>,
+    pending_peers: &Arc<Mutex<HashMap<(RelayMode, String), mpsc::Sender<Connection>>>>,
+    accept_tasks: &mut JoinSet<()>,
     active_sessions: &mut JoinSet<()>,
     completed_sessions: &Arc<StdMutex<Vec<Uuid>>>,
 ) -> Result<()> {
@@ -246,8 +330,6 @@ async fn control_session(
     .await
     .context("agent control connection timed out")??;
     let (mut writer, mut reader) = ws.split();
-    let mut endpoint_addrs = endpoint.watch_addr().stream();
-    endpoint_addrs.next().await;
     let completed = {
         let mut completed = completed_sessions
             .lock()
@@ -265,25 +347,11 @@ async fn control_session(
         .await
         .context("report SSH session finished while control was offline")?;
     }
-    send_control_sink(
-        &mut writer,
-        &ControlMessage::AgentReady {
-            endpoint_addr: endpoint.addr(),
-        },
-    )
-    .await
-    .context("publish target Iroh endpoint address")?;
-
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ControlMessage>(64);
     let (done_tx, mut done_rx) = mpsc::channel::<Uuid>(16);
     let mut sessions: HashMap<Uuid, mpsc::Sender<ControlMessage>> = HashMap::new();
     loop {
         tokio::select! {
-            address = endpoint_addrs.next() => {
-                let address = address.context("target Iroh address watcher stopped")?;
-                send_control_sink(&mut writer, &ControlMessage::AgentReady { endpoint_addr: address })
-                    .await.context("publish updated target Iroh address")?;
-            }
             Some(message) = outbound_rx.recv() => {
                 send_control_sink(&mut writer, &message).await.context("send agent control message")?;
             }
@@ -302,6 +370,41 @@ async fn control_session(
                     continue;
                 }
                 match Api::control_message(incoming)? {
+                    ControlMessage::Prepare { session_id, relay_mode } => {
+                        match prepare_endpoint(
+                            context,
+                            endpoint_secret_key,
+                            transport_info,
+                            relay_mode,
+                            endpoints,
+                            pending_peers,
+                            accept_tasks,
+                        ).await {
+                            Ok(endpoint_addr) => {
+                                send_control_sink(&mut writer, &ControlMessage::AgentReady {
+                                    session_id: Some(session_id),
+                                    relay_mode,
+                                    endpoint_addr,
+                                }).await.context("publish prepared Iroh endpoint to server")?;
+                            }
+                            Err(error) => {
+                                let code = if error.is_security_failure() || error.is_auth_failure() {
+                                    "authentication"
+                                } else if matches!(error, TransportError::Configuration(_) | TransportError::Tls(_)) {
+                                    "configuration"
+                                } else if error.is_network_failure() {
+                                    "network"
+                                } else {
+                                    "configuration"
+                                };
+                                outbound_tx.send(ControlMessage::Error {
+                                    session_id: Some(session_id),
+                                    code: code.to_owned(),
+                                    message: error.to_string(),
+                                }).await.context("report target relay preparation failure")?;
+                            }
+                        }
+                    }
                     ControlMessage::Offer {
                         session_id,
                         target_id,
@@ -309,14 +412,17 @@ async fn control_session(
                         client_endpoint_id,
                         target_endpoint_addr,
                         ticket_public_key_pem,
+                        relay_mode,
                     } => {
                         anyhow::ensure!(target_id == credentials.target_id, "offer target ID differs from this agent");
+                        let endpoint = endpoints.lock().await.get(&relay_mode).cloned()
+                            .context("offer relay endpoint has not been prepared")?;
                         anyhow::ensure!(target_endpoint_addr.id == endpoint.id(), "offer endpoint identity differs from this agent");
                         anyhow::ensure!(!sessions.contains_key(&session_id), "duplicate offer for session {session_id}");
                         let (peer_tx, peer_rx) = mpsc::channel(1);
                         {
                             let mut peers = pending_peers.lock().await;
-                            anyhow::ensure!(peers.insert(client_endpoint_id.clone(), peer_tx).is_none(), "client EndpointId already has a pending offer");
+                            anyhow::ensure!(peers.insert((relay_mode, client_endpoint_id.clone()), peer_tx).is_none(), "client EndpointId already has a pending offer");
                         }
                         let (session_tx, session_rx) = mpsc::channel(16);
                         sessions.insert(session_id, session_tx);
@@ -334,6 +440,7 @@ async fn control_session(
                                 client_endpoint_id,
                                 target_endpoint_addr,
                                 ticket_public_key_pem,
+                                relay_mode,
                             };
                             let peer_endpoint_id = offer.client_endpoint_id.clone();
                             let result = handle_offer(
@@ -356,10 +463,13 @@ async fn control_session(
                                     remember_completed(&completed_sessions, session_id);
                                 }
                             }
-                            pending_peers.lock().await.remove(&peer_endpoint_id);
+                            pending_peers
+                                .lock()
+                                .await
+                                .remove(&(relay_mode, peer_endpoint_id));
                             let _ = done_tx.send(session_id).await;
                         });
-                        send_control_sink(&mut writer, &ControlMessage::OfferReady { session_id })
+                        send_control_sink(&mut writer, &ControlMessage::OfferReady { session_id, relay_mode })
                             .await.context("confirm target is ready for Iroh connection")?;
                     }
                     ControlMessage::Error { session_id: None, code, message }
@@ -419,6 +529,7 @@ async fn handle_offer(
         .send(ControlMessage::IrohReady {
             session_id: offer.session_id,
             client_endpoint_id: remote_endpoint_id,
+            relay_mode: offer.relay_mode,
         })
         .await
         .context("report authenticated Iroh peer to server")?;
@@ -488,6 +599,10 @@ fn validate_ticket(
     ensure_auth(
         claims.target_endpoint_id == offer.target_endpoint_addr.id.to_string(),
         "ticket target EndpointId mismatch",
+    )?;
+    ensure_auth(
+        claims.relay_mode == offer.relay_mode,
+        "ticket relay mode mismatch",
     )?;
     ensure_auth(
         offer.target_id == credentials.target_id,
@@ -572,12 +687,19 @@ fn message_session_id(message: &ControlMessage) -> Option<Uuid> {
     match message {
         ControlMessage::Activated { session_id }
         | ControlMessage::IrohReady { session_id, .. }
-        | ControlMessage::OfferReady { session_id }
+        | ControlMessage::OfferReady { session_id, .. }
+        | ControlMessage::Prepare { session_id, .. }
         | ControlMessage::Close { session_id, .. } => Some(*session_id),
         ControlMessage::Error { session_id, .. } => *session_id,
         ControlMessage::Open { .. }
         | ControlMessage::Offer { .. }
-        | ControlMessage::AgentReady { .. } => None,
+        | ControlMessage::AgentReady {
+            session_id: None, ..
+        } => None,
+        ControlMessage::AgentReady {
+            session_id: Some(session_id),
+            ..
+        } => Some(*session_id),
     }
 }
 
@@ -607,5 +729,62 @@ fn transport_error(error: TransportError) -> anyhow::Error {
     match error {
         TransportError::Authentication(message) => anyhow!(AgentAuthenticationFailure(message)),
         error => anyhow!(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn context(server_url: &str) -> ClientContext {
+        let mut config = crate::config::Config::default();
+        config.server_url = server_url.to_owned();
+        let api = Api::new(&config).await.expect("build test API client");
+        let profiles =
+            profile::ProfileStore::new(&config.data_dir, &config.server_url, &config.profile);
+        ClientContext {
+            config,
+            config_path: None,
+            api,
+            profiles,
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_mode_uses_public_default_only_when_requested() {
+        let context = context("https://kmesh.test:9443").await;
+        let info = TransportInfo {
+            private_relay_url: None,
+            qad_port: 3478,
+        };
+
+        let public = endpoint_options(&context, &info, RelayMode::PublicDefault)
+            .expect("public relay mode does not require a private relay");
+        assert_eq!(public.relay_choice, RelayChoice::PublicDefault);
+        assert!(endpoint_options(&context, &info, RelayMode::Private).is_err());
+    }
+
+    #[tokio::test]
+    async fn private_relay_must_match_the_authenticated_service_origin() {
+        let context = context("https://kmesh.test:9443").await;
+        let info = TransportInfo {
+            private_relay_url: Some("https://kmesh.test:9443".to_owned()),
+            qad_port: 3478,
+        };
+        let options = endpoint_options(&context, &info, RelayMode::Private)
+            .expect("server private relay matches the control service");
+        assert_eq!(
+            options.relay_choice,
+            RelayChoice::Private {
+                url: reqwest::Url::parse("https://kmesh.test:9443").unwrap(),
+                qad_port: 3478,
+            }
+        );
+
+        let malicious = TransportInfo {
+            private_relay_url: Some("https://untrusted.example".to_owned()),
+            qad_port: 3478,
+        };
+        assert!(endpoint_options(&context, &malicious, RelayMode::Private).is_err());
     }
 }

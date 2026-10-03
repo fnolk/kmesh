@@ -37,11 +37,11 @@ use crate::{
     protocol::{
         AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, LoginTokens,
         PasswordLoginRequest, PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest,
-        TargetPermission, TunnelTicketClaims,
+        RelayMode, TargetPermission, TunnelTicketClaims,
     },
     transport::{
-        IrohByteStream, IrohEndpointOptions, accept_peer, connect_peer, create_endpoint,
-        http_client,
+        IrohByteStream, IrohEndpointOptions, RelayChoice, accept_peer, connect_peer,
+        create_endpoint, http_client,
     },
 };
 
@@ -85,7 +85,7 @@ async fn fixture(issuer: &str) -> Fixture {
                 online_agents: RwLock::new(std::collections::HashMap::new()),
                 tunnels: RwLock::new(std::collections::HashMap::new()),
                 transport_info: RwLock::new(crate::protocol::TransportInfo {
-                    relay_url: issuer.to_owned(),
+                    private_relay_url: Some(issuer.to_owned()),
                     qad_port: 3478,
                 }),
             }),
@@ -230,9 +230,10 @@ async fn online_target(
         OnlineAgent {
             connection_id,
             sender,
-            endpoint_addr: Some(
+            endpoints: std::collections::HashMap::from([(
+                RelayMode::Private,
                 EndpointAddr::new(endpoint_secret_key.public()).with_relay_url(relay_url),
-            ),
+            )]),
         },
     );
     (connection_id, receiver)
@@ -299,9 +300,22 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         denied_session_id,
         target_id,
         denied_client_key.public().to_string(),
+        RelayMode::Private,
     )
     .await
     .expect("open pending SSH session");
+    assert!(matches!(
+        target_receiver.recv().await.expect("target preparation"),
+        ControlMessage::Prepare { session_id: id, relay_mode: RelayMode::Private } if id == denied_session_id
+    ));
+    control::send_target_offer(
+        state,
+        target_id,
+        target_connection_id,
+        RelayMode::Private,
+        denied_session_id,
+    )
+    .await;
     let ControlMessage::Offer { ticket, .. } = target_receiver.recv().await.expect("target offer")
     else {
         panic!("target received another control message");
@@ -320,7 +334,14 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         claims.target_endpoint_id,
         target_secret.public().to_string()
     );
-    control::send_offer_to_client(state, target_id, target_connection_id, denied_session_id).await;
+    control::send_offer_to_client(
+        state,
+        target_id,
+        target_connection_id,
+        RelayMode::Private,
+        denied_session_id,
+    )
+    .await;
     let _ = client_receiver.recv().await.expect("client offer");
     assert_eq!(
         state
@@ -335,6 +356,7 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         target_connection_id,
         denied_session_id,
         denied_client_key.public().to_string(),
+        RelayMode::Private,
     )
     .await;
     let denied_status: String =
@@ -369,11 +391,31 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         active_session_id,
         target_id,
         active_client_key.public().to_string(),
+        RelayMode::Private,
     )
     .await
     .expect("open second pending SSH session");
+    assert!(matches!(
+        target_receiver.recv().await.expect("second target preparation"),
+        ControlMessage::Prepare { session_id: id, relay_mode: RelayMode::Private } if id == active_session_id
+    ));
+    control::send_target_offer(
+        state,
+        target_id,
+        target_connection_id,
+        RelayMode::Private,
+        active_session_id,
+    )
+    .await;
     let _ = target_receiver.recv().await.expect("second target offer");
-    control::send_offer_to_client(state, target_id, target_connection_id, active_session_id).await;
+    control::send_offer_to_client(
+        state,
+        target_id,
+        target_connection_id,
+        RelayMode::Private,
+        active_session_id,
+    )
+    .await;
     let _ = client_receiver.recv().await.expect("second client offer");
     control::activate_tunnel(
         state,
@@ -381,6 +423,7 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         target_connection_id,
         active_session_id,
         active_client_key.public().to_string(),
+        RelayMode::Private,
     )
     .await;
     let active_status: String =
@@ -406,6 +449,107 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         .await
         .expect("read retained session");
     assert_eq!(retained, "active");
+}
+
+#[tokio::test]
+async fn public_default_mode_works_without_a_private_relay() {
+    let fixture = fixture("https://kmesh.test").await;
+    let state = &fixture.state;
+    state.inner.transport_info.write().await.private_relay_url = None;
+    let login = login_password(state).await;
+    let user = auth::authenticate(state, &bearer(&login.access_token))
+        .await
+        .expect("authenticate admin");
+    let target_secret = SecretKey::generate();
+    let (target_id, _) = create_enrolled_target(state, "public-mode-target", &target_secret).await;
+    grant_target(state, target_id).await;
+
+    let relay_url = crate::transport::allowed_relay_urls(&RelayChoice::PublicDefault)
+        .expect("load SDK default relay allowlist")
+        .into_iter()
+        .next()
+        .expect("SDK default relay set is nonempty");
+    let public_endpoint_addr = EndpointAddr::new(target_secret.public()).with_relay_url(relay_url);
+    let target_connection_id = Uuid::new_v4();
+    let (target_sender, mut target_receiver) = mpsc::channel(16);
+    state.inner.online_agents.write().await.insert(
+        target_id,
+        OnlineAgent {
+            connection_id: target_connection_id,
+            sender: target_sender,
+            endpoints: std::collections::HashMap::new(),
+        },
+    );
+    let (client_sender, mut client_receiver) = mpsc::channel(16);
+    let client_secret = SecretKey::generate();
+    let session_id = Uuid::new_v4();
+
+    assert!(
+        control::open_tunnel(
+            state,
+            user,
+            &client_sender,
+            Uuid::new_v4(),
+            target_id,
+            client_secret.public().to_string(),
+            RelayMode::Private,
+        )
+        .await
+        .is_err()
+    );
+    control::open_tunnel(
+        state,
+        user,
+        &client_sender,
+        session_id,
+        target_id,
+        client_secret.public().to_string(),
+        RelayMode::PublicDefault,
+    )
+    .await
+    .expect("public mode remains available without a private relay");
+    assert!(matches!(
+        target_receiver.recv().await.expect("target preparation"),
+        ControlMessage::Prepare { session_id: received, relay_mode: RelayMode::PublicDefault }
+            if received == session_id
+    ));
+    control::handle_agent_message(
+        state,
+        target_id,
+        target_connection_id,
+        ControlMessage::AgentReady {
+            session_id: Some(session_id),
+            relay_mode: RelayMode::PublicDefault,
+            endpoint_addr: public_endpoint_addr,
+        },
+    )
+    .await;
+    let ControlMessage::Offer { ticket, .. } = target_receiver.recv().await.expect("target offer")
+    else {
+        panic!("target received another control message");
+    };
+    let claims: TunnelTicketClaims = identity::decode_tunnel_ticket(
+        &ticket,
+        &state.inner.keys.tunnel_ticket.public_key_pem,
+        &state.inner.issuer,
+    )
+    .expect("decode public-mode ticket");
+    assert_eq!(claims.relay_mode, RelayMode::PublicDefault);
+    control::handle_agent_message(
+        state,
+        target_id,
+        target_connection_id,
+        ControlMessage::OfferReady {
+            session_id,
+            relay_mode: RelayMode::PublicDefault,
+        },
+    )
+    .await;
+    assert!(matches!(
+        client_receiver.recv().await.expect("client offer"),
+        ControlMessage::Offer { session_id: received, relay_mode: RelayMode::PublicDefault, .. }
+            if received == session_id
+    ));
 }
 
 #[tokio::test]
@@ -531,7 +675,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
 
     let relay_server = super::iroh::listen_and_serve(
         super::router(state.clone()),
-        Arc::new(state.clone()),
+        Some(Arc::new(state.clone())),
         SocketAddr::from(([127, 0, 0, 1], https_port)),
         SocketAddr::from(([127, 0, 0, 1], 0)),
         &cert_path,
@@ -562,7 +706,10 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         .json()
         .await
         .expect("decode private transport settings");
-    assert_eq!(published_transport.relay_url, issuer);
+    assert_eq!(
+        published_transport.private_relay_url.as_deref(),
+        Some(issuer.as_str())
+    );
     assert_eq!(published_transport.qad_port, relay_server.qad_addr().port());
 
     let target_secret = SecretKey::generate();
@@ -572,9 +719,12 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     let relay_url: RelayUrl = reqwest::Url::parse(&issuer)
         .expect("parse private relay URL")
         .into();
-    let endpoint_options = IrohEndpointOptions {
-        relay_url: reqwest::Url::parse(&issuer).expect("parse private relay URL"),
+    let relay_choice = RelayChoice::Private {
+        url: reqwest::Url::parse(&issuer).expect("parse private relay URL"),
         qad_port: relay_server.qad_addr().port(),
+    };
+    let endpoint_options = IrohEndpointOptions {
+        relay_choice: relay_choice.clone(),
         tls: tls.clone(),
     };
     let target_endpoint = create_endpoint(target_secret.clone(), true, endpoint_options.clone())
@@ -604,6 +754,8 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     send_control(
         &mut agent_control,
         &ControlMessage::AgentReady {
+            session_id: None,
+            relay_mode: RelayMode::Private,
             endpoint_addr: relay_only_target_addr.clone(),
         },
     )
@@ -616,7 +768,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
                 .read()
                 .await
                 .get(&target_id)
-                .is_some_and(|agent| agent.endpoint_addr.is_some());
+                .is_some_and(|agent| agent.endpoints.contains_key(&RelayMode::Private));
             if ready {
                 return;
             }
@@ -637,6 +789,26 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
             session_id,
             target_id,
             client_endpoint_id: client_secret.public().to_string(),
+            relay_mode: RelayMode::Private,
+        },
+    )
+    .await;
+    assert!(matches!(
+        timeout(Duration::from_secs(10), receive_control(&mut agent_control))
+            .await
+            .expect("timed out waiting for target prepare"),
+        ControlMessage::Prepare { session_id: received, relay_mode: RelayMode::Private } if received == session_id
+    ));
+    let client_accept = {
+        let endpoint = target_endpoint.clone();
+        tokio::spawn(async move { accept_peer(&endpoint).await })
+    };
+    send_control(
+        &mut agent_control,
+        &ControlMessage::AgentReady {
+            session_id: Some(session_id),
+            relay_mode: RelayMode::Private,
+            endpoint_addr: relay_only_target_addr.clone(),
         },
     )
     .await;
@@ -645,6 +817,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         ticket,
         target_endpoint_addr,
         ticket_public_key_pem,
+        relay_mode: RelayMode::Private,
         ..
     } = timeout(Duration::from_secs(10), receive_control(&mut agent_control))
         .await
@@ -654,13 +827,12 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
     };
     assert_eq!(target_offer_id, session_id);
     assert_eq!(target_endpoint_addr, relay_only_target_addr);
-    let client_accept = {
-        let endpoint = target_endpoint.clone();
-        tokio::spawn(async move { accept_peer(&endpoint).await })
-    };
     send_control(
         &mut agent_control,
-        &ControlMessage::OfferReady { session_id },
+        &ControlMessage::OfferReady {
+            session_id,
+            relay_mode: RelayMode::Private,
+        },
     )
     .await;
     let ControlMessage::Offer {
@@ -668,6 +840,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         ticket: client_ticket,
         client_endpoint_id,
         target_endpoint_addr: client_target_addr,
+        relay_mode: RelayMode::Private,
         ..
     } = timeout(
         Duration::from_secs(10),
@@ -695,7 +868,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         .expect("client did not connect to the private relay");
     let connection = timeout(
         Duration::from_secs(15),
-        connect_peer(&client_endpoint, client_target_addr),
+        connect_peer(&client_endpoint, client_target_addr, &relay_choice),
     )
     .await
     .expect("Iroh peer connection timed out")
@@ -739,6 +912,7 @@ async fn self_hosted_https_relay_qad_and_activated_ssh_stream_work_together() {
         &ControlMessage::IrohReady {
             session_id,
             client_endpoint_id,
+            relay_mode: RelayMode::Private,
         },
     )
     .await;

@@ -233,7 +233,7 @@ async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocke
             OnlineAgent {
                 connection_id,
                 sender,
-                endpoint_addr: None,
+                endpoints: HashMap::new(),
             },
         );
     }
@@ -320,7 +320,7 @@ async fn handle_client_message(
     }
 }
 
-async fn handle_agent_message(
+pub(super) async fn handle_agent_message(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,
@@ -574,7 +574,7 @@ pub(super) async fn send_offer_to_client(
     }
 }
 
-async fn send_target_offer(
+pub(super) async fn send_target_offer(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,
@@ -667,7 +667,7 @@ async fn authorized_for_target(
     Ok(allowed != 0)
 }
 
-async fn register_agent_endpoint(
+pub(super) async fn register_agent_endpoint(
     state: &ServerState,
     target_id: Uuid,
     connection_id: Uuid,
