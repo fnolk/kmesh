@@ -1514,7 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn closing_a_second_session_endpoint_keeps_the_first_ssh_stream_alive() {
         let (client_one, target_one) = local_endpoints().await;
-        let (client_two, target_two) = local_endpoints().await;
+        let (_client_two, target_two) = local_endpoints().await;
         let session_one_endpoint_id = target_one.id();
         let session_two_endpoint_id = target_two.id();
         assert_ne!(session_one_endpoint_id, session_two_endpoint_id);
