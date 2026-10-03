@@ -12,7 +12,7 @@ use iroh::{Endpoint, EndpointAddr, SecretKey};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
-    sync::{Mutex, mpsc},
+    sync::mpsc,
     task::JoinSet,
     time::{Instant, sleep, timeout_at},
 };
@@ -136,7 +136,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     };
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        match control_session(context, &credentials, &mut runtime).await {
+        match control_session(context, target_id, &credentials, &mut runtime).await {
             Ok(()) => bail!("agent control connection closed"),
             Err(error) if is_authentication_error(&error) => {
                 tracing::error!(target = %target_id, error = %error, "agent credential was rejected; active SSH sessions will finish");
@@ -267,7 +267,7 @@ async fn run_agent_session(
             session_id: accepted,
             relay_mode: accepted_mode,
         }) if accepted == session_id && accepted_mode == relay_mode => {}
-        Some(_) => {
+        _ => {
             return Err(anyhow!(AgentAuthenticationFailure(
                 "server returned an unexpected response to the signed target identity".to_owned()
             )));
@@ -347,7 +347,6 @@ async fn run_agent_session(
             })?;
             let Some(native) = run_target_punch(
                 session_id,
-                target_id,
                 relay_mode,
                 data_id,
                 client_id,
@@ -364,7 +363,7 @@ async fn run_agent_session(
             };
             native
         }
-        Some(_) => {
+        _ => {
             return Err(anyhow!(AgentAuthenticationFailure(
                 "server sent an unexpected response to target QAD candidates".to_owned()
             )));
@@ -472,12 +471,20 @@ async fn run_agent_session(
         endpoint_addr = ?endpoint.addr(),
         "per-session target endpoint ready"
     );
-    handle_dial_offer(context, offer, endpoint, relay_choice, control_rx, outbound).await
+    handle_dial_offer(
+        context,
+        offer,
+        endpoint,
+        relay_choice,
+        deadline,
+        control_rx,
+        outbound,
+    )
+    .await
 }
 
 async fn run_target_punch(
     session_id: Uuid,
-    target_id: Uuid,
     relay_mode: RelayMode,
     target_data_id: iroh::EndpointId,
     client_id: iroh::EndpointId,
@@ -798,6 +805,7 @@ fn agent_session_error_code(error: &anyhow::Error) -> &'static str {
 
 async fn control_session(
     context: &ClientContext,
+    target_id: Uuid,
     credentials: &AgentCredentials,
     runtime: &mut AgentRuntime,
 ) -> Result<()> {
@@ -1271,6 +1279,7 @@ mod tests {
     use crate::{client::proxy::read_ticket, transport::accept_peer};
     use iroh::{Endpoint, endpoint::presets};
     use std::io;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn per_session_error_classification_keeps_auth_and_protocol_failures_terminal() {
