@@ -732,6 +732,59 @@ mod tests {
     use std::io;
     use tokio::io::AsyncWriteExt;
 
+    async fn local_ticket_streams(
+        initial_frame: &[u8],
+    ) -> (Endpoint, Endpoint, IrohByteStream, IrohByteStream) {
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![crate::transport::IROH_SSH_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind local client endpoint");
+        let agent = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind local target endpoint");
+        let client_addr = client.addr();
+        let accept_endpoint = client.clone();
+        let accepting = tokio::spawn(async move { accept_peer(&accept_endpoint).await });
+        let connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_peer(&agent, client_addr, &RelayChoice::PublicDefault),
+        )
+        .await
+        .expect("target connection handshake timed out")
+        .expect("target connects to accepting client");
+        let incoming = tokio::time::timeout(Duration::from_secs(5), accepting)
+            .await
+            .expect("client did not accept target")
+            .expect("client accept task panicked")
+            .expect("accept target connection");
+        let target_stream =
+            tokio::time::timeout(Duration::from_secs(5), IrohByteStream::open_bi(connection))
+                .await
+                .expect("target stream open timed out")
+                .expect("target opens ticket stream");
+        let mut target_stream = target_stream;
+        target_stream
+            .write_all(initial_frame)
+            .await
+            .expect("write initial ticket bytes");
+        target_stream
+            .flush()
+            .await
+            .expect("flush initial ticket bytes");
+        let client_stream =
+            tokio::time::timeout(Duration::from_secs(5), IrohByteStream::accept_bi(incoming))
+                .await
+                .expect("client stream accept timed out")
+                .expect("client accepts ticket stream");
+        (client, agent, target_stream, client_stream)
+    }
+
     #[test]
     fn retryable_private_failures_use_a_fresh_session_and_endpoint_key() {
         let (private_session, private_key) = new_attempt_identity();
@@ -785,52 +838,11 @@ mod tests {
 
     #[tokio::test]
     async fn partial_ticket_disconnect_is_retryable_but_invalid_frame_is_authentication() {
-        let client = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::generate())
-            .alpns(vec![crate::transport::IROH_SSH_ALPN.to_vec()])
-            .relay_mode(iroh::RelayMode::Disabled)
-            .bind()
+        let (_client, _agent, _target_stream, mut client_stream) =
+            local_ticket_streams(&0u32.to_be_bytes()).await;
+        let invalid = tokio::time::timeout(Duration::from_secs(5), read_ticket(&mut client_stream))
             .await
-            .expect("bind local client endpoint");
-        let agent = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::generate())
-            .relay_mode(iroh::RelayMode::Disabled)
-            .bind()
-            .await
-            .expect("bind local target endpoint");
-        let client_addr = client.addr();
-        let accepting = tokio::spawn(async move { accept_peer(&client).await });
-        let connection = connect_peer(&agent, client_addr, &RelayChoice::PublicDefault)
-            .await
-            .expect("target connects to accepting client");
-        let incoming = tokio::time::timeout(Duration::from_secs(5), accepting)
-            .await
-            .expect("client did not accept target")
-            .expect("client accept task panicked")
-            .expect("accept target connection");
-        let mut target_stream = IrohByteStream::open_bi(connection)
-            .await
-            .expect("target opens ticket stream");
-        let mut client_stream = IrohByteStream::accept_bi(incoming)
-            .await
-            .expect("client accepts ticket stream");
-
-        target_stream
-            .write_u32(0)
-            .await
-            .expect("write invalid ticket frame length");
-        target_stream
-            .write_u32(32)
-            .await
-            .expect("write partial ticket frame length");
-        target_stream
-            .write_all(b"partial")
-            .await
-            .expect("write partial ticket frame");
-        target_stream.flush().await.expect("flush ticket frames");
-
-        let invalid = read_ticket(&mut client_stream)
-            .await
+            .expect("invalid ticket frame read timed out")
             .expect_err("zero-length ticket frame must be rejected");
         assert!(invalid.downcast_ref::<SshAuthenticationFailure>().is_some());
         assert!(
@@ -839,16 +851,18 @@ mod tests {
                 .is_none()
         );
 
-        let pending_read = read_ticket(&mut client_stream);
-        tokio::pin!(pending_read);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut pending_read)
-                .await
-                .is_err()
-        );
+        drop(client_stream);
+        let mut partial_frame = 32u32.to_be_bytes().to_vec();
+        partial_frame.extend_from_slice(b"partial");
+        let (_client, _agent, mut target_stream, mut client_stream) =
+            local_ticket_streams(&partial_frame).await;
+        let read_task = tokio::spawn(async move { read_ticket(&mut client_stream).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
         target_stream.reset().expect("reset partial ticket stream");
-        let network = pending_read
+        let network = tokio::time::timeout(Duration::from_secs(5), read_task)
             .await
+            .expect("partial ticket reader did not observe the stream reset")
+            .expect("partial ticket reader task panicked")
             .expect_err("reset during a partial ticket must fail");
         assert!(network.downcast_ref::<SshAuthenticationFailure>().is_none());
         assert!(
