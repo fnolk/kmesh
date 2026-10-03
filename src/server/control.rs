@@ -1387,10 +1387,16 @@ async fn register_discovery(
         if ready.is_none() {
             setup.punch_stage = PunchStage::NativePlanned;
             action = Some(DiscoveryAction::Native);
-        } else if let (Some(target_discovery), Some(client_discovery)) =
-            (&setup.target_discovery, &setup.client_discovery)
-        {
-            if use_birthday_target(target_discovery, client_discovery) {
+        } else if setup.target_discovery.is_some() && setup.client_discovery.is_some() {
+            let target_discovery = setup
+                .target_discovery
+                .clone()
+                .expect("target QAD result is present");
+            let client_discovery = setup
+                .client_discovery
+                .clone()
+                .expect("client QAD result is present");
+            if use_birthday_target(&target_discovery, &client_discovery) {
                 setup.punch_stage = PunchStage::PairSent;
                 let target_data_endpoint_id = setup
                     .target_data_endpoint_id
@@ -1400,19 +1406,16 @@ async fn register_discovery(
                     target: ControlMessage::PunchPair {
                         session_id,
                         relay_mode,
-                        target_endpoint_id: target_data_endpoint_id,
+                        target_endpoint_id: target_data_endpoint_id.clone(),
                         client_endpoint_id: runtime.client_endpoint_id.clone(),
-                        peer_discovery: client_discovery.clone(),
+                        peer_discovery: client_discovery,
                     },
                     client: ControlMessage::PunchPair {
                         session_id,
                         relay_mode,
-                        target_endpoint_id: setup
-                            .target_data_endpoint_id
-                            .clone()
-                            .expect("session identity exists before QAD"),
+                        target_endpoint_id,
                         client_endpoint_id: runtime.client_endpoint_id.clone(),
-                        peer_discovery: target_discovery.clone(),
+                        peer_discovery: target_discovery,
                     },
                 });
             } else {

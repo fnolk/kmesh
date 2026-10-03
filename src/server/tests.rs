@@ -38,7 +38,8 @@ use crate::{
     protocol::{
         AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, DiscoveryResult,
         LoginTokens, NativePlan, PasswordLoginRequest, PublicKeyChallengeRequest,
-        PublicKeyLoginRequest, RefreshRequest, RelayMode, TargetPermission, TunnelTicketClaims,
+        PublicKeyLoginRequest, ReadyDiscovery, RefreshRequest, RelayMode, TargetPermission,
+        TunnelTicketClaims,
     },
     transport::{
         IrohByteStream, IrohEndpointOptions, QadObservation, QadReflector, RelayChoice,
@@ -924,12 +925,12 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
             .expect("authenticate enrolled target"),
         target_id
     );
-    assert_eq!(
+    assert!(matches!(
         state
             .on_connect(&endpoint_connect_request(target_secret.public()))
             .await,
         Access::Deny { .. }
-    );
+    ));
 
     let login = login_password(state).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
@@ -972,12 +973,12 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
         Access::Allow
     );
     control::close_pending_client_tunnels(state, &client_sender).await;
-    assert_eq!(
+    assert!(matches!(
         state
             .on_connect(&endpoint_connect_request(data_key.public()))
             .await,
         Access::Deny { .. }
-    );
+    ));
 }
 
 #[tokio::test]
@@ -2286,18 +2287,18 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
             .await,
         Access::Allow
     );
-    assert_eq!(
+    assert!(matches!(
         state
             .on_connect(&endpoint_connect_request(pending_client_key.public()))
             .await,
         Access::Deny { .. }
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         state
             .on_connect(&endpoint_connect_request(device_key.public()))
             .await,
         Access::Deny { .. }
-    );
+    ));
 }
 
 #[tokio::test]
