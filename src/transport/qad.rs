@@ -86,10 +86,11 @@ impl noq::Runtime for TrackedTokioRuntime {
 }
 
 async fn join_noq_tasks(owner: &TaskOwner) -> Result<()> {
-    let mut state = owner.lock().expect("QAD runtime task owner poisoned");
-    state.0 = true;
-    let mut tasks = std::mem::take(&mut state.1);
-    drop(state);
+    let mut tasks = {
+        let mut state = owner.lock().expect("QAD runtime task owner poisoned");
+        state.0 = true;
+        std::mem::take(&mut state.1)
+    };
 
     while let Some(result) = tasks.join_next().await {
         result.context("join QAD Noq runtime task")?;
