@@ -13,14 +13,14 @@ use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
 use iroh_relay::quic::{QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON, QuicClient};
 use noq::{Endpoint, PathId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     task::JoinSet,
     time::{Instant as TokioInstant, timeout_at},
 };
 
 /// One authenticated QAD reflector.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QadReflector {
     /// IPv4 reflector address and UDP port.
     pub addr: SocketAddrV4,
@@ -29,7 +29,7 @@ pub struct QadReflector {
 }
 
 /// One successful QAD observation made over the caller-owned UDP socket.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QadObservation {
     /// Authenticated reflector contacted for this observation.
     pub reflector: QadReflector,
