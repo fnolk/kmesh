@@ -748,7 +748,7 @@ async fn drive_target(
                     tx_delta,
                     rx_delta,
                 });
-                break;
+                return Ok(evidence);
             }
         }
     }
