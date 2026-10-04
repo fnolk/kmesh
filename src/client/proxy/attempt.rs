@@ -104,18 +104,15 @@ pub(super) async fn open_ssh_session(
             deadline,
             tokio::time::Instant::now() + Duration::from_secs(2),
         );
-        let discovery = tokio::select! {
-            biased;
-            control_message = next_client_session_message(control, session_id, route_mode, deadline) => {
-                match control_message? {
-                    None => bail!("server closed SSH session during QAD discovery"),
-                    Some(_) => bail!("server sent a control message before client QAD discovery completed"),
-                }
-            }
-            result = discover_ipv4_mappings(qad_plan, &context.config.tls, discovery_deadline) => {
-                result.map_err(classify_transport_error)?
-            }
-        };
+        let (discovery, early_native_plan) = wait_for_discovery_or_native_plan(
+            control,
+            session_id,
+            route_mode,
+            deadline,
+            discovery_deadline,
+            discover_ipv4_mappings(qad_plan, &context.config.tls, discovery_deadline),
+        )
+        .await?;
         let (discovery_message, mut discovered) = match discovery {
             MappingDiscovery::Ready(discovered) => (
                 DiscoveryResult::Ready {
@@ -142,9 +139,16 @@ pub(super) async fn open_ssh_session(
             deadline,
         )
         .await?;
-        let first_plan = next_client_session_message(control, session_id, route_mode, deadline)
-            .await?
-            .context("server closed SSH session before native transport plan")?;
+        let first_plan = match early_native_plan {
+            Some(plan) => ControlMessage::ContinueNative {
+                session_id,
+                route_mode,
+                plan,
+            },
+            None => next_client_session_message(control, session_id, route_mode, deadline)
+                .await?
+                .context("server closed SSH session before native transport plan")?,
+        };
         match first_plan {
             ControlMessage::ContinueNative {
                 session_id: received,
@@ -381,6 +385,45 @@ pub(super) async fn open_ssh_session(
                 tracing::debug!(session = %session_id, "endpoint cleanup reached the shared setup deadline; endpoint drop will abort remaining SDK tasks");
             }
             Err(error)
+        }
+    }
+}
+
+async fn wait_for_discovery_or_native_plan(
+    control: &mut WsStream,
+    session_id: Uuid,
+    route_mode: RouteMode,
+    setup_deadline: tokio::time::Instant,
+    discovery_deadline: tokio::time::Instant,
+    discovery: impl Future<Output = Result<MappingDiscovery, TransportError>> + Send,
+) -> Result<(MappingDiscovery, Option<NativePlan>)> {
+    let discovery = async {
+        match tokio::time::timeout_at(discovery_deadline, discovery).await {
+            Ok(result) => result.map_err(classify_transport_error),
+            Err(_) => Ok(MappingDiscovery::Unavailable {
+                reason: "QAD mapping discovery deadline elapsed".to_owned(),
+            }),
+        }
+    };
+    tokio::pin!(discovery);
+    let mut early_native_plan = None;
+    loop {
+        tokio::select! {
+            biased;
+            message = next_client_session_message(control, session_id, route_mode, setup_deadline) => {
+                match message? {
+                    Some(ControlMessage::ContinueNative {
+                        session_id: received,
+                        route_mode: mode,
+                        plan: NativePlan::Standard,
+                    }) if received == session_id && mode == route_mode && early_native_plan.is_none() => {
+                        early_native_plan = Some(NativePlan::Standard);
+                    }
+                    None => bail!("server closed SSH session during QAD discovery"),
+                    Some(_) => bail!("server sent a control message before client QAD discovery completed"),
+                }
+            }
+            result = &mut discovery => return Ok((result?, early_native_plan)),
         }
     }
 }
@@ -657,9 +700,11 @@ async fn wait_activated(control: &mut WsStream, session_id: Uuid) -> Result<()> 
 mod tests {
     use super::super::is_retryable_route_failure;
     use super::*;
-    use crate::transport::TransportError;
+    use crate::transport::{BoxedIo, TransportError};
     use anyhow::anyhow;
     use std::io;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 
     #[test]
     fn route_retries_use_a_fresh_session_and_endpoint_key() {
@@ -720,5 +765,197 @@ mod tests {
         let server_auth =
             server_setup_error("authorization".to_owned(), "access denied".to_owned());
         assert!(server_auth.downcast_ref::<RouteNetworkFailure>().is_none());
+    }
+
+    #[tokio::test]
+    async fn early_standard_plan_is_retained_until_bounded_qad_finishes() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let mut client_control: WsStream =
+            WebSocketStream::from_raw_socket(Box::new(client_io) as BoxedIo, Role::Client, None)
+                .await;
+        let mut server_control: WsStream =
+            WebSocketStream::from_raw_socket(Box::new(server_io) as BoxedIo, Role::Server, None)
+                .await;
+        let session_id = Uuid::new_v4();
+        let (finish_discovery, discovery_gate) = oneshot::channel();
+        let discovery = async move {
+            discovery_gate
+                .await
+                .expect("finish deterministic QAD future");
+            Ok(MappingDiscovery::Unavailable {
+                reason: "fixture QAD unavailable".to_owned(),
+            })
+        };
+        let discovery_task = tokio::spawn(async move {
+            wait_for_discovery_or_native_plan(
+                &mut client_control,
+                session_id,
+                RouteMode::PrivateDirect,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                discovery,
+            )
+            .await
+        });
+
+        Api::send_control(
+            &mut server_control,
+            &ControlMessage::ContinueNative {
+                session_id,
+                route_mode: RouteMode::PrivateDirect,
+                plan: NativePlan::Standard,
+            },
+        )
+        .await
+        .expect("deliver early standard plan");
+        finish_discovery
+            .send(())
+            .expect("release deterministic QAD future");
+
+        let (discovery, early_plan) = tokio::time::timeout(Duration::from_secs(2), discovery_task)
+            .await
+            .expect("QAD and early plan complete within the route deadline")
+            .expect("discovery task does not panic")
+            .expect("early Standard is a valid route decision");
+        assert!(matches!(
+            discovery,
+            MappingDiscovery::Unavailable { ref reason } if reason == "fixture QAD unavailable"
+        ));
+        assert!(matches!(early_plan, Some(NativePlan::Standard)));
+    }
+
+    #[tokio::test]
+    async fn server_error_cancels_qad_discovery_immediately() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let mut client_control: WsStream =
+            WebSocketStream::from_raw_socket(Box::new(client_io) as BoxedIo, Role::Client, None)
+                .await;
+        let mut server_control: WsStream =
+            WebSocketStream::from_raw_socket(Box::new(server_io) as BoxedIo, Role::Server, None)
+                .await;
+        let session_id = Uuid::new_v4();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let discovery = async move {
+            let _ = started_tx.send(());
+            let _cancel_rx = cancel_rx;
+            std::future::pending::<Result<MappingDiscovery, TransportError>>().await
+        };
+        let discovery_task = tokio::spawn(async move {
+            wait_for_discovery_or_native_plan(
+                &mut client_control,
+                session_id,
+                RouteMode::PrivateDirect,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                discovery,
+            )
+            .await
+        });
+        started_rx.await.expect("QAD discovery was polled");
+
+        Api::send_control(
+            &mut server_control,
+            &ControlMessage::ContinueNative {
+                session_id,
+                route_mode: RouteMode::PrivateDirect,
+                plan: NativePlan::Standard,
+            },
+        )
+        .await
+        .expect("deliver early standard plan");
+        Api::send_control(
+            &mut server_control,
+            &ControlMessage::Error {
+                session_id: Some(session_id),
+                code: "authorization".to_owned(),
+                message: "target access revoked".to_owned(),
+            },
+        )
+        .await
+        .expect("deliver server authorization error");
+
+        let error = tokio::time::timeout(Duration::from_secs(2), discovery_task)
+            .await
+            .expect("server error stops QAD without waiting for its deadline")
+            .expect("discovery task does not panic")
+            .expect_err("server authorization error terminates route setup");
+        assert!(
+            error
+                .downcast_ref::<super::super::SshAuthenticationFailure>()
+                .is_some(),
+            "server authorization remains an authentication boundary error"
+        );
+        assert!(error.to_string().contains("target access revoked"));
+        assert!(
+            cancel_tx.send(()).is_err(),
+            "QAD future was dropped on error"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_close_cancels_qad_discovery_immediately() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let mut client_control: WsStream =
+            WebSocketStream::from_raw_socket(Box::new(client_io) as BoxedIo, Role::Client, None)
+                .await;
+        let mut server_control: WsStream =
+            WebSocketStream::from_raw_socket(Box::new(server_io) as BoxedIo, Role::Server, None)
+                .await;
+        let session_id = Uuid::new_v4();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let discovery = async move {
+            let _ = started_tx.send(());
+            let _cancel_rx = cancel_rx;
+            std::future::pending::<Result<MappingDiscovery, TransportError>>().await
+        };
+        let discovery_task = tokio::spawn(async move {
+            wait_for_discovery_or_native_plan(
+                &mut client_control,
+                session_id,
+                RouteMode::PrivateDirect,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                discovery,
+            )
+            .await
+        });
+        started_rx.await.expect("QAD discovery was polled");
+
+        Api::send_control(
+            &mut server_control,
+            &ControlMessage::ContinueNative {
+                session_id,
+                route_mode: RouteMode::PrivateDirect,
+                plan: NativePlan::Standard,
+            },
+        )
+        .await
+        .expect("deliver early standard plan");
+        Api::send_control(
+            &mut server_control,
+            &ControlMessage::Close {
+                session_id,
+                reason: "target disconnected".to_owned(),
+            },
+        )
+        .await
+        .expect("deliver server close");
+
+        let error = tokio::time::timeout(Duration::from_secs(2), discovery_task)
+            .await
+            .expect("server close stops QAD without waiting for its deadline")
+            .expect("discovery task does not panic")
+            .expect_err("server close terminates route setup");
+        assert!(
+            error
+                .to_string()
+                .contains("server closed SSH session during QAD discovery")
+        );
+        assert!(
+            cancel_tx.send(()).is_err(),
+            "QAD future was dropped on close"
+        );
     }
 }
