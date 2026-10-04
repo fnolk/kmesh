@@ -177,13 +177,14 @@ pub(super) async fn control_session(
                                 &credentials,
                                 stable_device_key,
                                 transport_info,
-                                session_id,
-                                target_id,
-                                client_endpoint_id,
-                                route_mode,
-                                expires_at,
-                                session_rx,
-                                outbound.clone(),
+                                session::AgentSessionPrepare {
+                                    session_id,
+                                    client_endpoint_id,
+                                    route_mode,
+                                    expires_at,
+                                    control_rx: session_rx,
+                                    outbound: outbound.clone(),
+                                },
                             )
                             .await
                             {

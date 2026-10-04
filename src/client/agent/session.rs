@@ -31,7 +31,19 @@ use super::{
     AgentAuthenticationFailure, ClientContext, MAX_TICKET_FRAME, TunnelOffer, ensure_auth,
     route::endpoint_options, server_session_error, transport_error,
 };
-use super::{control::next_session_message, punch::run_target_punch};
+use super::{
+    control::next_session_message,
+    punch::{TargetPunchSetup, run_target_punch},
+};
+
+pub(super) struct AgentSessionPrepare {
+    pub(super) session_id: Uuid,
+    pub(super) client_endpoint_id: String,
+    pub(super) route_mode: RouteMode,
+    pub(super) expires_at: i64,
+    pub(super) control_rx: mpsc::Receiver<ControlMessage>,
+    pub(super) outbound: mpsc::Sender<ControlMessage>,
+}
 
 async fn wait_for_target_qad_discovery<F>(
     discovery: F,
@@ -81,14 +93,17 @@ pub(super) async fn run_agent_session(
     credentials: &AgentCredentials,
     stable_device_key: SecretKey,
     transport_info: TransportInfo,
-    session_id: Uuid,
-    target_id: Uuid,
-    client_endpoint_id: String,
-    route_mode: RouteMode,
-    expires_at: i64,
-    mut control_rx: mpsc::Receiver<ControlMessage>,
-    outbound: mpsc::Sender<ControlMessage>,
+    prepare: AgentSessionPrepare,
 ) -> Result<()> {
+    let AgentSessionPrepare {
+        session_id,
+        client_endpoint_id,
+        route_mode,
+        expires_at,
+        mut control_rx,
+        outbound,
+    } = prepare;
+    let target_id = credentials.target_id;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
@@ -218,13 +233,17 @@ pub(super) async fn run_agent_session(
                     ))
                 })?;
                 let Some(native) = run_target_punch(
-                    session_id,
-                    route_mode,
-                    data_id,
-                    client_id,
-                    data_key.clone(),
-                    discovered,
-                    peer_discovery,
+                    TargetPunchSetup {
+                        identity: crate::transport::PunchIdentity {
+                            session_id,
+                            target_id: data_id,
+                            client_id,
+                        },
+                        route_mode,
+                        data_key: data_key.clone(),
+                        discovered,
+                        peer_discovery,
+                    },
                     &mut control_rx,
                     &outbound,
                     deadline,
@@ -262,96 +281,102 @@ pub(super) async fn run_agent_session(
                 .map_err(anyhow::Error::new)?
         }
     };
-    tokio::select! {
-        biased;
-        control = next_session_message(&mut control_rx, session_id, deadline) => {
-            match control? {
-                None => return Ok(()),
-                Some(_) => return Err(anyhow!(AgentAuthenticationFailure(
-                    "server sent a control message before target Endpoint readiness".to_owned()
-                ))),
+    let endpoint_ref = &endpoint;
+    let result = async move {
+        tokio::select! {
+            biased;
+            control = next_session_message(&mut control_rx, session_id, deadline) => {
+                match control? {
+                    None => return Ok(()),
+                    Some(_) => return Err(anyhow!(AgentAuthenticationFailure(
+                        "server sent a control message before target Endpoint readiness".to_owned()
+                    ))),
+                }
+            }
+            result = timeout_at(deadline, wait_endpoint_ready(endpoint_ref, &relay_choice, deadline)) => {
+                result
+                    .context("wait for per-session target relay and address readiness")?
+                    .map_err(anyhow::Error::new)?;
             }
         }
-        result = timeout_at(deadline, wait_endpoint_ready(&endpoint, &relay_choice, deadline)) => {
-            result
-                .context("wait for per-session target relay and address readiness")?
-                .map_err(anyhow::Error::new)?;
-        }
-    }
-    let target_data_endpoint_id = endpoint.id().to_string();
-    outbound
-        .send(ControlMessage::AgentReady {
-            session_id,
-            route_mode,
-            endpoint_addr: endpoint.addr(),
-        })
-        .await
-        .context("publish per-session target Iroh endpoint")?;
+        let target_data_endpoint_id = endpoint_ref.id().to_string();
+        outbound
+            .send(ControlMessage::AgentReady {
+                session_id,
+                route_mode,
+                endpoint_addr: endpoint_ref.addr(),
+            })
+            .await
+            .context("publish per-session target Iroh endpoint")?;
 
-    let offer = match next_session_message(&mut control_rx, session_id, deadline).await? {
-        None => return Ok(()),
-        Some(ControlMessage::DialOffer {
-            session_id: received,
-            target_id: offered_target_id,
-            ticket,
-            client_endpoint_id,
-            client_endpoint_addr,
-            ticket_public_key_pem,
-            route_mode: offered_mode,
-        }) if received == session_id && offered_mode == route_mode => TunnelOffer {
-            session_id,
-            target_id: offered_target_id,
-            ticket,
-            client_endpoint_id,
-            client_endpoint_addr,
-            ticket_public_key_pem,
-            route_mode,
-        },
-        Some(_) => {
-            return Err(anyhow!(AgentAuthenticationFailure(
-                "server sent an unexpected control message before target dial offer".to_owned()
-            )));
-        }
-    };
-    ensure_auth(
-        offer.target_id == target_id,
-        "dial offer target ID differs from Prepare",
-    )?;
-    let claims = decode_tunnel_ticket(
-        &offer.ticket,
-        &offer.ticket_public_key_pem,
-        context.api.issuer(),
-    )
-    .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
-    validate_ticket(&claims, &offer, credentials, endpoint.id())?;
-    validate_endpoint_addr(&offer.client_endpoint_addr, &relay_choice)
-        .map_err(anyhow::Error::new)
+        let offer = match next_session_message(&mut control_rx, session_id, deadline).await? {
+            None => return Ok(()),
+            Some(ControlMessage::DialOffer {
+                session_id: received,
+                target_id: offered_target_id,
+                ticket,
+                client_endpoint_id,
+                client_endpoint_addr,
+                ticket_public_key_pem,
+                route_mode: offered_mode,
+            }) if received == session_id && offered_mode == route_mode => TunnelOffer {
+                session_id,
+                target_id: offered_target_id,
+                ticket,
+                client_endpoint_id,
+                client_endpoint_addr,
+                ticket_public_key_pem,
+                route_mode,
+            },
+            Some(_) => {
+                return Err(anyhow!(AgentAuthenticationFailure(
+                    "server sent an unexpected control message before target dial offer".to_owned()
+                )));
+            }
+        };
+        ensure_auth(
+            offer.target_id == target_id,
+            "dial offer target ID differs from Prepare",
+        )?;
+        let claims = decode_tunnel_ticket(
+            &offer.ticket,
+            &offer.ticket_public_key_pem,
+            context.api.issuer(),
+        )
         .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
+        validate_ticket(&claims, &offer, credentials, endpoint_ref.id())?;
+        validate_endpoint_addr(&offer.client_endpoint_addr, &relay_choice)
+            .map_err(anyhow::Error::new)
+            .map_err(|error| anyhow!(AgentAuthenticationFailure(error.to_string())))?;
 
-    tracing::debug!(
-        session = %session_id,
-        target_data_endpoint_id,
-        raw_selected = selection.is_some(),
-        native_handoff_selected = handoff.is_some(),
-        endpoint_addr = ?endpoint.addr(),
-        "per-session target endpoint ready"
-    );
-    handle_dial_offer(
-        context,
-        offer,
-        endpoint,
-        relay_choice,
-        deadline,
-        control_rx,
-        outbound,
-    )
-    .await
+        tracing::debug!(
+            session = %session_id,
+            target_data_endpoint_id,
+            raw_selected = selection.is_some(),
+            native_handoff_selected = handoff.is_some(),
+            endpoint_addr = ?endpoint_ref.addr(),
+            "per-session target endpoint ready"
+        );
+        handle_dial_offer(
+            context,
+            offer,
+            endpoint_ref,
+            relay_choice,
+            deadline,
+            control_rx,
+            outbound,
+        )
+        .await
+    }
+    .await;
+    endpoint.close().await;
+    result
 }
 
 pub(super) async fn handle_dial_offer(
     context: &ClientContext,
     offer: TunnelOffer,
-    endpoint: Endpoint,
+    endpoint: &Endpoint,
     relay_choice: RelayChoice,
     setup_deadline: Instant,
     mut control_rx: mpsc::Receiver<ControlMessage>,
@@ -363,7 +388,7 @@ pub(super) async fn handle_dial_offer(
             control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
                 control.map(|()| None)
             },
-            connection = connect_peer(&endpoint, offer.client_endpoint_addr.clone(), &relay_choice) => {
+            connection = connect_peer(endpoint, offer.client_endpoint_addr.clone(), &relay_choice) => {
                 connection.map(Some).map_err(transport_error)
             },
         }

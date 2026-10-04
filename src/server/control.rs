@@ -342,18 +342,18 @@ pub(super) async fn handle_client_message(
                 return;
             }
             let runtime = { state.inner.tunnels.read().await.get(&session_id).cloned() };
-            if let Some(runtime) = runtime {
-                if let Err(error) = maybe_send_dial_offer(state, &runtime).await {
-                    fail_from_client(
-                        state,
-                        user,
-                        sender,
-                        session_id,
-                        "client_ready_denied",
-                        &error.to_string(),
-                    )
-                    .await;
-                }
+            if let Some(runtime) = runtime
+                && let Err(error) = maybe_send_dial_offer(state, &runtime).await
+            {
+                fail_from_client(
+                    state,
+                    user,
+                    sender,
+                    session_id,
+                    "client_ready_denied",
+                    &error.to_string(),
+                )
+                .await;
             }
         }
         ControlMessage::PathReady {
@@ -448,25 +448,24 @@ pub(super) async fn handle_agent_message(
                     return;
                 }
                 send_client_offer(state, target_id, connection_id, route_mode, session_id).await;
-                if route_mode == RouteMode::PrivateRelay {
-                    if let Err(error) = send_native_plans(
+                if route_mode == RouteMode::PrivateRelay
+                    && let Err(error) = send_native_plans(
                         state,
                         &runtime,
                         NativePlan::Standard,
                         NativePlan::Standard,
                     )
                     .await
-                    {
-                        fail_pending_from_target(
-                            state,
-                            session_id,
-                            target_id,
-                            connection_id,
-                            "private_relay_setup_failed".to_owned(),
-                            error.to_string(),
-                        )
-                        .await;
-                    }
+                {
+                    fail_pending_from_target(
+                        state,
+                        session_id,
+                        target_id,
+                        connection_id,
+                        "private_relay_setup_failed".to_owned(),
+                        error.to_string(),
+                    )
+                    .await;
                 }
             }
         }
@@ -620,18 +619,18 @@ pub(super) async fn handle_agent_message(
                 return;
             }
             let runtime = { state.inner.tunnels.read().await.get(&session_id).cloned() };
-            if let Some(runtime) = runtime {
-                if let Err(error) = maybe_send_dial_offer(state, &runtime).await {
-                    fail_pending_from_target(
-                        state,
-                        session_id,
-                        target_id,
-                        connection_id,
-                        "agent_ready_denied".to_owned(),
-                        error.to_string(),
-                    )
-                    .await;
-                }
+            if let Some(runtime) = runtime
+                && let Err(error) = maybe_send_dial_offer(state, &runtime).await
+            {
+                fail_pending_from_target(
+                    state,
+                    session_id,
+                    target_id,
+                    connection_id,
+                    "agent_ready_denied".to_owned(),
+                    error.to_string(),
+                )
+                .await;
             }
         }
         ControlMessage::IrohReady {

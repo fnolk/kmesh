@@ -551,22 +551,46 @@ fn test_qad_ready(
     }
 }
 
-async fn start_test_birthday_punch(
-    state: &ServerState,
-    user: super::auth::AuthenticatedUser,
+struct BirthdayPunchControl<'a> {
     target_id: Uuid,
     connection_id: Uuid,
-    device_key: &SecretKey,
-    target_receiver: &mut mpsc::Receiver<ControlMessage>,
-    client_sender: &mpsc::Sender<ControlMessage>,
-    client_receiver: &mut mpsc::Receiver<ControlMessage>,
+    device_key: &'a SecretKey,
+    target_receiver: &'a mut mpsc::Receiver<ControlMessage>,
+    client_sender: &'a mpsc::Sender<ControlMessage>,
+    client_receiver: &'a mut mpsc::Receiver<ControlMessage>,
     session_id: Uuid,
-    client_key: &SecretKey,
+    client_key: &'a SecretKey,
+}
+
+struct BirthdayPunchCandidates {
     target_local: SocketAddrV4,
     target_observed: [SocketAddrV4; 2],
     client_local: SocketAddrV4,
     client_observed: [SocketAddrV4; 2],
+}
+
+async fn start_test_birthday_punch(
+    state: &ServerState,
+    user: super::auth::AuthenticatedUser,
+    control: BirthdayPunchControl<'_>,
+    candidates: BirthdayPunchCandidates,
 ) -> String {
+    let BirthdayPunchControl {
+        target_id,
+        connection_id,
+        device_key,
+        target_receiver,
+        client_sender,
+        client_receiver,
+        session_id,
+        client_key,
+    } = control;
+    let BirthdayPunchCandidates {
+        target_local,
+        target_observed,
+        client_local,
+        client_observed,
+    } = candidates;
     control::open_tunnel(
         state,
         user,
@@ -1620,18 +1644,22 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     start_test_birthday_punch(
         state,
         user,
-        target_id,
-        connection_id,
-        &device_key,
-        &mut target_receiver,
-        &client_sender,
-        &mut client_receiver,
-        session_id,
-        &client_key,
-        target_local,
-        target_mappings,
-        client_local,
-        client_mappings,
+        BirthdayPunchControl {
+            target_id,
+            connection_id,
+            device_key: &device_key,
+            target_receiver: &mut target_receiver,
+            client_sender: &client_sender,
+            client_receiver: &mut client_receiver,
+            session_id,
+            client_key: &client_key,
+        },
+        BirthdayPunchCandidates {
+            target_local,
+            target_observed: target_mappings,
+            client_local,
+            client_observed: client_mappings,
+        },
     )
     .await;
     control::handle_agent_message(
@@ -1676,18 +1704,22 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     start_test_birthday_punch(
         state,
         user,
-        target_id,
-        connection_id,
-        &device_key,
-        &mut target_receiver,
-        &client_sender,
-        &mut client_receiver,
-        session_id,
-        &client_key,
-        target_local,
-        target_mappings,
-        client_local,
-        client_mappings,
+        BirthdayPunchControl {
+            target_id,
+            connection_id,
+            device_key: &device_key,
+            target_receiver: &mut target_receiver,
+            client_sender: &client_sender,
+            client_receiver: &mut client_receiver,
+            session_id,
+            client_key: &client_key,
+        },
+        BirthdayPunchCandidates {
+            target_local,
+            target_observed: target_mappings,
+            client_local,
+            client_observed: client_mappings,
+        },
     )
     .await;
     control::handle_agent_message(
@@ -1719,18 +1751,22 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     start_test_birthday_punch(
         state,
         user,
-        target_id,
-        connection_id,
-        &device_key,
-        &mut target_receiver,
-        &client_sender,
-        &mut client_receiver,
-        session_id,
-        &client_key,
-        target_local,
-        target_mappings,
-        client_local,
-        client_mappings,
+        BirthdayPunchControl {
+            target_id,
+            connection_id,
+            device_key: &device_key,
+            target_receiver: &mut target_receiver,
+            client_sender: &client_sender,
+            client_receiver: &mut client_receiver,
+            session_id,
+            client_key: &client_key,
+        },
+        BirthdayPunchCandidates {
+            target_local,
+            target_observed: target_mappings,
+            client_local,
+            client_observed: client_mappings,
+        },
     )
     .await;
     control::handle_agent_message(

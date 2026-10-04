@@ -33,8 +33,8 @@ pub(super) enum PunchSide {
 enum DiscoveryAction {
     Native,
     Pair {
-        target: ControlMessage,
-        client: ControlMessage,
+        target: Box<ControlMessage>,
+        client: Box<ControlMessage>,
     },
 }
 
@@ -164,20 +164,20 @@ async fn register_discovery(
                     .clone()
                     .expect("session identity exists before QAD");
                 action = Some(DiscoveryAction::Pair {
-                    target: ControlMessage::PunchPair {
+                    target: Box::new(ControlMessage::PunchPair {
                         session_id,
                         route_mode,
                         target_endpoint_id: target_data_endpoint_id.clone(),
                         client_endpoint_id: runtime.client_endpoint_id.clone(),
                         peer_discovery: client_discovery,
-                    },
-                    client: ControlMessage::PunchPair {
+                    }),
+                    client: Box::new(ControlMessage::PunchPair {
                         session_id,
                         route_mode,
                         target_endpoint_id: target_data_endpoint_id,
                         client_endpoint_id: runtime.client_endpoint_id.clone(),
                         peer_discovery: target_discovery,
-                    },
+                    }),
                 });
             } else {
                 setup.punch_stage = PunchStage::NativePlanned;
@@ -194,8 +194,8 @@ async fn register_discovery(
             send_native_plans(state, &runtime, NativePlan::Standard, NativePlan::Standard).await
         }
         DiscoveryAction::Pair { target, client } => {
-            if runtime.target_sender.send(target).await.is_err()
-                || runtime.client_sender.send(client).await.is_err()
+            if runtime.target_sender.send(*target).await.is_err()
+                || runtime.client_sender.send(*client).await.is_err()
             {
                 close_tunnel(
                     state,

@@ -183,7 +183,7 @@ async fn target_dials_the_client_and_reports_only_after_ticket_write() {
         handle_dial_offer(
             &context,
             offer,
-            target,
+            &target,
             RelayChoice::DirectOnly,
             Instant::now() + Duration::from_secs(5),
             control_rx,
@@ -240,7 +240,7 @@ async fn close_cancels_target_dial_before_client_accepts() {
         handle_dial_offer(
             &context,
             offer,
-            target,
+            &target,
             RelayChoice::DirectOnly,
             Instant::now() + Duration::from_secs(5),
             control_rx,
@@ -271,7 +271,7 @@ async fn control_disconnect_cancels_target_dial() {
         handle_dial_offer(
             &context,
             offer,
-            target,
+            &target,
             RelayChoice::DirectOnly,
             Instant::now() + Duration::from_secs(5),
             control_rx,

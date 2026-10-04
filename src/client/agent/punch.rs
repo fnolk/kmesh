@@ -7,18 +7,22 @@ use super::control::next_session_message;
 use super::{AgentAuthenticationFailure, ensure_auth};
 use crate::client::route::DIRECT_PUNCH_TIMEOUT;
 use crate::{
-    protocol::{ControlMessage, NativePlan, RouteMode},
-    transport::{HandoffOptions, PreparedPunch, PunchError, PunchIdentity, PunchRole},
+    protocol::{ControlMessage, NativePlan, ReadyDiscovery, RouteMode},
+    transport::{
+        DiscoveredUdpSocket, HandoffOptions, PreparedPunch, PunchError, PunchIdentity, PunchRole,
+    },
 };
 
+pub(super) struct TargetPunchSetup {
+    pub(super) identity: PunchIdentity,
+    pub(super) route_mode: RouteMode,
+    pub(super) data_key: SecretKey,
+    pub(super) discovered: DiscoveredUdpSocket,
+    pub(super) peer_discovery: ReadyDiscovery,
+}
+
 pub(super) async fn run_target_punch(
-    session_id: Uuid,
-    route_mode: RouteMode,
-    target_data_id: iroh::EndpointId,
-    client_id: iroh::EndpointId,
-    data_key: SecretKey,
-    discovered: crate::transport::DiscoveredUdpSocket,
-    peer_discovery: crate::protocol::ReadyDiscovery,
+    setup: TargetPunchSetup,
     control_rx: &mut mpsc::Receiver<ControlMessage>,
     outbound: &mpsc::Sender<ControlMessage>,
     deadline: Instant,
@@ -28,14 +32,18 @@ pub(super) async fn run_target_punch(
         Option<crate::transport::PunchSelection>,
     )>,
 > {
+    let TargetPunchSetup {
+        identity,
+        route_mode,
+        data_key,
+        discovered,
+        peer_discovery,
+    } = setup;
+    let session_id = identity.session_id;
     let standard_handoff = discovered.handoff_options();
     let mut punch = match PreparedPunch::prepare(
         PunchRole::Target,
-        PunchIdentity {
-            session_id,
-            target_id: target_data_id,
-            client_id,
-        },
+        identity,
         data_key,
         discovered,
         peer_discovery.local_socket,

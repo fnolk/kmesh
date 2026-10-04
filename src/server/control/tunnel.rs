@@ -369,9 +369,9 @@ pub(super) async fn register_agent_data_endpoint(
         return Err(ApiError::unauthorized());
     }
     let online = state.inner.online_agents.read().await;
-    if !online
+    if online
         .get(&target_id)
-        .is_some_and(|agent| agent.connection_id == connection_id)
+        .is_none_or(|agent| agent.connection_id != connection_id)
     {
         return Err(ApiError::unauthorized());
     }
