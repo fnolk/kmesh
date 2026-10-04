@@ -260,34 +260,26 @@ class Verification:
             start_new_session=True,
         )
         if not select.select([cancelled.stdout], [], [], 5)[0]:
-            try:
-                os.killpg(cancelled.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if cancelled.poll() is None:
+                cancelled.kill()
             cancelled.communicate(timeout=2)
             raise VerificationError("cancel-test SSH channel never reached its active remote command")
         started_marker = cancelled.stdout.readline().strip()
         if started_marker != b"kmesh-cancel-started":
-            try:
-                os.killpg(cancelled.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if cancelled.poll() is None:
+                cancelled.kill()
             cancelled.communicate(timeout=2)
             raise VerificationError("cancel-test SSH channel did not report its active marker")
         time.sleep(1)
-        try:
-            os.killpg(cancelled.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        if cancelled.poll() is None:
+            cancelled.terminate()
         try:
             cancel_stdout, _cancel_stderr = cancelled.communicate(timeout=3)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(cancelled.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if cancelled.poll() is None:
+                cancelled.kill()
             cancel_stdout, _cancel_stderr = cancelled.communicate(timeout=2)
-            raise VerificationError("cancelled SSH command process group did not exit")
+            raise VerificationError("cancelled SSH client process did not exit")
         if cancelled.returncode == 0 and b"kmesh-cancelled-command-complete" in cancel_stdout:
             raise VerificationError("cancelled SSH command unexpectedly completed")
         after_cancel = self.run(
