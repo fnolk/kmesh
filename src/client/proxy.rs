@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
-use crate::protocol::{ControlMessage, RouteMode, TransportInfo};
+use crate::protocol::{ControlMessage, RouteMode};
 
 mod attempt;
 mod stdio;

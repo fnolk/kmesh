@@ -2,22 +2,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use iroh::{Endpoint, SecretKey};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use iroh::{Endpoint, SecretKey, Watcher as _};
+use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use crate::{
     identity::{TUNNEL_TICKET_AUDIENCE, decode_tunnel_ticket},
     protocol::{
-        ControlMessage, DiscoveryResult, NativePlan, RouteMode, SelectedPath, TransportInfo,
-        TunnelTicketClaims,
+        ControlMessage, DiscoveryResult, NativePlan, RouteMode, TransportInfo, TunnelTicketClaims,
     },
     transport::{
         DiscoveredUdpSocket, HandoffOptions, IrohByteStream, IrohEndpointOptions, MappingDiscovery,
-        PreparedPunch, PunchError, PunchIdentity, PunchRole, RelayChoice, TransportError,
-        accept_peer, create_endpoint, discover_ipv4_mappings, is_auth_failure_source,
-        wait_endpoint_ready, wait_for_selected_path,
+        PreparedPunch, PunchError, PunchIdentity, PunchRole, TransportError, accept_peer,
+        create_endpoint, discover_ipv4_mappings, is_auth_failure_source, wait_endpoint_ready,
+        wait_for_selected_path,
     },
 };
 
@@ -391,7 +390,7 @@ pub(super) async fn open_ssh_session(
             "Iroh stream ticket differs from the signed client offer",
         )?;
         if !activated {
-            tokio::time::timeout_at(deadline, wait_activated(control, session_id, route_mode))
+            tokio::time::timeout_at(deadline, wait_activated(control, session_id))
                 .await
                 .map_err(|_| {
                     private_relay_auth_failure(&endpoint, route_mode).unwrap_or_else(|| {
@@ -1082,11 +1081,7 @@ pub(in crate::client) async fn read_ticket(stream: &mut IrohByteStream) -> Resul
     })
 }
 
-async fn wait_activated(
-    control: &mut WsStream,
-    session_id: Uuid,
-    route_mode: RouteMode,
-) -> Result<()> {
+async fn wait_activated(control: &mut WsStream, session_id: Uuid) -> Result<()> {
     loop {
         let message = control
             .next()
@@ -1130,7 +1125,7 @@ mod tests {
     use super::*;
     use crate::{
         protocol::{RouteMode, TunnelTicketClaims},
-        transport::{TransportError, connect_peer},
+        transport::{RelayChoice, TransportError, connect_peer},
     };
     use iroh::{Endpoint, SecretKey, endpoint::presets};
     use std::io;
