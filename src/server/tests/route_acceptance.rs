@@ -39,9 +39,8 @@ use crate::{
         SelectedPath, TunnelTicketClaims,
     },
     transport::{
-        IrohByteStream, IrohEndpointOptions, IrohPathKind, QadReflector, RelayChoice,
-        TransportError, connect_peer, create_endpoint, observe_ipv4_mappings, wait_endpoint_ready,
-        wait_for_selected_path,
+        IrohByteStream, IrohEndpointOptions, IrohPathKind, QadReflector, RelayChoice, connect_peer,
+        create_endpoint, observe_ipv4_mappings, wait_endpoint_ready, wait_for_selected_path,
     },
 };
 
