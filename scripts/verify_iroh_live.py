@@ -384,7 +384,7 @@ WantedBy=multi-user.target
     return {
         SERVER_PRIVATE_UNIT: template.format(exec_start=base, mode="private relay"),
         SERVER_PUBLIC_UNIT: template.format(
-            exec_start=base + " --disable-private-relay", mode="public default relay"
+            exec_start=base + " --disable-private-relay", mode="public-direct"
         ),
     }
 
@@ -440,7 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--seconds", type=int, default=8)
     probe.add_argument("--ssh-config", type=Path, default=None)
     mode = subparsers.add_parser("mode", help="switch only the new deployment between relay modes")
-    mode.add_argument("value", choices=("private", "public-default"))
+    mode.add_argument("value", choices=("private", "public-direct"))
     subparsers.add_parser("rollback", help="stop new units and restore the preserved old services")
     return parser
 
@@ -708,7 +708,7 @@ def remote_binary_hash(harness: Harness, phase: str, label: str, host: str, path
 
 def stage_binary(harness: Harness) -> None:
     state = harness.load_state()
-    if state["server_mode"] not in {"private", "public-default"}:
+    if state["server_mode"] not in {"private", "public-direct"}:
         raise VerificationError("deployment has an unknown server mode")
     if not harness.args.linux_binary.is_file():
         raise VerificationError("stage-binary requires --linux-binary")
@@ -827,7 +827,7 @@ def upgrade_binary(harness: Harness) -> None:
     close_run_masters(harness)
     target_unit = f"kmesh-iroh-verification-agent@{state['target_id']}.service"
     server_unit = (
-        SERVER_PUBLIC_UNIT if state["server_mode"] == "public-default" else SERVER_PRIVATE_UNIT
+        SERVER_PUBLIC_UNIT if state["server_mode"] == "public-direct" else SERVER_PRIVATE_UNIT
     )
     harness.ssh_raw(
         "refresh-binary", "stop-new-target-agent", harness.args.target_ssh, f"systemctl stop {target_unit}"
@@ -1560,10 +1560,10 @@ def verify(harness: Harness, *, reuse_login: bool = False) -> None:
         )
     session_fingerprint = auth_session_fingerprint(harness, "ssh-password", state["username"])
     host_alias, known_host = fetch_target_host_key(harness, state)
-    mode_suffix = "private" if state["server_mode"] == "private" else "public-default"
+    mode_suffix = "private" if state["server_mode"] == "private" else "public-direct"
     known_hosts = harness.run_dir / f"known_hosts-{mode_suffix}"
     write_private_file(known_hosts, known_host.encode())
-    config_suffix = "" if mode_suffix == "private" else "-public-default"
+    config_suffix = "" if mode_suffix == "private" else "-public-direct"
     ssh_config = harness.run_dir / f"ssh-password{config_suffix}.conf"
     alias = write_ssh_config(harness, state, "ssh-password", known_hosts, ssh_config)
     env = {
@@ -1637,8 +1637,8 @@ def set_mode(harness: Harness, mode: str) -> None:
         return
     close_run_masters(harness)
     target_unit = f"kmesh-iroh-verification-agent@{state['target_id']}.service"
-    old_server_unit = SERVER_PUBLIC_UNIT if state["server_mode"] == "public-default" else SERVER_PRIVATE_UNIT
-    new_server_unit = SERVER_PUBLIC_UNIT if mode == "public-default" else SERVER_PRIVATE_UNIT
+    old_server_unit = SERVER_PUBLIC_UNIT if state["server_mode"] == "public-direct" else SERVER_PRIVATE_UNIT
+    new_server_unit = SERVER_PUBLIC_UNIT if mode == "public-direct" else SERVER_PRIVATE_UNIT
     harness.ssh_raw("mode", "stop-new-target-agent", harness.args.target_ssh, f"systemctl stop {target_unit}")
     harness.ssh_raw("mode", "stop-current-new-server", harness.args.server_ssh, f"systemctl stop {old_server_unit}")
     harness.ssh_raw("mode", "start-requested-new-server", harness.args.server_ssh, f"systemctl start {new_server_unit}")
@@ -1674,8 +1674,8 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     )
     if "deployment" in harness.report:
         harness.report["deployment"]["server_mode"] = state["server_mode"]
-    mode_suffix = "private" if state["server_mode"] == "private" else "public-default"
-    config_suffix = "" if mode_suffix == "private" else "-public-default"
+    mode_suffix = "private" if state["server_mode"] == "private" else "public-direct"
+    config_suffix = "" if mode_suffix == "private" else "-public-direct"
     ssh_config = ssh_config or harness.run_dir / f"ssh-password{config_suffix}.conf"
     if not ssh_config.is_file():
         candidates = sorted(
@@ -1988,7 +1988,7 @@ def main() -> int:
     phase_status = "prepared" if args.command == "stage" else "passed"
     if args.command == "path-probe":
         state = harness.load_state()
-        mode_suffix = "private" if state["server_mode"] == "private" else "public-default"
+        mode_suffix = "private" if state["server_mode"] == "private" else "public-direct"
         probe = harness.report[f"path_probe_{mode_suffix}"]
         harness.report["ssh_status"] = probe["ssh_status"]
         harness.report["p2p_status"] = probe["p2p_status"]

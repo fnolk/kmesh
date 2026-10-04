@@ -663,7 +663,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--role-id", required=True, type=uuid.UUID)
     parser.add_argument("--target-id", required=True, type=uuid.UUID)
     parser.add_argument("--evidence-dir", required=True, type=Path)
-    parser.add_argument("--mode", choices=("private", "public-default"), required=True)
+    parser.add_argument("--mode", choices=("private", "public-direct"), required=True)
     args = parser.parse_args()
     args.client_binary = args.client_binary.resolve()
     args.ssh_config = args.ssh_config.resolve()
