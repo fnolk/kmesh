@@ -1,4 +1,8 @@
-# Iroh live SSH verification report
+# Historical Iroh SSH verification report — earlier route implementation
+
+> **Scope:** This report preserves the 2026-10-03 evidence gathered from several earlier source and binary revisions listed below. Those revisions used the former private/public-default route model; in particular, the public-default runs could carry SSH data over an official Iroh relay. Current `PrivateDirect` and `PublicDirect` endpoints disable relay data paths, and only `PrivateRelay` carries SSH through the self-hosted relay. None of the path outcomes below verifies the current three-route design.
+
+> **Current acceptance status (2026-10-04):** The route-aware fallback run on candidate `be3ca70` exposed a control-message race when `ContinueNative(Standard)` arrives during client QAD discovery. Client-side correction `a27a1b1` is committed on its isolated branch; the target-agent correction and rerun are pending integration. Current direct SSH over `target-1`, the fallback path, and four-platform release artifacts remain unaccepted until a final candidate report records the exact source revision, hashes, and selected path for each connection.
 
 Test date: 2026-10-03. The checks used `https://192.0.2.11:9443` and the existing OpenSSH management connection to `target-1`. No long-duration test was run.
 
