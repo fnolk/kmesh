@@ -8,20 +8,26 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use iroh::SecretKey;
-use iroh_relay::server::{
-    CertConfig, QuicConfig as RelayQuicConfig, RelayConfig as RelayHttpConfig,
-    Server as RelayServer, ServerConfig as RelayServerConfig, TlsConfig as RelayTlsConfig,
+use iroh::{RelayUrl, SecretKey};
+use iroh_relay::{
+    client::ClientBuilder,
+    server::{
+        CertConfig, QuicConfig as RelayQuicConfig, RelayConfig as RelayHttpConfig,
+        Server as RelayServer, ServerConfig as RelayServerConfig, TlsConfig as RelayTlsConfig,
+    },
+    tls::CaTlsConfig,
 };
 use kmesh::config::{HttpProxyConfig, TlsConfig};
 use kmesh::transport::{
     IrohByteStream, IrohEndpointOptions, RelayChoice, TransportError, accept_peer, connect_peer,
-    connect_wss, create_endpoint, http_client, wait_endpoint_ready, wait_for_selected_path,
+    connect_wss, create_endpoint, http_client, is_auth_failure_source, is_network_failure_source,
+    wait_endpoint_ready, wait_for_selected_path,
 };
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::PrivateKeyDer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
@@ -138,17 +144,35 @@ async fn start_connect_proxy(
     origin: SocketAddr,
     acceptor: TlsAcceptor,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    start_connect_proxy_with_connections(scheme, origin, acceptor, 1).await
+}
+
+async fn start_connect_proxy_with_connections(
+    scheme: &str,
+    origin: SocketAddr,
+    acceptor: TlsAcceptor,
+    connection_count: usize,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
     let secure = scheme == "https";
     let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        if secure {
-            proxy_tunnel(acceptor.accept(stream).await.unwrap(), origin).await;
-        } else {
-            proxy_tunnel(stream, origin).await;
+        let mut tunnels = JoinSet::new();
+        for _ in 0..connection_count {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            tunnels.spawn(async move {
+                if secure {
+                    proxy_tunnel(acceptor.accept(stream).await.unwrap(), origin).await;
+                } else {
+                    proxy_tunnel(stream, origin).await;
+                }
+            });
+        }
+        while let Some(result) = tunnels.join_next().await {
+            result.unwrap();
         }
     });
     (address, task)
@@ -370,9 +394,10 @@ async fn iroh_private_relay_carries_ssh_bytes_through_http_and_https_connect() {
     for scheme in ["http", "https"] {
         let acceptor = tls_acceptor(&identity);
         let (client_proxy_addr, client_proxy_task) =
-            start_connect_proxy(scheme, relay_https_addr, acceptor.clone()).await;
+            start_connect_proxy_with_connections(scheme, relay_https_addr, acceptor.clone(), 2)
+                .await;
         let (agent_proxy_addr, agent_proxy_task) =
-            start_connect_proxy(scheme, relay_https_addr, acceptor).await;
+            start_connect_proxy_with_connections(scheme, relay_https_addr, acceptor, 2).await;
         let client_tls = tls_config(&identity, proxy_config(scheme, client_proxy_addr));
         let agent_tls = tls_config(&identity, proxy_config(scheme, agent_proxy_addr));
 
@@ -504,42 +529,34 @@ async fn iroh_private_relay_carries_ssh_bytes_through_http_and_https_connect() {
 #[tokio::test]
 async fn iroh_relay_rejects_untrusted_ca_and_proxy_407_as_authentication_failures() {
     let identity = local_certificate();
-    let (relay_server, relay_https_addr, relay_quic_port) = start_local_relay(&identity).await;
+    let (relay_server, relay_https_addr, _relay_quic_port) = start_local_relay(&identity).await;
     let relay_url: reqwest::Url = format!("https://127.0.0.1:{}", relay_https_addr.port())
         .parse()
         .unwrap();
-    let relay_choice = RelayChoice::Private {
-        url: relay_url,
-        quic_port: relay_quic_port,
-    };
-
     let (proxy_addr, proxy_task) =
         start_connect_proxy("http", relay_https_addr, tls_acceptor(&identity)).await;
-    let untrusted = create_endpoint(
-        SecretKey::generate(),
-        false,
-        IrohEndpointOptions {
-            relay_choice: relay_choice.clone(),
-            tls: TlsConfig {
-                ca_certificates: Vec::new(),
-                server_name: None,
-                proxy: Some(proxy_config("http", proxy_addr)),
-            },
-            handoff: None,
-        },
+    let mut proxy_url: reqwest::Url = format!("http://{proxy_addr}").parse().unwrap();
+    proxy_url.set_username("kmesh-test").unwrap();
+    proxy_url.set_password(Some("proxy-secret")).unwrap();
+    let untrusted_tls = CaTlsConfig::default()
+        .client_config(Arc::new(rustls::crypto::ring::default_provider()))
+        .unwrap();
+    let untrusted_error = timeout(
+        Duration::from_secs(5),
+        ClientBuilder::new(
+            RelayUrl::from(relay_url.clone()),
+            SecretKey::generate(),
+            Default::default(),
+        )
+        .tls_client_config(untrusted_tls)
+        .proxy_url(proxy_url)
+        .connect(),
     )
     .await
-    .unwrap();
-    let error = wait_endpoint_ready(
-        &untrusted,
-        &relay_choice,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
+    .expect("untrusted relay TLS fails promptly")
     .expect_err("self-signed relay certificate requires the configured CA");
-    assert!(matches!(error, TransportError::Authentication(_)));
-    assert!(!error.is_network_failure());
-    untrusted.close().await;
+    assert!(is_auth_failure_source(&untrusted_error));
+    assert!(!is_network_failure_source(&untrusted_error));
     timeout(Duration::from_secs(5), proxy_task)
         .await
         .expect("untrusted relay CONNECT tunnel closes")
@@ -547,27 +564,33 @@ async fn iroh_relay_rejects_untrusted_ca_and_proxy_407_as_authentication_failure
 
     let acceptor = tls_acceptor(&identity);
     let (proxy_addr, proxy_task) = start_rejecting_connect_proxy("https", acceptor).await;
-    let rejected = create_endpoint(
-        SecretKey::generate(),
-        false,
-        IrohEndpointOptions {
-            relay_choice: relay_choice.clone(),
-            tls: tls_config(&identity, proxy_config("https", proxy_addr)),
-            handoff: None,
-        },
+    let mut proxy_url: reqwest::Url = format!("https://{proxy_addr}").parse().unwrap();
+    proxy_url.set_username("kmesh-test").unwrap();
+    proxy_url.set_password(Some("proxy-secret")).unwrap();
+    let trusted_tls = CaTlsConfig::default()
+        .with_extra_roots(
+            rustls_pemfile::certs(&mut io::BufReader::new(identity.cert_pem.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        )
+        .client_config(Arc::new(rustls::crypto::ring::default_provider()))
+        .unwrap();
+    let proxy_error = timeout(
+        Duration::from_secs(5),
+        ClientBuilder::new(
+            RelayUrl::from(relay_url),
+            SecretKey::generate(),
+            Default::default(),
+        )
+        .tls_client_config(trusted_tls)
+        .proxy_url(proxy_url)
+        .connect(),
     )
     .await
-    .unwrap();
-    let error = wait_endpoint_ready(
-        &rejected,
-        &relay_choice,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .expect_err("proxy authentication failure is terminal");
-    assert!(matches!(error, TransportError::Authentication(_)));
-    assert!(!error.is_network_failure());
-    rejected.close().await;
+    .expect("proxy rejection is returned promptly")
+    .expect_err("HTTP 407 is a proxy authentication failure");
+    assert!(is_auth_failure_source(&proxy_error));
+    assert!(!is_network_failure_source(&proxy_error));
     timeout(Duration::from_secs(5), proxy_task)
         .await
         .expect("HTTP 407 proxy closes")

@@ -75,6 +75,7 @@ pub async fn create_endpoint(
 
     let mut net_report_config = NetReportConfig::minimal();
     if matches!(&options.relay_choice, RelayChoice::Private { .. }) {
+        // Relay-only endpoints have no IP transport for QAD, so HTTPS latency selects their home relay.
         net_report_config.https_probes = true;
     }
 
