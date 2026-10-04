@@ -9,10 +9,13 @@ import hashlib
 import json
 import os
 import re
+import select
 import secrets
+import signal
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,11 +45,13 @@ class Verification:
         self.proxy_dir = self.run_dir / "bin"
         self.proxy_dir.mkdir(mode=0o700)
         self.proxy_calls = self.run_dir / "proxy-calls.log"
+        self.proxy_pids = self.run_dir / "proxy-pids.log"
         self.path_log = self.run_dir / "path-events.log"
         self.master_log = self.run_dir / "control-master.log"
         self.socket_dir = tempfile.TemporaryDirectory(prefix="kmesh-mux-", dir="/tmp")
         self.master_socket = Path(self.socket_dir.name) / "c"
         self.proxy_calls.touch(mode=0o600)
+        self.proxy_pids.touch(mode=0o600)
         self.path_log.touch(mode=0o600)
         self.report: dict[str, Any] = {
             "run_id": run_id,
@@ -58,19 +63,31 @@ class Verification:
             "client_binary": str(args.client_binary),
             "steps": [],
         }
+        deployment_file = args.admin_config.parent / "deployment.json"
+        if deployment_file.is_file() and stat.S_IMODE(deployment_file.stat().st_mode) == 0o600:
+            deployment = json.loads(deployment_file.read_text())
+            self.report["source_revision"] = deployment.get("artifact_revision")
+            self.report["client_binary_sha256"] = hashlib.sha256(args.client_binary.read_bytes()).hexdigest()
+            self.report["server_agent_binary_sha256"] = deployment.get("server_agent_binary_sha256")
         self.env = os.environ.copy()
         self.env["PATH"] = str(self.proxy_dir) + os.pathsep + self.env.get("PATH", "")
         self.env["KMESH_REAL_BINARY"] = str(args.client_binary)
         self.env["KMESH_PROXY_COUNT_FILE"] = str(self.proxy_calls)
+        self.env["KMESH_PROXY_PID_FILE"] = str(self.proxy_pids)
         self.env["KMESH_PATH_LOG_FILE"] = str(self.path_log)
+        self.proxy_command: list[str] = []
         self.master: subprocess.Popen[bytes] | None = None
         self.master_log_handle: Any = None
         self.remote_file: str | None = None
         self.forward: str | None = None
         self.revocation_attempted = False
+        self.target_disable_attempted = False
+        self.logout_restore: tuple[str, bytes] | None = None
         self.cleanup_errors: list[str] = []
         self.host_key_alias = ""
         self.known_hosts = Path()
+        self.proxy_rss_peak_kb = 0
+        self.proxy_rss_samples = 0
 
     def write_report(self) -> None:
         self.report["updated_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -146,6 +163,146 @@ class Verification:
         if status == "failed":
             raise VerificationError(f"{label}: expected {expected} kmesh proxy starts, observed {observed}")
 
+    def sample_proxy_rss(self) -> None:
+        for raw_pid in self.proxy_pids.read_text().splitlines():
+            if not raw_pid.isdigit():
+                continue
+            sample = subprocess.run(
+                ["ps", "-o", "rss=", "-p", raw_pid],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+                text=True,
+            )
+            value = sample.stdout.strip()
+            if sample.returncode == 0 and value.isdigit():
+                self.proxy_rss_peak_kb = max(self.proxy_rss_peak_kb, int(value))
+                self.proxy_rss_samples += 1
+
+    def wait_ssh_processes(
+        self,
+        label: str,
+        processes: list[subprocess.Popen[bytes]],
+        timeout: float,
+    ) -> list[tuple[int, bytes, bytes]]:
+        deadline = time.monotonic() + timeout
+        while any(process.poll() is None for process in processes):
+            self.sample_proxy_rss()
+            if time.monotonic() >= deadline:
+                for process in processes:
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                for process in processes:
+                    process.communicate()
+                self.record(label, "timeout")
+                raise VerificationError(f"{label} exceeded {timeout:g} seconds")
+            time.sleep(0.1)
+        results = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=2)
+            results.append((process.returncode, stdout, stderr))
+        self.sample_proxy_rss()
+        return results
+
+    def verify_short_stream_interactions(self) -> None:
+        self.sample_proxy_rss()
+        idle = subprocess.Popen(
+            self.ssh_base(multiplex=True) + ["sh -c 'sleep 5; printf kmesh-idle-complete'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
+            start_new_session=True,
+        )
+        idle_result = self.wait_ssh_processes("five-second-idle-stream", [idle], 10)[0]
+        if idle_result[0] != 0 or b"kmesh-idle-complete" not in idle_result[1]:
+            raise VerificationError("five-second active SSH stream did not finish after idle")
+        self.record("five-second-idle-stream", "passed", exit_code=idle_result[0])
+
+        commands = [
+            ("left", "sh -c 'sleep 2; printf kmesh-concurrent-left'"),
+            ("right", "sh -c 'sleep 2; printf kmesh-concurrent-right'"),
+        ]
+        processes = [
+            subprocess.Popen(
+                self.ssh_base(multiplex=True) + [command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self.env,
+                start_new_session=True,
+            )
+            for _, command in commands
+        ]
+        concurrent_results = self.wait_ssh_processes("concurrent-short-ssh-channels", processes, 10)
+        for (name, _command), (returncode, stdout, _stderr) in zip(commands, concurrent_results):
+            if returncode != 0 or f"kmesh-concurrent-{name}".encode() not in stdout:
+                raise VerificationError(f"concurrent SSH channel {name} did not finish successfully")
+        self.record(
+            "concurrent-short-ssh-channels",
+            "passed",
+            details={"channels": len(commands)},
+        )
+
+        cancelled = subprocess.Popen(
+            self.ssh_base(multiplex=True)
+            + ["sh -c 'printf kmesh-cancel-started\\n; sleep 5; printf kmesh-cancelled-command-complete'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
+            start_new_session=True,
+        )
+        if not select.select([cancelled.stdout], [], [], 5)[0]:
+            try:
+                os.killpg(cancelled.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cancelled.communicate(timeout=2)
+            raise VerificationError("cancel-test SSH channel never reached its active remote command")
+        started_marker = cancelled.stdout.readline().strip()
+        if started_marker != b"kmesh-cancel-started":
+            try:
+                os.killpg(cancelled.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cancelled.communicate(timeout=2)
+            raise VerificationError("cancel-test SSH channel did not report its active marker")
+        time.sleep(1)
+        try:
+            os.killpg(cancelled.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            cancel_stdout, _cancel_stderr = cancelled.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(cancelled.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cancel_stdout, _cancel_stderr = cancelled.communicate(timeout=2)
+            raise VerificationError("cancelled SSH command process group did not exit")
+        if cancelled.returncode == 0 and b"kmesh-cancelled-command-complete" in cancel_stdout:
+            raise VerificationError("cancelled SSH command unexpectedly completed")
+        after_cancel = self.run(
+            "control-master-survives-channel-cancel",
+            self.ssh_base(multiplex=True) + ["hostname"],
+            timeout=5,
+        )
+        if not after_cancel.stdout.strip():
+            raise VerificationError("ControlMaster stopped responding after channel cancellation")
+        self.record_proxy_count(3, "short-interactions-reuse-one-control-master")
+        self.report["short_stream_interactions"] = {
+            "idle_seconds": 5,
+            "concurrent_channels": len(commands),
+            "cancelled_channel_process_exit": cancelled.returncode,
+            "control_master_alive_after_cancel": True,
+            "proxy_rss_peak_kb": self.proxy_rss_peak_kb or None,
+            "proxy_rss_samples": self.proxy_rss_samples,
+        }
+        self.write_report()
+
     def ssh_base(self, *, multiplex: bool) -> list[str]:
         args = [
             "ssh",
@@ -171,10 +328,8 @@ class Verification:
             "#!/bin/sh\n"
             "printf 'start\\n' >> \"$KMESH_PROXY_COUNT_FILE\"\n"
             "printf '[proxy-start]\\n' >> \"$KMESH_PATH_LOG_FILE\"\n"
-            "\"$KMESH_REAL_BINARY\" \"$@\" 2>>\"$KMESH_PATH_LOG_FILE\"\n"
-            "status=$?\n"
-            "printf '[proxy-end:%s]\\n' \"$status\" >> \"$KMESH_PATH_LOG_FILE\"\n"
-            "exit \"$status\"\n"
+            "printf '%s\\n' \"$$\" >> \"$KMESH_PROXY_PID_FILE\"\n"
+            "exec \"$KMESH_REAL_BINARY\" \"$@\" 2>>\"$KMESH_PATH_LOG_FILE\"\n"
         )
         os.chmod(shim, 0o700)
         config = self.run(
@@ -186,6 +341,7 @@ class Verification:
         proxy = shlex.split(fields.get("proxycommand", ""))
         if not proxy or proxy[0] != "kmesh":
             raise VerificationError("SSH config ProxyCommand must resolve through the kmesh CLI name")
+        self.proxy_command = proxy
         self.host_key_alias = fields.get("hostkeyalias", "")
         expected_alias = f"kmesh/{self.args.target_id}"
         if self.host_key_alias != expected_alias:
@@ -625,7 +781,177 @@ class Verification:
             raise VerificationError("could not restore the original ssh_connect grant")
         self.record("restore-original-target-grant", "passed")
 
+    def target_enabled(self) -> bool:
+        response = self.admin("list-verification-targets", "targets", "list")
+        if response.get("result") != "targets" or not isinstance(response.get("data"), list):
+            raise VerificationError("admin targets list returned an unexpected response")
+        target = next(
+            (item for item in response["data"] if item.get("target_id") == str(self.args.target_id)),
+            None,
+        )
+        if target is None or not isinstance(target.get("enabled"), bool):
+            raise VerificationError("verification target state is missing from targets list")
+        return target["enabled"]
+
+    def restore_target(self) -> None:
+        if not self.target_disable_attempted:
+            return
+        if not self.target_enabled():
+            self.admin(
+                "restore-verification-target",
+                "targets",
+                "enable",
+                str(self.args.target_id),
+            )
+        if not self.target_enabled():
+            raise VerificationError("could not restore the target's enabled state")
+        self.target_disable_attempted = False
+        self.record("restore-verification-target", "passed")
+
+    def verify_target_disable_boundary(self) -> None:
+        if not self.grant_exists() or not self.target_enabled():
+            raise VerificationError("target disable check requires its original enabled ssh_connect grant")
+        self.target_disable_attempted = True
+        try:
+            self.admin(
+                "disable-verification-target",
+                "targets",
+                "disable",
+                str(self.args.target_id),
+            )
+            if self.target_enabled():
+                raise VerificationError("admin disable command left the target enabled")
+            active = self.run(
+                "active-control-master-survives-target-disable",
+                self.ssh_base(multiplex=True) + ["hostname"],
+                timeout=5,
+            )
+            if not active.stdout.strip():
+                raise VerificationError("active ControlMaster stopped responding after target disable")
+            denied = self.run(
+                "new-transport-after-target-disable",
+                self.ssh_base(multiplex=False) + ["true"],
+                accepted=None,
+            )
+            denial = (denied.stderr + denied.stdout).decode("utf-8", "replace").lower()
+            attempt_log = self.path_log.read_text(errors="replace").rsplit("[proxy-start]", 1)[-1].lower()
+            if denied.returncode == 0 or not any(
+                phrase in denial + attempt_log
+                for phrase in ("not enrolled", "target is offline", "not found", "disabled")
+            ):
+                raise VerificationError("new transport did not report the disabled target")
+            self.report["target_disable_boundary"] = {
+                "active_control_master_continued": True,
+                "new_transport_denied": True,
+                "reason": "target disabled",
+            }
+            self.write_report()
+            self.record("assert-target-disable-boundary", "passed")
+        finally:
+            self.restore_target()
+
+    def verification_user_password(self) -> tuple[str, bytes]:
+        deployment_file = self.args.admin_config.parent / "deployment.json"
+        if not deployment_file.is_file() or stat.S_IMODE(deployment_file.stat().st_mode) != 0o600:
+            raise VerificationError("protected verification deployment state is missing")
+        deployment = json.loads(deployment_file.read_text())
+        username = deployment.get("username")
+        password_file = deployment.get("user_password_file")
+        if not isinstance(username, str) or not username or not isinstance(password_file, str) or not password_file:
+            raise VerificationError("verification user credentials are unavailable")
+        password_path = Path(password_file)
+        if not password_path.is_file():
+            raise VerificationError("verification user password file is missing")
+        if stat.S_IMODE(password_path.stat().st_mode) != 0o600:
+            raise VerificationError("verification password file is not owner-only")
+        return username, password_path.read_bytes()
+
+    def verification_user_cli(self, *command: str) -> list[str]:
+        if (
+            len(self.proxy_command) < 3
+            or self.proxy_command[-2] != "proxy"
+            or self.proxy_command[-1] != str(self.args.target_id)
+        ):
+            raise VerificationError("ProxyCommand does not match the verification target")
+        return [
+            str(self.args.client_binary),
+            *self.proxy_command[1:-2],
+            *command,
+        ]
+
+    def restore_verification_login(self) -> None:
+        if self.logout_restore is None:
+            return
+        username, password = self.logout_restore
+        self.run(
+            "restore-verification-user-login",
+            self.verification_user_cli(
+                "login",
+                "--method",
+                "password",
+                "--username",
+                username,
+                "--password-stdin",
+            ),
+            input_data=password,
+            timeout=30,
+        )
+        self.logout_restore = None
+
+    def verify_logout_boundary(self) -> None:
+        username, password = self.verification_user_password()
+        self.logout_restore = (username, password)
+        self.run(
+            "verification-user-logout",
+            self.verification_user_cli("logout"),
+            timeout=30,
+        )
+        try:
+            active = self.run(
+                "active-control-master-survives-login-logout",
+                self.ssh_base(multiplex=True) + ["hostname"],
+                timeout=5,
+            )
+            if not active.stdout.strip():
+                raise VerificationError("active ControlMaster stopped responding after user logout")
+            denied = self.run(
+                "new-transport-after-login-logout",
+                self.ssh_base(multiplex=False) + ["true"],
+                accepted=None,
+            )
+            denial = (denied.stderr + denied.stdout).decode("utf-8", "replace").lower()
+            if denied.returncode == 0 or not any(
+                phrase in denial for phrase in ("read active kmesh login", "please run kmesh login")
+            ):
+                raise VerificationError("new transport did not require login after logout")
+            self.report["logout_boundary"] = {
+                "active_control_master_continued": True,
+                "new_transport_denied": True,
+                "reason": "local login removed after server logout",
+            }
+            self.write_report()
+            self.record("assert-logout-boundary", "passed")
+        finally:
+            self.restore_verification_login()
+        restored = self.run(
+            "verify-login-restored-after-logout-test",
+            self.ssh_base(multiplex=False) + ["hostname"],
+            timeout=10,
+        )
+        if not restored.stdout.strip():
+            raise VerificationError("verification user login was not restored after logout test")
+        self.record("verify-login-restored-after-logout-test", "passed")
+
     def cleanup(self) -> None:
+        try:
+            self.restore_verification_login()
+        except Exception as error:
+            self.cleanup_errors.append(f"verification login restoration failed: {error}")
+        try:
+            self.restore_target()
+        except Exception as error:
+            self.cleanup_errors.append(f"target enablement restoration failed: {error}")
+            self.record("restore-verification-target", "failed")
         try:
             self.restore_grant()
         except Exception as error:
@@ -680,6 +1006,15 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"{label} does not exist")
     if not os.access(args.client_binary, os.X_OK):
         parser.error("client binary is not executable")
+    deployment_file = args.admin_config.parent / "deployment.json"
+    if not deployment_file.is_file() or stat.S_IMODE(deployment_file.stat().st_mode) != 0o600:
+        parser.error("verification deployment state must exist with mode 0600 beside --admin-config")
+    try:
+        deployment = json.loads(deployment_file.read_text())
+    except json.JSONDecodeError:
+        parser.error("verification deployment state is invalid")
+    if not deployment.get("artifact_revision") or not deployment.get("server_agent_binary_sha256"):
+        parser.error("deployment state must identify the active source and server/agent artifact SHA-256")
     if shutil.which("ssh") is None or shutil.which("ssh-keygen") is None:
         parser.error("OpenSSH ssh and ssh-keygen are required")
     return args
@@ -695,10 +1030,13 @@ def main() -> int:
         verifier.verify_basic_ssh()
         verifier.verify_path_probe()
         verifier.verify_control_master()
+        verifier.verify_short_stream_interactions()
         verifier.verify_file_transfer()
         verifier.verify_forward()
         verifier.verify_host_key_rejection()
         verifier.verify_revoke_boundary()
+        verifier.verify_target_disable_boundary()
+        verifier.verify_logout_boundary()
     except (OSError, subprocess.SubprocessError, VerificationError, json.JSONDecodeError) as error:
         failure = str(error)
         verifier.report["failure"] = failure

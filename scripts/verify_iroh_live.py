@@ -436,9 +436,15 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser = subparsers.add_parser("verify", help="run password login or reuse its saved session, then test SSH")
     verify_parser.add_argument("--reuse-login", action="store_true")
     subparsers.add_parser("key-login", help="verify SSHSIG login with an isolated temporary ssh-agent")
-    probe = subparsers.add_parser("path-probe", help="keep one SSH command active briefly and record Iroh path changes")
+    probe = subparsers.add_parser("path-probe", help="run fresh direct-gated SSH path samples")
     probe.add_argument("--seconds", type=int, default=8)
+    probe.add_argument("--repetitions", type=int, default=3)
     probe.add_argument("--ssh-config", type=Path, default=None)
+    probe.add_argument(
+        "--restart-server-after-direct",
+        action="store_true",
+        help="restart only the new private server after this SSH stream selects Direct",
+    )
     mode = subparsers.add_parser("mode", help="switch only the new deployment between relay modes")
     mode.add_argument("value", choices=("private", "public-direct"))
     subparsers.add_parser("rollback", help="stop new units and restore the preserved old services")
@@ -866,6 +872,9 @@ def upgrade_binary(harness: Harness) -> None:
         "preserved_current_binaries": backups,
         "legacy_deployment_touched": False,
     }
+    state["artifact_revision"] = harness.args.artifact_revision
+    state["server_agent_binary_sha256"] = expected
+    harness.save_state(state)
     harness.write_report()
 
 
@@ -1199,6 +1208,8 @@ def deploy(harness: Harness) -> None:
         "role_id": role_id,
         "role_name": role_name,
         "server_mode": "private",
+        "artifact_revision": args.artifact_revision,
+        "server_agent_binary_sha256": hashlib.sha256(args.linux_binary.read_bytes()).hexdigest(),
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     harness.save_state(state)
@@ -1597,6 +1608,9 @@ def verify(harness: Harness, *, reuse_login: bool = False) -> None:
         harness.report["deployment"]["server_mode"] = state["server_mode"]
     harness.report["ssh_basic"] = {
         "mode": state["server_mode"],
+        "source_revision": harness.args.artifact_revision,
+        "client_binary_sha256": harness.report.get("client_artifact", {}).get("sha256"),
+        "server_agent_binary_sha256": state.get("server_agent_binary_sha256"),
         "login_profile": "ssh-password",
         "reused_login_session": reuse_login,
         "auth_session_sha256": session_fingerprint,
@@ -1660,7 +1674,13 @@ def set_mode(harness: Harness, mode: str) -> None:
         raise VerificationError(f"target did not reconnect after switching to {mode}")
 
 
-def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
+def _path_probe_sample(
+    harness: Harness,
+    seconds: int,
+    ssh_config: Path | None,
+    sample_index: int,
+    restart_server_after_direct: bool,
+) -> dict[str, Any]:
     if not 1 <= seconds <= 30:
         raise VerificationError("path probe duration must be between 1 and 30 seconds")
     state = harness.load_state()
@@ -1674,6 +1694,8 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     )
     if "deployment" in harness.report:
         harness.report["deployment"]["server_mode"] = state["server_mode"]
+    if restart_server_after_direct and state["server_mode"] != "private":
+        raise VerificationError("control-disconnect probe requires the new private server mode")
     mode_suffix = "private" if state["server_mode"] == "private" else "public-direct"
     config_suffix = "" if mode_suffix == "private" else "-public-direct"
     ssh_config = ssh_config or harness.run_dir / f"ssh-password{config_suffix}.conf"
@@ -1728,8 +1750,15 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     direct_gate_remote_address = None
     process_deadline = None
     process_timed_out = False
+    control_disconnect = None
     open_streams = {process.stdout, process.stderr}
-    script = b"hostname\nprintf '%s\\n' kmesh-path-probe-complete\nsleep 1\nexit 23\n"
+    script = (
+        b"hostname\nprintf '%s\\n' kmesh-path-probe-started\nsleep 8\nprintf '%s\\n' "
+        b"kmesh-path-probe-complete\nexit 23\n"
+        if restart_server_after_direct
+        else b"hostname\nprintf '%s\\n' kmesh-path-probe-started\nsleep 1\nprintf '%s\\n' "
+        b"kmesh-path-probe-complete\nexit 23\n"
+    )
     while open_streams or process.poll() is None:
         now = time.monotonic()
         if command_sent_at is None and process.poll() is None and (
@@ -1796,6 +1825,71 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
                     selected_path_state = update_selected_path_state(
                         selected_path_state, event
                     )
+        if (
+            restart_server_after_direct
+            and script_sent_after_direct
+            and control_disconnect is None
+            and b"kmesh-path-probe-started" in b"".join(stdout_chunks)
+        ):
+            try:
+                harness.ssh_raw(
+                    "path-probe",
+                    f"restart-private-control-server-during-direct-session-{sample_index}",
+                    harness.args.server_ssh,
+                    f"systemctl restart {SERVER_PRIVATE_UNIT}",
+                    timeout=20,
+                )
+                wait_health(harness, "path-probe")
+                target_id = state["target_id"]
+                target_online_deadline = time.monotonic() + 20
+                target_online = False
+                while time.monotonic() < target_online_deadline:
+                    try:
+                        response = kmesh_admin_json(
+                            harness,
+                            "admin",
+                            "targets",
+                            "list",
+                            label=f"wait-agent-online-after-control-restart-{sample_index}",
+                            phase="path-probe",
+                        )
+                        targets = expect_data(
+                            response,
+                            "targets",
+                            f"wait-agent-online-after-control-restart-{sample_index}",
+                        )
+                        if any(item["target_id"] == target_id and item["online"] for item in targets):
+                            target_online = True
+                            break
+                    except (OSError, subprocess.SubprocessError, VerificationError, json.JSONDecodeError):
+                        pass
+                    time.sleep(0.5)
+                control_disconnect = {
+                    "performed": True,
+                    "server_unit": SERVER_PRIVATE_UNIT,
+                    "target_online_after_restart": target_online,
+                    "active_direct_ssh_command_was_in_flight": True,
+                }
+            except (OSError, subprocess.SubprocessError, VerificationError, json.JSONDecodeError) as error:
+                recovery_error = None
+                try:
+                    harness.ssh_raw(
+                        "path-probe",
+                        f"ensure-private-control-server-active-{sample_index}",
+                        harness.args.server_ssh,
+                        f"systemctl start {SERVER_PRIVATE_UNIT}",
+                        timeout=20,
+                    )
+                    wait_health(harness, "path-probe")
+                except (OSError, subprocess.SubprocessError, VerificationError, json.JSONDecodeError) as recovery:
+                    recovery_error = harness.redact(str(recovery))
+                control_disconnect = {
+                    "performed": False,
+                    "server_unit": SERVER_PRIVATE_UNIT,
+                    "target_online_after_restart": False,
+                    "error": harness.redact(str(error)),
+                    "server_recovery_error": recovery_error,
+                }
     if process.stdin and not process.stdin.closed:
         try:
             process.stdin.close()
@@ -1806,11 +1900,18 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
     stderr = b"".join(stderr_chunks)
     stdout_lines = stdout.decode("utf-8", "replace").splitlines()
     marker_observed = "kmesh-path-probe-complete" in stdout_lines
-    hostname = next((line for line in stdout_lines if line and line != "kmesh-path-probe-complete"), "")
+    hostname = next(
+        (
+            line
+            for line in stdout_lines
+            if line and line not in {"kmesh-path-probe-started", "kmesh-path-probe-complete"}
+        ),
+        "",
+    )
     ssh_status = "passed" if returncode == 23 and hostname and marker_observed else "failed"
     harness.record(
         "path-probe",
-        f"ssh-path-probe-{mode_suffix}",
+        f"ssh-path-probe-{mode_suffix}-{sample_index}",
         status=ssh_status,
         exit_code=returncode,
         stdout_bytes=len(stdout),
@@ -1824,7 +1925,7 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
             "process_timed_out": process_timed_out,
         },
     )
-    stderr_path = harness.run_dir / f"path-probe-{mode_suffix}.stderr"
+    stderr_path = harness.run_dir / f"path-probe-{mode_suffix}-{sample_index}.stderr"
     stderr_path.write_bytes(stderr)
     os.chmod(stderr_path, 0o600)
     path_events = selected_paths(stderr)
@@ -1877,10 +1978,13 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
         )
         else "failed"
     )
-    harness.report[f"path_probe_{mode_suffix}"] = {
+    sample = {
         "status": p2p_status,
         "ssh_status": ssh_status,
         "p2p_status": p2p_status,
+        "source_revision": harness.args.artifact_revision,
+        "client_binary_sha256": harness.report.get("client_artifact", {}).get("sha256"),
+        "server_agent_binary_sha256": state.get("server_agent_binary_sha256"),
         "duration_seconds": round(time.monotonic() - process_started_at, 3),
         "direct_wait_timeout_seconds": seconds,
         "direct_wait_elapsed_seconds": round(
@@ -1896,6 +2000,13 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
             path_state_at_command.get("source") if path_state_at_command else None
         ),
         "process_timed_out": process_timed_out,
+        "control_disconnect": control_disconnect
+        if control_disconnect is not None
+        else (
+            {"performed": False, "reason": "direct path was not selected before SSH command"}
+            if restart_server_after_direct
+            else None
+        ),
         "ssh_transfer_bytes": ssh_transfer_bytes,
         "ssh_transfer_summary_observed": ssh_transfer_bytes is not None,
         "direct_path_delta_source": path_delta_source if direct_selected_path_deltas else None,
@@ -1914,6 +2025,55 @@ def path_probe(harness: Harness, seconds: int, ssh_config: Path | None) -> None:
         "ssh_config": str(ssh_config),
         "debug_filter": env["RUST_LOG"],
         **diagnostics,
+    }
+    harness.report.setdefault(f"path_probe_{mode_suffix}_samples", []).append(sample)
+    harness.write_report()
+    return sample
+
+
+def path_probe(
+    harness: Harness,
+    seconds: int,
+    ssh_config: Path | None,
+    repetitions: int,
+    restart_server_after_direct: bool,
+) -> None:
+    if not 1 <= repetitions <= 3:
+        raise VerificationError("path probe repetitions must be between one and three")
+    if restart_server_after_direct and repetitions != 1:
+        raise VerificationError("control-disconnect probe requires exactly one path sample")
+    samples = [
+        _path_probe_sample(
+            harness,
+            seconds,
+            ssh_config,
+            sample_index,
+            restart_server_after_direct,
+        )
+        for sample_index in range(1, repetitions + 1)
+    ]
+    mode_suffix = "private" if harness.load_state()["server_mode"] == "private" else "public-direct"
+    ssh_status = "passed" if all(sample["ssh_status"] == "passed" for sample in samples) else "failed"
+    p2p_status = "passed" if all(sample["p2p_status"] == "passed" for sample in samples) else "failed"
+    control_disconnect_status = None
+    if restart_server_after_direct:
+        control_disconnect_status = (
+            "passed"
+            if ssh_status == "passed"
+            and samples[0]["p2p_status"] == "passed"
+            and samples[0]["control_disconnect"]
+            and samples[0]["control_disconnect"].get("performed")
+            and samples[0]["control_disconnect"].get("target_online_after_restart")
+            and samples[0]["control_disconnect"].get("active_direct_ssh_command_was_in_flight")
+            else "failed"
+        )
+    harness.report[f"path_probe_{mode_suffix}"] = {
+        "status": p2p_status,
+        "ssh_status": ssh_status,
+        "p2p_status": p2p_status,
+        "control_disconnect_status": control_disconnect_status,
+        "repetitions": len(samples),
+        "samples": samples,
     }
     harness.write_report()
 
@@ -1945,6 +2105,16 @@ def main() -> int:
     if args.command == "plan":
         print_plan(args)
         return 0
+    if args.command in {
+        "stage",
+        "stage-binary",
+        "refresh-binary",
+        "deploy",
+        "verify",
+        "key-login",
+        "path-probe",
+    } and not args.artifact_revision:
+        parser.error("--artifact-revision is required for artifact staging and SSH evidence")
     harness = Harness(args)
     try:
         if args.command == "preflight":
@@ -1962,7 +2132,13 @@ def main() -> int:
         elif args.command == "key-login":
             verify_public_key_login(harness)
         elif args.command == "path-probe":
-            path_probe(harness, args.seconds, args.ssh_config)
+            path_probe(
+                harness,
+                args.seconds,
+                args.ssh_config,
+                args.repetitions,
+                args.restart_server_after_direct,
+            )
         elif args.command == "mode":
             set_mode(harness, args.value)
         elif args.command == "rollback":
@@ -1993,13 +2169,20 @@ def main() -> int:
         harness.report["ssh_status"] = probe["ssh_status"]
         harness.report["p2p_status"] = probe["p2p_status"]
         phase_status = probe["p2p_status"]
+        if probe.get("control_disconnect_status") == "failed":
+            phase_status = "failed"
     harness.report["last_phase_status"] = phase_status
-    harness.report["status"] = harness.report.get("p2p_status", phase_status)
+    harness.report["status"] = phase_status
     harness.write_report()
     result_fields = {"status": phase_status, "report_status": harness.report["status"]}
     if harness.report.get("p2p_status"):
         result_fields["ssh_status"] = harness.report["ssh_status"]
         result_fields["p2p_status"] = harness.report["p2p_status"]
+        state = harness.load_state()
+        mode_suffix = "private" if state["server_mode"] == "private" else "public-direct"
+        probe = harness.report.get(f"path_probe_{mode_suffix}", {})
+        if probe.get("control_disconnect_status"):
+            result_fields["control_disconnect_status"] = probe["control_disconnect_status"]
     result_fields.update(
         {"phase": args.command, "report": str(harness.report_path), "events": len(harness.events)}
     )
