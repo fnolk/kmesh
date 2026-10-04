@@ -22,7 +22,7 @@ use crate::{
     identity,
     protocol::{
         AdminOperation, AdminRequest, AdminResponse, AgentEnrollmentRequest, LoginTokens,
-        PasswordLoginRequest, PublicKeyChallengeRequest, PublicKeyLoginRequest, RelayMode,
+        PasswordLoginRequest, PublicKeyChallengeRequest, PublicKeyLoginRequest, RouteMode,
         TargetPermission,
     },
 };
@@ -631,7 +631,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
             Uuid::new_v4(),
             target.target_id,
             iroh::SecretKey::generate().public().to_string(),
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
         )
         .await
         .unwrap_err()
@@ -676,7 +676,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         connected_session,
         target.target_id,
         iroh::SecretKey::generate().public().to_string(),
-        RelayMode::Private,
+        RouteMode::PrivateRelay,
     )
     .await
     .expect("ssh_connect grant permits a connection");
@@ -723,7 +723,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
             Uuid::new_v4(),
             target.target_id,
             iroh::SecretKey::generate().public().to_string(),
-            RelayMode::Private,
+            RouteMode::PrivateRelay,
         )
         .await
         .unwrap_err()
