@@ -100,7 +100,6 @@ pub(super) fn agent_session_error_code(error: &anyhow::Error) -> &'static str {
 
 pub(super) async fn control_session(
     context: &ClientContext,
-    target_id: Uuid,
     credentials: &AgentCredentials,
     runtime: &mut AgentRuntime,
 ) -> Result<()> {

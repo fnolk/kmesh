@@ -118,7 +118,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     };
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        match control::control_session(context, target_id, &credentials, &mut runtime).await {
+        match control::control_session(context, &credentials, &mut runtime).await {
             Ok(()) => bail!("agent control connection closed"),
             Err(error) if is_authentication_error(&error) => {
                 tracing::error!(target = %target_id, error = %error, "agent credential was rejected; active SSH sessions will finish");
