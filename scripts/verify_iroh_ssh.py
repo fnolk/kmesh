@@ -747,31 +747,34 @@ class Verification:
         if not self.grant_exists():
             raise VerificationError("the supplied role has no ssh_connect grant for the target")
         self.revocation_attempted = True
-        self.admin("revoke-target-grant", "grants", "remove", str(self.args.role_id), str(self.args.target_id))
-        if self.grant_exists():
-            raise VerificationError("admin revoke command returned but the target grant remains")
-        existing = self.run("active-control-master-survives-revoke", self.ssh_base(multiplex=True) + ["hostname"])
-        active_hostname = existing.stdout.decode("utf-8", "replace").strip()
-        if not active_hostname:
-            raise VerificationError("active ControlMaster returned no hostname after revoke")
-        self.report["active_after_revoke_hostname"] = active_hostname
-        self.write_report()
-        denied_command = self.ssh_base(multiplex=False) + ["true"]
-        denied = self.run("new-connection-after-revoke", denied_command, accepted=None)
-        path_text = self.path_log.read_text(errors="replace")
-        latest_attempt = path_text.rsplit("[proxy-start]", 1)[-1].lower()
-        denied_text = (denied.stderr + denied.stdout).decode("utf-8", "replace").lower() + latest_attempt
-        if denied.returncode == 0 or not any(
-            phrase in denied_text for phrase in ("forbidden", "operation is not permitted", "authorization")
-        ):
-            raise VerificationError("a new SSH connection did not show the expected authorization denial")
-        self.report["new_connection_after_revoke"] = {
-            "denied": True,
-            "reason": "kmesh authorization",
-        }
-        self.write_report()
-        self.record("assert-new-connection-authorization-denied", "passed", details={"denied": True})
-        self.record_proxy_count(5, "revoked-new-connection-used-fresh-proxy")
+        try:
+            self.admin("revoke-target-grant", "grants", "remove", str(self.args.role_id), str(self.args.target_id))
+            if self.grant_exists():
+                raise VerificationError("admin revoke command returned but the target grant remains")
+            existing = self.run("active-control-master-survives-revoke", self.ssh_base(multiplex=True) + ["hostname"])
+            active_hostname = existing.stdout.decode("utf-8", "replace").strip()
+            if not active_hostname:
+                raise VerificationError("active ControlMaster returned no hostname after revoke")
+            self.report["active_after_revoke_hostname"] = active_hostname
+            self.write_report()
+            denied_command = self.ssh_base(multiplex=False) + ["true"]
+            denied = self.run("new-connection-after-revoke", denied_command, accepted=None)
+            path_text = self.path_log.read_text(errors="replace")
+            latest_attempt = path_text.rsplit("[proxy-start]", 1)[-1].lower()
+            denied_text = (denied.stderr + denied.stdout).decode("utf-8", "replace").lower() + latest_attempt
+            if denied.returncode == 0 or not any(
+                phrase in denied_text for phrase in ("forbidden", "operation is not permitted", "authorization")
+            ):
+                raise VerificationError("a new SSH connection did not show the expected authorization denial")
+            self.report["new_connection_after_revoke"] = {
+                "denied": True,
+                "reason": "kmesh authorization",
+            }
+            self.write_report()
+            self.record("assert-new-connection-authorization-denied", "passed", details={"denied": True})
+            self.record_proxy_count(5, "revoked-new-connection-used-fresh-proxy")
+        finally:
+            self.restore_grant()
 
     def restore_grant(self) -> None:
         if not self.revocation_attempted:
@@ -780,6 +783,7 @@ class Verification:
             self.admin("restore-target-grant", "grants", "add", str(self.args.role_id), str(self.args.target_id))
         if not self.grant_exists():
             raise VerificationError("could not restore the original ssh_connect grant")
+        self.revocation_attempted = False
         self.record("restore-original-target-grant", "passed")
 
     def target_enabled(self) -> bool:
