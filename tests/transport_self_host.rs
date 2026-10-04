@@ -26,12 +26,12 @@ impl Drop for TestCertificate {
 }
 
 #[test]
-fn relay_address_allowlist_is_scoped_to_the_selected_mode() {
+fn relay_address_allowlist_is_scoped_to_direct_and_private_modes() {
     let private_url: reqwest::Url = "https://private.kmesh.invalid".parse().unwrap();
     let private_relay = RelayUrl::from(private_url.clone());
     let private_choice = RelayChoice::Private {
         url: private_url,
-        qad_port: 3478,
+        quic_port: 3478,
     };
     let endpoint_addr =
         EndpointAddr::new(SecretKey::generate().public()).with_relay_url(private_relay.clone());
@@ -41,10 +41,9 @@ fn relay_address_allowlist_is_scoped_to_the_selected_mode() {
     assert!(private_relays.contains(&private_relay));
     assert!(validate_endpoint_addr(&endpoint_addr, &private_choice).is_ok());
 
-    let official_relays = allowed_relay_urls(&RelayChoice::PublicDefault).unwrap();
-    assert!(!official_relays.is_empty());
-    assert!(!official_relays.contains(&private_relay));
-    assert!(validate_endpoint_addr(&endpoint_addr, &RelayChoice::PublicDefault).is_err());
+    let direct_relays = allowed_relay_urls(&RelayChoice::DirectOnly).unwrap();
+    assert!(direct_relays.is_empty());
+    assert!(validate_endpoint_addr(&endpoint_addr, &RelayChoice::DirectOnly).is_err());
 }
 
 #[tokio::test]
@@ -100,7 +99,7 @@ async fn self_hosted_https_and_qad_report_the_observed_ipv4_address() {
         IrohEndpointOptions {
             relay_choice: RelayChoice::Private {
                 url: relay_url,
-                qad_port: qad_addr.port(),
+                quic_port: qad_addr.port(),
             },
             tls: TlsConfig {
                 ca_certificates: vec![certificate_file.0.clone()],
