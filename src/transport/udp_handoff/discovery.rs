@@ -33,7 +33,8 @@ pub async fn discover_ipv4_mappings(
     deadline: Instant,
 ) -> Result<MappingDiscovery, TransportError> {
     crate::transport::ensure_rustls_provider();
-    let deadline = std::cmp::min(deadline, Instant::now() + MAPPING_DISCOVERY_BUDGET);
+    let cleanup_deadline = deadline;
+    let probe_deadline = std::cmp::min(cleanup_deadline, Instant::now() + MAPPING_DISCOVERY_BUDGET);
     let socket = StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
         .map_err(TransportError::Network)?;
     socket
@@ -48,7 +49,7 @@ pub async fn discover_ipv4_mappings(
         }
     };
 
-    let reflectors = match qad_reflectors(qad_plan, deadline).await {
+    let reflectors = match qad_reflectors(qad_plan, probe_deadline).await {
         Ok(reflectors) => reflectors,
         Err(error) if error.is_network_failure() => {
             return Ok(MappingDiscovery::Unavailable {
@@ -65,22 +66,20 @@ pub async fn discover_ipv4_mappings(
         .client_config(crypto_provider)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
     let probe_socket = socket.try_clone().map_err(TransportError::Network)?;
-    let observed = timeout_at(
-        deadline,
-        observe_ipv4_mappings(probe_socket, tls, &reflectors, deadline),
+    let observations = match observe_ipv4_mappings(
+        probe_socket,
+        tls,
+        &reflectors,
+        probe_deadline,
+        cleanup_deadline,
     )
-    .await;
-    let observations = match observed {
-        Err(_) => {
-            return Ok(MappingDiscovery::Unavailable {
-                reason: "QAD mapping discovery deadline elapsed".to_owned(),
-            });
-        }
-        Ok(Ok((probe_socket, observations))) => {
+    .await
+    {
+        Ok((probe_socket, observations)) => {
             drop(probe_socket);
             observations
         }
-        Ok(Err(error)) => return classify_qad_error(error),
+        Err(error) => return classify_qad_error(error),
     };
     if observations.len() != reflectors.len()
         || observations.iter().any(|observation| {

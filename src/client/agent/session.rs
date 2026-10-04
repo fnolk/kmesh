@@ -14,7 +14,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    client::route::{DIRECT_PUNCH_TIMEOUT, SSH_SETUP_TIMEOUT, attempt_timeout},
+    client::route::{SSH_SETUP_TIMEOUT, attempt_timeout},
     identity::{TUNNEL_TICKET_AUDIENCE, decode_tunnel_ticket},
     protocol::{
         AgentCredentials, ControlMessage, DiscoveryResult, NativePlan, RouteMode, TransportInfo,
@@ -160,9 +160,8 @@ pub(super) async fn run_agent_session(
     let mut discovered = None;
     let mut native_plan_received = false;
     if let Some(qad_plan) = route_plan.qad_plan {
-        let discovery_deadline = std::cmp::min(deadline, Instant::now() + DIRECT_PUNCH_TIMEOUT);
         let Some((discovery, native_plan_already_selected)) = wait_for_target_qad_discovery(
-            discover_ipv4_mappings(&qad_plan, &context.config.tls, discovery_deadline),
+            discover_ipv4_mappings(&qad_plan, &context.config.tls, deadline),
             &mut control_rx,
             session_id,
             route_mode,

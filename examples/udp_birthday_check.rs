@@ -335,7 +335,7 @@ async fn run() -> Result<()> {
         .context("bind the single IPv4 UDP socket for both QAD reflectors")?;
     let (std_socket, observations) = timeout_at(
         deadline,
-        observe_ipv4_mappings(std_socket, qad_tls, &reflectors, deadline),
+        observe_ipv4_mappings(std_socket, qad_tls, &reflectors, deadline, deadline),
     )
     .await
     .context("QAD mapping observation exceeded the 60-second deadline")?

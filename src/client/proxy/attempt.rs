@@ -120,17 +120,12 @@ pub(super) async fn open_ssh_session(
             ))
         })?;
     let (handoff, punch_selection) = if let Some(qad_plan) = route_transport.qad_plan.as_ref() {
-        let discovery_deadline = std::cmp::min(
-            deadline,
-            tokio::time::Instant::now() + Duration::from_secs(2),
-        );
         let (discovery, early_native_plan) = wait_for_discovery_or_native_plan(
             control,
             session_id,
             route_mode,
             deadline,
-            discovery_deadline,
-            discover_ipv4_mappings(qad_plan, &context.config.tls, discovery_deadline),
+            discover_ipv4_mappings(qad_plan, &context.config.tls, deadline),
         )
         .await?;
         let (discovery_message, mut discovered) = match discovery {
@@ -409,14 +404,13 @@ async fn wait_for_discovery_or_native_plan(
     session_id: Uuid,
     route_mode: RouteMode,
     setup_deadline: tokio::time::Instant,
-    discovery_deadline: tokio::time::Instant,
     discovery: impl Future<Output = Result<MappingDiscovery, TransportError>> + Send,
 ) -> Result<(MappingDiscovery, Option<NativePlan>)> {
     let discovery = async {
-        match tokio::time::timeout_at(discovery_deadline, discovery).await {
+        match tokio::time::timeout_at(setup_deadline, discovery).await {
             Ok(result) => result.map_err(classify_transport_error),
             Err(_) => Ok(MappingDiscovery::Unavailable {
-                reason: "QAD mapping discovery deadline elapsed".to_owned(),
+                reason: "QAD discovery and cleanup exceeded the SSH setup deadline".to_owned(),
             }),
         }
     };
@@ -815,7 +809,6 @@ mod tests {
                 session_id,
                 RouteMode::PrivateDirect,
                 tokio::time::Instant::now() + Duration::from_secs(2),
-                tokio::time::Instant::now() + Duration::from_secs(1),
                 discovery,
             )
             .await
@@ -870,7 +863,6 @@ mod tests {
                 session_id,
                 RouteMode::PrivateDirect,
                 tokio::time::Instant::now() + Duration::from_secs(2),
-                tokio::time::Instant::now() + Duration::from_secs(1),
                 discovery,
             )
             .await
@@ -939,7 +931,6 @@ mod tests {
                 session_id,
                 RouteMode::PrivateDirect,
                 tokio::time::Instant::now() + Duration::from_secs(2),
-                tokio::time::Instant::now() + Duration::from_secs(1),
                 discovery,
             )
             .await

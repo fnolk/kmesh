@@ -114,13 +114,16 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
         addr: qad_addr,
         server_name: "127.0.0.1".to_owned(),
     };
+    let probe_deadline = Instant::now() + Duration::from_secs(2);
+    let cleanup_deadline = Instant::now() + Duration::from_secs(10);
     let (qad_socket, observations) = timeout(
         Duration::from_secs(10),
         observe_ipv4_mappings(
             qad_socket,
             qad_tls,
             &[reflector],
-            Instant::now() + Duration::from_secs(10),
+            probe_deadline,
+            cleanup_deadline,
         ),
     )
     .await
@@ -138,6 +141,9 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
     assert!(observation.udp_tx_datagrams > 0 && observation.udp_rx_datagrams > 0);
     assert!(observation.udp_tx_bytes > 0 && observation.udp_rx_bytes > 0);
     drop(qad_socket);
+    let rebound_socket = StdUdpSocket::bind(local_qad_socket)
+        .expect("QAD Noq drivers released the original UDP tuple before handoff");
+    drop(rebound_socket);
 
     let relay_url: reqwest::Url = format!("https://127.0.0.1:{}", https_addr.port())
         .parse()

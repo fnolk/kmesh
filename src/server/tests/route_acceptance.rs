@@ -285,13 +285,8 @@ async fn probe_qad_blackhole() -> Result<(String, DropStats)> {
         addr: dropper.addr,
         server_name: "localhost".to_owned(),
     }];
-    let probe = observe_ipv4_mappings(
-        source,
-        tls,
-        &reflector,
-        Instant::now() + Duration::from_millis(400),
-    )
-    .await;
+    let deadline = Instant::now() + Duration::from_millis(400);
+    let probe = observe_ipv4_mappings(source, tls, &reflector, deadline, deadline).await;
     let error = match probe {
         Ok(_) => bail!("controlled UDP dropper unexpectedly completed a QAD handshake"),
         Err(error) => error,

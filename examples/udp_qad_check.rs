@@ -19,6 +19,7 @@ use tokio::{
     net::lookup_host,
     time::{Instant as TokioInstant, timeout, timeout_at},
 };
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use kmesh::{
@@ -35,7 +36,8 @@ const SERVER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
 const SERVER_NAME: &str = "192.0.2.11";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
-const OFFICIAL_PAIR_TIMEOUT: Duration = Duration::from_secs(2);
+const OFFICIAL_PAIR_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const OFFICIAL_PAIR_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 const OFFICIAL_SINGLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -52,6 +54,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("warn,kmesh::transport::qad=debug"))
+        .with_writer(std::io::stderr)
+        .try_init();
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -314,10 +320,11 @@ async fn run_official() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let pair_started = Instant::now();
+    let pair_deadline = TokioInstant::now() + OFFICIAL_PAIR_ATTEMPT_TIMEOUT;
     let pair_result = discover_ipv4_mappings(
         &QadPlan::OfficialDefault,
         &TlsConfig::default(),
-        TokioInstant::now() + OFFICIAL_PAIR_TIMEOUT,
+        pair_deadline,
     )
     .await;
     let pair_elapsed_ms = pair_started.elapsed().as_millis();
@@ -373,9 +380,10 @@ async fn run_official() -> Result<()> {
                 addr: address,
                 server_name: server_name.clone(),
             };
-            let (socket, observations) = observe_ipv4_mappings(socket, tls, &[reflector], deadline)
-                .await
-                .with_context(|| format!("single official reflector QAD at {address}"))?;
+            let (socket, observations) =
+                observe_ipv4_mappings(socket, tls, &[reflector], deadline, deadline)
+                    .await
+                    .with_context(|| format!("single official reflector QAD at {address}"))?;
             let local_socket = socket.local_addr().context("read retained QAD socket")?;
             drop(socket);
             ensure!(
@@ -423,7 +431,8 @@ async fn run_official() -> Result<()> {
                 "configured_server_name": server_name,
                 "quic_port": port,
             })).collect::<Vec<_>>(),
-            "deadline_ms": OFFICIAL_PAIR_TIMEOUT.as_millis(),
+            "qad_probe_budget_ms": OFFICIAL_PAIR_PROBE_TIMEOUT.as_millis(),
+            "attempt_cleanup_deadline_ms": OFFICIAL_PAIR_ATTEMPT_TIMEOUT.as_millis(),
             "elapsed_ms": pair_elapsed_ms,
             "result": pair_result,
         },

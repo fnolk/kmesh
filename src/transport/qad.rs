@@ -101,19 +101,27 @@ async fn join_noq_tasks(owner: &TaskOwner) -> Result<()> {
 /// Discover the external IPv4 mapping of `socket` through each QAD reflector.
 ///
 /// A duplicated handle is passed to Noq; the owned original is returned after all Noq drivers and
-/// connections have stopped. Dropping this future aborts its tracked tasks when the task owner is
-/// dropped. The socket is set to nonblocking mode for Tokio I/O and is returned in that mode.
+/// connections have stopped. `probe_deadline` bounds handshakes and mapping observations, while
+/// `cleanup_deadline` bounds the endpoint drain and driver join. Dropping this future aborts its
+/// tracked tasks when the task owner is dropped. The socket is set to nonblocking mode for Tokio
+/// I/O and is returned in that mode.
 pub async fn observe_ipv4_mappings(
     socket: UdpSocket,
     tls: rustls::ClientConfig,
     targets: &[QadReflector],
-    deadline: TokioInstant,
+    probe_deadline: TokioInstant,
+    cleanup_deadline: TokioInstant,
 ) -> Result<(UdpSocket, Vec<QadObservation>)> {
     super::ensure_rustls_provider();
     ensure!(
         !targets.is_empty(),
         "at least one QAD reflector is required"
     );
+    ensure!(
+        cleanup_deadline >= probe_deadline,
+        "QAD cleanup deadline precedes the probe deadline"
+    );
+    let probe_started = TokioInstant::now();
     let local_socket = socket
         .local_addr()
         .context("read owned UDP socket address")?;
@@ -144,18 +152,18 @@ pub async fn observe_ipv4_mappings(
 
     for reflector in targets {
         let connection = timeout_at(
-            deadline,
+            probe_deadline,
             client.create_conn(reflector.addr.into(), &reflector.server_name),
         )
         .await
         .with_context(|| format!("QAD QUIC connect to {}", reflector.addr))?
         .with_context(|| format!("QAD QUIC connect to {}", reflector.addr))?;
-        timeout_at(deadline, connection.handshake_confirmed())
+        timeout_at(probe_deadline, connection.handshake_confirmed())
             .await
             .with_context(|| format!("QAD TLS handshake to {}", reflector.addr))?
             .with_context(|| format!("QAD TLS handshake to {}", reflector.addr))?;
 
-        let observed = timeout_at(deadline, connection.observed_external_addr().next())
+        let observed = timeout_at(probe_deadline, connection.observed_external_addr().next())
             .await
             .with_context(|| format!("QAD observed-address report from {}", reflector.addr))?
             .context("QAD observed-address stream ended")?;
@@ -198,16 +206,40 @@ pub async fn observe_ipv4_mappings(
         connection.close(QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON);
     }
 
+    let probe_elapsed_ms = probe_started.elapsed().as_millis();
+    let cleanup_started = TokioInstant::now();
     drop(client);
     endpoint.close(0u16.into(), b"QAD observation complete");
-    timeout_at(deadline, endpoint.wait_idle())
-        .await
-        .context("wait for QAD Noq connections to drain")?;
+    if let Err(error) = timeout_at(cleanup_deadline, endpoint.wait_idle()).await {
+        tracing::warn!(
+            reflector_count = targets.len(),
+            probe_elapsed_ms,
+            cleanup_elapsed_ms = cleanup_started.elapsed().as_millis(),
+            "QAD cleanup deadline elapsed while draining Noq connections"
+        );
+        return Err(error).context("wait for QAD Noq connections to drain");
+    }
     drop(endpoint);
     drop(runtime);
-    timeout_at(deadline, join_noq_tasks(&owner))
-        .await
-        .context("wait for QAD Noq drivers to stop")??;
+    match timeout_at(cleanup_deadline, join_noq_tasks(&owner)).await {
+        Err(error) => {
+            tracing::warn!(
+                reflector_count = targets.len(),
+                probe_elapsed_ms,
+                cleanup_elapsed_ms = cleanup_started.elapsed().as_millis(),
+                "QAD cleanup deadline elapsed while joining Noq drivers"
+            );
+            return Err(error).context("wait for QAD Noq drivers to stop");
+        }
+        Ok(Err(error)) => return Err(error).context("join QAD Noq runtime tasks"),
+        Ok(Ok(())) => {}
+    }
+    tracing::debug!(
+        reflector_count = targets.len(),
+        probe_elapsed_ms,
+        cleanup_elapsed_ms = cleanup_started.elapsed().as_millis(),
+        "QAD observations complete and Noq drivers stopped; original socket is ready for handoff"
+    );
 
     Ok((socket, observations))
 }
