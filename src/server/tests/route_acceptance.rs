@@ -74,7 +74,15 @@ impl AccessControl for RelayAccessPolicy {
                 ),
             };
         }
-        self.state.on_connect(request).await
+        AccessControl::on_connect(&self.state, request).await
+    }
+}
+
+impl std::fmt::Debug for RelayAccessPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayAccessPolicy")
+            .finish_non_exhaustive()
     }
 }
 
@@ -588,7 +596,7 @@ async fn drive_target(
                         "private relay access policy did not reject a real client EndpointId"
                     );
                     endpoint.close().await;
-                    break;
+                    return Ok(evidence);
                 }
 
                 let ControlMessage::DialOffer {
@@ -808,7 +816,8 @@ async fn run_client_cli(
     }
     timeout(budget, child.wait_with_output())
         .await
-        .context("client CLI child deadline elapsed")
+        .context("client CLI child deadline elapsed")?
+        .context("wait for client CLI child")
 }
 
 async fn login_client(config_path: &Path) -> Result<()> {
@@ -903,7 +912,8 @@ async fn wait_for_tunnel_status(
         }
     })
     .await
-    .context("waiting for tunnel session status")??
+    .context("waiting for tunnel session status")??;
+    Ok(())
 }
 
 #[tokio::test]
