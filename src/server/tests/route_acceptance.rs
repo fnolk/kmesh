@@ -1073,6 +1073,9 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
             sessions_before == sessions_after,
             "authorization denial persisted a tunnel session"
         );
+        eprintln!(
+            "route_acceptance_auth_fast_stop target_id={target_id} mode=PrivateDirect retried=false grant=false tunnel_rows_before={sessions_before} tunnel_rows_after={sessions_after} error={error:?}"
+        );
         server.shutdown().await?;
         Ok::<_, anyhow::Error>(())
     }
@@ -1171,6 +1174,22 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
             "direct retries and private relay did not use fresh session IDs"
         );
         wait_for_tunnel_status(server.state(), &session_ids, "closed").await?;
+        let mut closed_rows = Vec::new();
+        for session_id in &session_ids {
+            let status: String = sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+                .bind(session_id.to_string())
+                .fetch_one(&server.state().inner.db.pool)
+                .await?;
+            closed_rows.push(format!("{session_id}:{status}"));
+        }
+        eprintln!(
+            "route_acceptance_success sessions={session_ids:?} direct_attempts={:?} private_relay={relay:?} ssh_request={:?} ssh_request_bytes={} proxy_stdout_bytes={} db_rows={closed_rows:?} client_stderr={:?}",
+            target_evidence.direct_attempts,
+            String::from_utf8_lossy(&requested),
+            requested.len(),
+            output.stdout.len(),
+            String::from_utf8_lossy(&output.stderr),
+        );
         server.shutdown().await?;
         Ok::<_, anyhow::Error>(())
     }
@@ -1260,6 +1279,21 @@ async fn client_reports_real_private_relay_refusal_after_direct_timeouts() {
         ensure!(
             active_sessions == 0,
             "failed route left active or pending database sessions"
+        );
+        let mut closed_rows = Vec::new();
+        for session_id in &session_ids {
+            let status: String = sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+                .bind(session_id.to_string())
+                .fetch_one(&server.state().inner.db.pool)
+                .await?;
+            closed_rows.push(format!("{session_id}:{status}"));
+        }
+        eprintln!(
+            "route_acceptance_all_failed sessions={session_ids:?} direct_attempts={:?} private_relay_refusal_stage={:?} relay_denials={} active_rows={active_sessions} db_rows={closed_rows:?} final_client_stderr={:?}",
+            target_evidence.direct_attempts,
+            target_evidence.relay_refusal_stage,
+            server.access.denial_count.load(Ordering::Relaxed),
+            String::from_utf8_lossy(&output.stderr),
         );
         server.shutdown().await?;
         Ok::<_, anyhow::Error>(())
