@@ -572,7 +572,7 @@ async fn start_test_birthday_punch(
         session_id,
         target_id,
         client_key.public().to_string(),
-        RouteMode::PrivateRelay,
+        RouteMode::PrivateDirect,
     )
     .await
     .expect("open test birthday punch session");
@@ -589,7 +589,7 @@ async fn start_test_birthday_punch(
         .sign(&identity::agent_session_identity_payload(
             session_id,
             target_id,
-            RouteMode::PrivateRelay,
+            RouteMode::PrivateDirect,
             &target_data_key.public(),
             expires_at,
         ))
@@ -601,7 +601,7 @@ async fn start_test_birthday_punch(
         connection_id,
         ControlMessage::AgentIdentity {
             session_id,
-            route_mode: RouteMode::PrivateRelay,
+            route_mode: RouteMode::PrivateDirect,
             target_data_endpoint_id: target_data_key.public().to_string(),
             signature,
         },
@@ -618,7 +618,7 @@ async fn start_test_birthday_punch(
         connection_id,
         ControlMessage::CandidatesReady {
             session_id,
-            route_mode: RouteMode::PrivateRelay,
+            route_mode: RouteMode::PrivateDirect,
             discovery: test_qad_ready(target_local, target_observed),
         },
     )
@@ -629,7 +629,7 @@ async fn start_test_birthday_punch(
         client_sender,
         ControlMessage::CandidatesReady {
             session_id,
-            route_mode: RouteMode::PrivateRelay,
+            route_mode: RouteMode::PrivateDirect,
             discovery: test_qad_ready(client_local, client_observed),
         },
     )
@@ -655,7 +655,7 @@ async fn start_test_birthday_punch(
         connection_id,
         ControlMessage::PunchReady {
             session_id,
-            route_mode: RouteMode::PrivateRelay,
+            route_mode: RouteMode::PrivateDirect,
             socket_count: 257,
         },
     )
@@ -666,7 +666,7 @@ async fn start_test_birthday_punch(
         client_sender,
         ControlMessage::PunchReady {
             session_id,
-            route_mode: RouteMode::PrivateRelay,
+            route_mode: RouteMode::PrivateDirect,
             socket_count: 1,
         },
     )
@@ -3088,6 +3088,12 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
         ControlMessage::IdentityAccepted { session_id: received, route_mode: RouteMode::PrivateRelay }
             if received == session_id
     ));
+    assert!(
+        control::allow_agent_data_endpoint(state, &target_data_endpoint_id)
+            .await
+            .expect("check pending target data relay access"),
+        "signed target data identity should be authorized for this pending session"
+    );
     let ControlMessage::ClientOffer {
         session_id: client_offer_id,
         target_id: offered_target_id,
