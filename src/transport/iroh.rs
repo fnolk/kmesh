@@ -73,11 +73,16 @@ pub async fn create_endpoint(
         Vec::new()
     };
 
+    let mut net_report_config = NetReportConfig::minimal();
+    if matches!(&options.relay_choice, RelayChoice::Private { .. }) {
+        net_report_config.https_probes = true;
+    }
+
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .alpns(alpns)
         .relay_mode(relay_mode)
-        .net_report_config(NetReportConfig::minimal())
+        .net_report_config(net_report_config)
         .ca_tls_config(build_ca_tls_config(&options.tls)?);
 
     match (&options.relay_choice, options.handoff) {
