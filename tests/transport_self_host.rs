@@ -107,7 +107,9 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
     let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
     let qad_tls = ca_tls.client_config(crypto_provider).unwrap();
     let qad_socket = StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let local_qad_socket = qad_socket.local_addr().unwrap();
+    let SocketAddr::V4(local_qad_socket) = qad_socket.local_addr().unwrap() else {
+        unreachable!("QAD test socket was bound to IPv4 loopback")
+    };
     let reflector = QadReflector {
         addr: qad_addr,
         server_name: "127.0.0.1".to_owned(),
