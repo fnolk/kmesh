@@ -16,9 +16,8 @@ use tokio::{
     net::UdpSocket,
     sync::{mpsc, watch},
     task::JoinSet,
-    time::{Instant, interval, sleep_until, timeout_at},
+    time::{Instant, interval, sleep_until},
 };
-use uuid::Uuid;
 
 use super::super::TransportError;
 use super::super::qad::QadObservation;
@@ -587,7 +586,9 @@ async fn send_packet(
 mod tests {
     use super::super::super::qad::QadReflector;
     use super::super::discovery::{PRIVATE_QAD_PORT, default_qad_configs};
+    use super::QadPlan;
     use super::*;
+    use uuid::Uuid;
 
     fn private_qad_plan() -> QadPlan {
         QadPlan::PrivateAndOfficial {

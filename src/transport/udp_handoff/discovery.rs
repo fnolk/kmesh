@@ -8,7 +8,7 @@ use std::{
 
 use iroh::RelayMode;
 use tokio::{
-    net::{UdpSocket, lookup_host},
+    net::lookup_host,
     time::{Instant, timeout_at},
 };
 
@@ -32,7 +32,7 @@ pub async fn discover_ipv4_mappings(
     tls: &TlsConfig,
     deadline: Instant,
 ) -> Result<MappingDiscovery, TransportError> {
-    super::ensure_rustls_provider();
+    crate::transport::ensure_rustls_provider();
     let deadline = std::cmp::min(deadline, Instant::now() + MAPPING_DISCOVERY_BUDGET);
     let socket = StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
         .map_err(TransportError::Network)?;
@@ -185,13 +185,13 @@ fn classify_qad_error(error: anyhow::Error) -> Result<MappingDiscovery, Transpor
     }
     if causes
         .iter()
-        .any(|cause| super::is_auth_failure_source(*cause))
+        .any(|cause| crate::transport::is_auth_failure_source(*cause))
     {
         return Err(TransportError::Authentication(reason));
     }
     if causes
         .iter()
-        .any(|cause| super::is_network_failure_source(*cause))
+        .any(|cause| crate::transport::is_network_failure_source(*cause))
     {
         return Ok(MappingDiscovery::Unavailable { reason });
     }
