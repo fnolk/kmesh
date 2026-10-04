@@ -1,13 +1,14 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
 use crate::protocol::{ControlMessage, RouteMode, TransportInfo};
 
 mod attempt;
 mod stdio;
-pub(super) use attempt::read_ticket;
+#[cfg(test)]
+pub(in crate::client) use attempt::read_ticket;
 
 use super::{
     ClientContext,
@@ -35,6 +36,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     } else {
         vec![RouteMode::PublicDirect]
     };
+    let private_routes_unavailable = transport_info.private_relay_url.is_none();
     let mut failures = Vec::new();
     let mut connected = None;
     for (index, route_mode) in route_modes.into_iter().enumerate() {
@@ -88,7 +90,22 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                     "{route_mode:?} session={session_id} elapsed_ms={elapsed_ms}: {error:#}"
                 ));
                 if !attempt::is_retryable_route_failure(&error) {
-                    return Err(error).context(format!("SSH route {route_mode:?} failed"));
+                    let mut route_history = failures.clone();
+                    if private_routes_unavailable {
+                        route_history.insert(
+                            0,
+                            "PrivateDirect unavailable: server has no configured private relay"
+                                .to_owned(),
+                        );
+                        route_history.push(
+                            "PrivateRelay unavailable: server has no configured private relay"
+                                .to_owned(),
+                        );
+                    }
+                    return Err(error).context(format!(
+                        "SSH route plan stopped: {}",
+                        route_history.join("; ")
+                    ));
                 }
                 if tokio::time::Instant::now() >= setup_deadline {
                     break;
@@ -96,12 +113,24 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
             }
         }
     }
-    let (session_id, ssh_session, mut control) = connected.ok_or_else(|| {
-        anyhow!(
-            "all SSH routes failed before activation: {}",
-            failures.join("; ")
-        )
-    })?;
+    let (session_id, ssh_session, mut control) = match connected {
+        Some(connected) => connected,
+        None => {
+            if private_routes_unavailable {
+                failures.insert(
+                    0,
+                    "PrivateDirect unavailable: server has no configured private relay".to_owned(),
+                );
+                failures.push(
+                    "PrivateRelay unavailable: server has no configured private relay".to_owned(),
+                );
+            }
+            return Err(anyhow!(
+                "all SSH routes failed before activation: {}",
+                failures.join("; ")
+            ));
+        }
+    };
     let attempt::OpenSshSession {
         _endpoint,
         mut stream,

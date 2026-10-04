@@ -49,8 +49,13 @@ struct SshAuthenticationFailure(String);
 #[error("route network path failed: {0}")]
 pub(super) struct RouteNetworkFailure(#[source] anyhow::Error);
 
+#[derive(Debug, thiserror::Error)]
+#[error("SSH session failed after activation: {0}")]
+struct ActivatedSessionFailure(#[source] anyhow::Error);
+
 pub(super) fn is_retryable_route_failure(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<RouteNetworkFailure>().is_some()
+    error.downcast_ref::<ActivatedSessionFailure>().is_none()
+        && error.downcast_ref::<RouteNetworkFailure>().is_some()
 }
 
 fn ensure_auth(condition: bool, message: &str) -> Result<()> {
@@ -269,135 +274,151 @@ pub(super) async fn open_ssh_session(
             .map_err(classify_transport_error)
             .context("create per-session client Iroh endpoint")?
     };
-    let mut activated = false;
-    wait_setup_step(
-        control,
-        &endpoint,
-        session_id,
-        route_mode,
-        "waiting for client Iroh endpoint readiness",
-        &mut activated,
-        async {
-            wait_endpoint_ready(&endpoint, &route_transport.relay_choice, deadline)
-                .await
-                .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
-        },
-        deadline,
-    )
-    .await?;
-    let client_endpoint_addr = endpoint.addr();
-    ensure_auth(
-        client_endpoint_addr.id.to_string() == client_endpoint_id,
-        "client EndpointId differs from the SSH attempt identity",
-    )?;
-    tracing::debug!(
-        session = %session_id,
-        route_mode = ?route_mode,
-        client_endpoint_id = %client_endpoint_addr.id,
-        client_ip_addrs = ?client_endpoint_addr.ip_addrs().copied().collect::<Vec<_>>(),
-        "publishing prepared client Iroh candidates"
-    );
-    send_setup_control(
-        control,
-        &ControlMessage::ClientReady {
+    let setup_result = async {
+        let mut activated = false;
+        wait_setup_step(
+            control,
+            &endpoint,
             session_id,
             route_mode,
-            client_endpoint_addr,
-        },
-        route_mode,
-        deadline,
-    )
-    .await?;
+            "waiting for client Iroh endpoint readiness",
+            &mut activated,
+            async {
+                wait_endpoint_ready(&endpoint, &route_transport.relay_choice, deadline)
+                    .await
+                    .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
+            },
+            deadline,
+        )
+        .await?;
+        let client_endpoint_addr = endpoint.addr();
+        ensure_auth(
+            client_endpoint_addr.id.to_string() == client_endpoint_id,
+            "client EndpointId differs from the SSH attempt identity",
+        )?;
+        tracing::debug!(
+            session = %session_id,
+            route_mode = ?route_mode,
+            client_endpoint_id = %client_endpoint_addr.id,
+            client_ip_addrs = ?client_endpoint_addr.ip_addrs().copied().collect::<Vec<_>>(),
+            "publishing prepared client Iroh candidates"
+        );
+        send_setup_control(
+            control,
+            &ControlMessage::ClientReady {
+                session_id,
+                route_mode,
+                client_endpoint_addr,
+            },
+            route_mode,
+            deadline,
+        )
+        .await?;
 
-    let connection = wait_setup_step(
-        control,
-        &endpoint,
-        session_id,
-        route_mode,
-        "waiting for target Iroh connection",
-        &mut activated,
-        async {
-            accept_peer(&endpoint)
-                .await
-                .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
-        },
-        deadline,
-    )
-    .await?;
-    ensure_auth(
-        connection.remote_id().to_string() == offer.target_endpoint_id,
-        "Iroh peer EndpointId differs from the signed target EndpointId",
-    )?;
-    let path = wait_setup_step(
-        control,
-        &endpoint,
-        session_id,
-        route_mode,
-        "waiting for the required Iroh path",
-        &mut activated,
-        async {
-            wait_for_selected_path(&connection, route_mode, deadline)
-                .await
-                .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
-        },
-        deadline,
-    )
-    .await?;
-    send_setup_control(
-        control,
-        &ControlMessage::PathReady {
+        let connection = wait_setup_step(
+            control,
+            &endpoint,
             session_id,
             route_mode,
-            path,
-        },
-        route_mode,
-        deadline,
-    )
-    .await?;
-    let mut stream = wait_setup_step(
-        control,
-        &endpoint,
-        session_id,
-        route_mode,
-        "waiting for target SSH stream",
-        &mut activated,
-        async {
-            IrohByteStream::accept_bi(connection)
+            "waiting for target Iroh connection",
+            &mut activated,
+            async {
+                accept_peer(&endpoint)
+                    .await
+                    .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
+            },
+            deadline,
+        )
+        .await?;
+        ensure_auth(
+            connection.remote_id().to_string() == offer.target_endpoint_id,
+            "Iroh peer EndpointId differs from the signed target EndpointId",
+        )?;
+        let path = wait_setup_step(
+            control,
+            &endpoint,
+            session_id,
+            route_mode,
+            "waiting for the required Iroh path",
+            &mut activated,
+            async {
+                wait_for_selected_path(&connection, route_mode, deadline)
+                    .await
+                    .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
+            },
+            deadline,
+        )
+        .await?;
+        send_setup_control(
+            control,
+            &ControlMessage::PathReady {
+                session_id,
+                route_mode,
+                path,
+            },
+            route_mode,
+            deadline,
+        )
+        .await?;
+        let mut stream = wait_setup_step(
+            control,
+            &endpoint,
+            session_id,
+            route_mode,
+            "waiting for target SSH stream",
+            &mut activated,
+            async {
+                IrohByteStream::accept_bi(connection)
+                    .await
+                    .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
+            },
+            deadline,
+        )
+        .await?;
+        let received_ticket = wait_setup_step(
+            control,
+            &endpoint,
+            session_id,
+            route_mode,
+            "waiting for signed SSH ticket",
+            &mut activated,
+            async { read_ticket(&mut stream).await },
+            deadline,
+        )
+        .await?;
+        ensure_auth(
+            received_ticket == offer.ticket,
+            "Iroh stream ticket differs from the signed client offer",
+        )?;
+        if !activated {
+            tokio::time::timeout_at(deadline, wait_activated(control, session_id, route_mode))
                 .await
-                .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
-        },
-        deadline,
-    )
-    .await?;
-    let received_ticket = wait_setup_step(
-        control,
-        &endpoint,
-        session_id,
-        route_mode,
-        "waiting for signed SSH ticket",
-        &mut activated,
-        async { read_ticket(&mut stream).await },
-        deadline,
-    )
-    .await?;
-    ensure_auth(
-        received_ticket == offer.ticket,
-        "Iroh stream ticket differs from the signed client offer",
-    )?;
-    if !activated {
-        tokio::time::timeout_at(deadline, wait_activated(control, session_id, route_mode))
-            .await
-            .map_err(|_| {
-                private_relay_auth_failure(&endpoint, route_mode).unwrap_or_else(|| {
-                    route_network_timeout(route_mode, "waiting for SSH activation")
-                })
-            })?
-            .map_err(|error| classify_anyhow_network_error(error, route_mode))?;
+                .map_err(|_| {
+                    private_relay_auth_failure(&endpoint, route_mode).unwrap_or_else(|| {
+                        route_network_timeout(route_mode, "waiting for SSH activation")
+                    })
+                })?
+                .map_err(|error| classify_anyhow_network_error(error, route_mode))?;
+        }
+        Ok::<_, anyhow::Error>(stream)
     }
-    Ok(OpenSshSession {
-        _endpoint: endpoint,
-        stream,
-    })
+    .await;
+
+    match setup_result {
+        Ok(stream) => Ok(OpenSshSession {
+            _endpoint: endpoint,
+            stream,
+        }),
+        Err(error) => {
+            if tokio::time::timeout_at(deadline, endpoint.close())
+                .await
+                .is_err()
+            {
+                tracing::debug!(session = %session_id, "endpoint cleanup reached the shared setup deadline; endpoint drop will abort remaining SDK tasks");
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn run_client_punch(
@@ -442,6 +463,67 @@ async fn run_client_punch(
         }
     };
 
+    match drive_client_punch(&mut punch, session_id, control, route_mode, deadline).await {
+        Err(error) => {
+            if let Err(cleanup_error) = punch.finish(false).await {
+                return Err(error).context(format!("raw punch cleanup failed: {cleanup_error}"));
+            }
+            Err(error)
+        }
+        Ok(ClientPunchOutcome::Standard { selection }) => {
+            punch.finish(false).await.map_err(anyhow::Error::new)?;
+            Ok((Some(standard_handoff), selection))
+        }
+        Ok(ClientPunchOutcome::Selected {
+            selection,
+            self_observed_addr,
+            peer_observed_addr,
+        }) => {
+            if peer_observed_addr != selection.peer_observed_addr {
+                punch.finish(false).await.map_err(anyhow::Error::new)?;
+                return Err(anyhow!(SshAuthenticationFailure(
+                    "server handoff peer tuple differs from the confirmed client punch winner"
+                        .to_owned()
+                )));
+            }
+            let local = punch
+                .finish(true)
+                .await
+                .map_err(anyhow::Error::new)?
+                .context("selected client punch did not return a local handoff tuple")?;
+            ensure_auth(
+                local.index == selection.index && local.bind_addr == selection.local_socket,
+                "client punch handoff tuple differs from the selected raw socket",
+            )?;
+            Ok((
+                Some(HandoffOptions {
+                    bind_addr: local.bind_addr,
+                    self_observed_addr,
+                }),
+                Some(selection),
+            ))
+        }
+    }
+}
+
+enum ClientPunchOutcome {
+    Standard {
+        selection: Option<crate::transport::PunchSelection>,
+    },
+    Selected {
+        selection: crate::transport::PunchSelection,
+        self_observed_addr: std::net::SocketAddrV4,
+        peer_observed_addr: std::net::SocketAddrV4,
+    },
+}
+
+async fn drive_client_punch(
+    punch: &mut PreparedPunch,
+    session_id: Uuid,
+    control: &mut WsStream,
+    route_mode: RouteMode,
+    deadline: tokio::time::Instant,
+) -> Result<ClientPunchOutcome> {
     let socket_count = u16::try_from(punch.socket_count())
         .map_err(|_| anyhow!("client punch socket count exceeds protocol limit"))?;
     send_setup_control(
@@ -465,15 +547,12 @@ async fn run_client_punch(
             route_mode: mode,
             plan: NativePlan::Standard,
         }) if received == session_id && mode == route_mode => {
-            punch.finish(false).await.map_err(anyhow::Error::new)?;
-            return Ok((Some(standard_handoff), None));
+            return Ok(ClientPunchOutcome::Standard { selection: None });
         }
         None => {
-            punch.finish(false).await.map_err(anyhow::Error::new)?;
             bail!("server closed SSH session before client punching started");
         }
         Some(_) => {
-            punch.finish(false).await.map_err(anyhow::Error::new)?;
             return Err(anyhow!(SshAuthenticationFailure(
                 "server sent an unexpected client punch-stage control message".to_owned()
             )));
@@ -483,7 +562,6 @@ async fn run_client_punch(
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let punch_window = remaining.min(DIRECT_PUNCH_TIMEOUT);
     if punch_window.is_zero() {
-        punch.finish(false).await.map_err(anyhow::Error::new)?;
         return if report_punch_failure(
             control,
             session_id,
@@ -493,7 +571,7 @@ async fn run_client_punch(
         )
         .await?
         {
-            Ok((Some(standard_handoff), None))
+            Ok(ClientPunchOutcome::Standard { selection: None })
         } else {
             bail!("server closed SSH session after the punch window expired")
         };
@@ -504,7 +582,6 @@ async fn run_client_punch(
         message = next_client_session_message(control, session_id, route_mode, deadline) => {
             match message? {
                 None => {
-                    punch.finish(false).await.map_err(anyhow::Error::new)?;
                     bail!("server closed SSH session during client punching");
                 }
                 Some(ControlMessage::ContinueNative {
@@ -512,11 +589,9 @@ async fn run_client_punch(
                     route_mode: mode,
                     plan: NativePlan::Standard,
                 }) if received == session_id && mode == route_mode => {
-                    punch.finish(false).await.map_err(anyhow::Error::new)?;
-                    return Ok((Some(standard_handoff), None));
+                    return Ok(ClientPunchOutcome::Standard { selection: None });
                 }
                 Some(_) => {
-                    punch.finish(false).await.map_err(anyhow::Error::new)?;
                     return Err(anyhow!(SshAuthenticationFailure(
                         "server sent an unexpected control message while client punching".to_owned()
                     )));
@@ -526,15 +601,13 @@ async fn run_client_punch(
         result = punch.start(punch_deadline) => match result {
             Ok(selection) => selection,
             Err(PunchError::Unavailable(reason)) => {
-                punch.finish(false).await.map_err(anyhow::Error::new)?;
                 return if report_punch_failure(control, session_id, route_mode, reason, deadline).await? {
-                    Ok((Some(standard_handoff), None))
+                    Ok(ClientPunchOutcome::Standard { selection: None })
                 } else {
                     bail!("server closed SSH session after client punch failure")
                 };
             }
             Err(PunchError::Fatal(error)) => {
-                punch.finish(false).await.map_err(anyhow::Error::new)?;
                 return Err(classify_transport_error(error));
             }
         }
@@ -562,46 +635,24 @@ async fn run_client_punch(
                     self_observed_addr,
                     peer_observed_addr,
                 },
-        }) if received == session_id && mode == route_mode => {
-            ensure_auth(
-                peer_observed_addr == selection.peer_observed_addr,
-                "server handoff peer tuple differs from the confirmed client punch winner",
-            )?;
-            let local = punch
-                .finish(true)
-                .await
-                .map_err(anyhow::Error::new)?
-                .context("selected client punch did not return a local handoff tuple")?;
-            ensure_auth(
-                local.index == selection.index && local.bind_addr == selection.local_socket,
-                "client punch handoff tuple differs from the selected raw socket",
-            )?;
-            Ok((
-                Some(HandoffOptions {
-                    bind_addr: local.bind_addr,
-                    self_observed_addr,
-                }),
-                Some(selection),
-            ))
-        }
+        }) if received == session_id && mode == route_mode => Ok(ClientPunchOutcome::Selected {
+            selection,
+            self_observed_addr,
+            peer_observed_addr,
+        }),
         Some(ControlMessage::ContinueNative {
             session_id: received,
             route_mode: mode,
             plan: NativePlan::Standard,
-        }) if received == session_id && mode == route_mode => {
-            punch.finish(false).await.map_err(anyhow::Error::new)?;
-            Ok((Some(standard_handoff), Some(selection)))
-        }
+        }) if received == session_id && mode == route_mode => Ok(ClientPunchOutcome::Standard {
+            selection: Some(selection),
+        }),
         None => {
-            punch.finish(false).await.map_err(anyhow::Error::new)?;
             bail!("server closed SSH session before client native handoff")
         }
-        Some(_) => {
-            punch.finish(false).await.map_err(anyhow::Error::new)?;
-            Err(anyhow!(SshAuthenticationFailure(
-                "server sent an unexpected client native handoff control message".to_owned()
-            )))
-        }
+        Some(_) => Err(anyhow!(SshAuthenticationFailure(
+            "server sent an unexpected client native handoff control message".to_owned()
+        ))),
     }
 }
 
@@ -724,6 +775,7 @@ fn client_message_session_id(message: &ControlMessage) -> Option<Uuid> {
         | ControlMessage::PunchSelected { session_id, .. }
         | ControlMessage::PunchFailed { session_id, .. }
         | ControlMessage::ContinueNative { session_id, .. }
+        | ControlMessage::PathReady { session_id, .. }
         | ControlMessage::AgentReady { session_id, .. }
         | ControlMessage::ClientReady { session_id, .. }
         | ControlMessage::DialOffer { session_id, .. }
@@ -749,9 +801,6 @@ async fn wait_setup_step<T>(
         loop {
             tokio::select! {
                 biased;
-                result = &mut operation => {
-                    return result.map_err(|error| classify_anyhow_network_error(error, route_mode));
-                }
                 message = control.next() => {
                     let message = message
                         .context("control WebSocket ended during SSH setup")
@@ -765,11 +814,35 @@ async fn wait_setup_step<T>(
                             *activated = true;
                         }
                         ControlMessage::Error { session_id: Some(received), code, message }
-                            if received == session_id => return Err(server_setup_error(code, message)),
+                            if received == session_id => {
+                                let error = server_setup_error(code, message);
+                                return Err(if *activated {
+                                    anyhow::Error::new(ActivatedSessionFailure(error))
+                                } else {
+                                    error
+                                });
+                            }
+                        ControlMessage::Error { session_id: None, code, message } => {
+                            let error = server_setup_error(code, message);
+                            return Err(if *activated {
+                                anyhow::Error::new(ActivatedSessionFailure(error))
+                            } else {
+                                error
+                            });
+                        }
                         ControlMessage::Close { session_id: received, reason }
                             if received == session_id => bail!("server closed SSH session during setup: {reason}"),
                         _ => tracing::debug!(session = %session_id, "ignoring unexpected control message during Iroh setup"),
                     }
+                }
+                result = &mut operation => {
+                    return result.map_err(|error| {
+                        if *activated {
+                            anyhow::Error::new(ActivatedSessionFailure(error))
+                        } else {
+                            classify_anyhow_network_error(error, route_mode)
+                        }
+                    });
                 }
             }
         }
@@ -913,6 +986,11 @@ async fn next_offer(
             } if received == session_id => {
                 return Err(server_setup_error(code, message));
             }
+            ControlMessage::Error {
+                session_id: None,
+                code,
+                message,
+            } => return Err(server_setup_error(code, message)),
             ControlMessage::Close {
                 session_id: received,
                 reason,
@@ -980,7 +1058,7 @@ fn validate_offer(
     Ok(())
 }
 
-pub(super) async fn read_ticket(stream: &mut IrohByteStream) -> Result<String> {
+pub(in crate::client) async fn read_ticket(stream: &mut IrohByteStream) -> Result<String> {
     let mut length_bytes = [0; 4];
     stream
         .read_exact(&mut length_bytes)
@@ -1029,6 +1107,11 @@ async fn wait_activated(
             } if received == session_id => {
                 return Err(server_setup_error(code, message));
             }
+            ControlMessage::Error {
+                session_id: None,
+                code,
+                message,
+            } => return Err(server_setup_error(code, message)),
             ControlMessage::Close {
                 session_id: received,
                 reason,
@@ -1142,6 +1225,10 @@ mod tests {
                 .downcast_ref::<RouteNetworkFailure>()
                 .is_some()
         );
+        let active_network = anyhow::Error::new(ActivatedSessionFailure(anyhow::Error::new(
+            RouteNetworkFailure(anyhow!("transport closed after activation")),
+        )));
+        assert!(!is_retryable_route_failure(&active_network));
 
         let private_auth =
             classify_transport_error(TransportError::Authentication("denied".to_owned()));
