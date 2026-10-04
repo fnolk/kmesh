@@ -271,16 +271,13 @@ class Verification:
             cancelled.communicate(timeout=2)
             raise VerificationError("cancel-test SSH channel did not report its active marker")
         time.sleep(1)
-        if cancelled.poll() is None:
-            cancelled.terminate()
-        try:
-            cancel_stdout, _cancel_stderr = cancelled.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            if cancelled.poll() is None:
-                cancelled.kill()
-            cancel_stdout, _cancel_stderr = cancelled.communicate(timeout=2)
-            raise VerificationError("cancelled SSH client process did not exit")
-        if cancelled.returncode == 0 and b"kmesh-cancelled-command-complete" in cancel_stdout:
+        if cancelled.poll() is not None:
+            raise VerificationError("cancel-test SSH client exited before explicit disconnect")
+        cancelled.kill()
+        cancel_stdout, _cancel_stderr = cancelled.communicate(timeout=7)
+        if cancelled.returncode != -signal.SIGKILL:
+            raise VerificationError("cancel-test SSH client did not exit from direct kill")
+        if b"kmesh-cancelled-command-complete" in cancel_stdout:
             raise VerificationError("cancelled SSH command unexpectedly completed")
         after_cancel = self.run(
             "control-master-survives-channel-cancel",
