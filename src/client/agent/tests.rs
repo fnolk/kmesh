@@ -1,5 +1,8 @@
 use super::{
-    TunnelOffer, control::agent_session_error_code, route::endpoint_options, server_session_error,
+    TunnelOffer,
+    control::{agent_session_error_code, route_session_message},
+    route::endpoint_options,
+    server_session_error,
     session::handle_dial_offer,
 };
 use crate::client::{ClientContext, api::Api, profile, proxy::read_ticket};
@@ -9,7 +12,7 @@ use crate::{
 };
 use anyhow::Result;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
-use std::{io, time::Duration};
+use std::{collections::HashMap, io, time::Duration};
 use tokio::time::Instant;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -68,6 +71,46 @@ fn server_network_errors_remain_retryable_route_failures() {
         )),
         "authentication"
     );
+}
+
+#[tokio::test]
+async fn closed_mailbox_before_done_keeps_sibling_session_routable() {
+    let closed_session_id = Uuid::new_v4();
+    let sibling_session_id = Uuid::new_v4();
+    let (closed_sender, closed_receiver) = mpsc::channel(1);
+    let (sibling_sender, mut sibling_receiver) = mpsc::channel(1);
+    let mut sessions = HashMap::new();
+    sessions.insert(closed_session_id, closed_sender);
+    sessions.insert(sibling_session_id, sibling_sender);
+    drop(closed_receiver);
+
+    assert!(sessions.contains_key(&closed_session_id));
+    route_session_message(
+        &mut sessions,
+        ControlMessage::Close {
+            session_id: closed_session_id,
+            reason: "session finished".to_owned(),
+        },
+    )
+    .await;
+    assert!(!sessions.contains_key(&closed_session_id));
+
+    route_session_message(
+        &mut sessions,
+        ControlMessage::IdentityAccepted {
+            session_id: sibling_session_id,
+            route_mode: RouteMode::PublicDirect,
+        },
+    )
+    .await;
+    assert!(matches!(
+        sibling_receiver.recv().await,
+        Some(ControlMessage::IdentityAccepted {
+            session_id,
+            route_mode: RouteMode::PublicDirect,
+        }) if session_id == sibling_session_id
+    ));
+    assert!(sessions.contains_key(&sibling_session_id));
 }
 
 async fn context(server_url: &str) -> ClientContext {

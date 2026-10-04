@@ -210,15 +210,31 @@ pub(super) async fn control_session(
                         return Err(anyhow!(ServerAuthenticationFailure(format!("server rejected agent control: {message}"))));
                     }
                     message => {
-                        if let Some(session_id) = message_session_id(&message)
-                            && let Some(sender) = sessions.get(&session_id)
-                        {
-                            sender.send(message).await.context("route agent session message")?;
-                        }
+                        route_session_message(&mut sessions, message).await;
                     }
                 }
             }
         }
+    }
+}
+
+pub(super) async fn route_session_message(
+    sessions: &mut HashMap<Uuid, mpsc::Sender<ControlMessage>>,
+    message: ControlMessage,
+) {
+    let Some(session_id) = message_session_id(&message) else {
+        return;
+    };
+    let Some(sender) = sessions.get(&session_id) else {
+        return;
+    };
+    if sender.send(message).await.is_err() {
+        tracing::debug!(
+            session = %session_id,
+            error = "session mailbox closed",
+            "removing completed agent SSH session from control routing"
+        );
+        sessions.remove(&session_id);
     }
 }
 
