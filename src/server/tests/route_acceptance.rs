@@ -35,11 +35,13 @@ use crate::{
     config::{Config, TlsConfig},
     identity,
     protocol::{
-        ControlMessage, DiscoveryResult, NativePlan, RouteMode, SelectedPath, TunnelTicketClaims,
+        ControlMessage, DiscoveryResult, LoginTokens, NativePlan, PasswordLoginRequest, RouteMode,
+        SelectedPath, TunnelTicketClaims,
     },
     transport::{
-        IrohByteStream, IrohEndpointOptions, IrohPathKind, QadReflector, RelayChoice, connect_peer,
-        create_endpoint, observe_ipv4_mappings, wait_endpoint_ready, wait_for_selected_path,
+        IrohByteStream, IrohEndpointOptions, IrohPathKind, QadReflector, RelayChoice,
+        TransportError, connect_peer, create_endpoint, observe_ipv4_mappings, wait_endpoint_ready,
+        wait_for_selected_path,
     },
 };
 
@@ -260,6 +262,7 @@ struct DirectAttemptEvidence {
 struct RelayStreamEvidence {
     session_id: Uuid,
     selected_url: String,
+    selected_remote_address: String,
     tx_delta: u64,
     rx_delta: u64,
 }
@@ -268,6 +271,7 @@ struct RelayStreamEvidence {
 struct TargetEvidence {
     direct_attempts: Vec<DirectAttemptEvidence>,
     relay_session_id: Option<Uuid>,
+    relay_refusal_stage: Option<String>,
     relay_stream: Option<RelayStreamEvidence>,
 }
 
@@ -576,12 +580,47 @@ async fn drive_target(
                     },
                 )
                 .await?;
-                wait_endpoint_ready(
+                let endpoint_ready = wait_endpoint_ready(
                     &endpoint,
                     &relay_choice,
                     Instant::now() + Duration::from_secs(10),
                 )
-                .await?;
+                .await;
+                if let Err(error) = endpoint_ready {
+                    if deny_private_relay
+                        && error.is_auth_failure()
+                        && server.access.denial_count.load(Ordering::Relaxed) > 0
+                    {
+                        ensure!(
+                            server
+                                .access
+                                .denied_client_ids
+                                .lock()
+                                .expect("relay deny set lock poisoned")
+                                .contains(&client_endpoint_id),
+                            "relay refusal was not for this session's client EndpointId"
+                        );
+                        ensure!(
+                            matches!(
+                                next_agent_control(
+                                    &mut agent_control,
+                                    Duration::from_secs(25)
+                                )
+                                .await?,
+                                ControlMessage::Close { session_id: closed, .. }
+                                    if closed == session_id
+                            ),
+                            "client did not close the pending private relay session after denial"
+                        );
+                        wait_for_tunnel_status(server.state(), &[session_id], "closed").await?;
+                        evidence.relay_refusal_stage = Some(format!(
+                            "target relay readiness ended after client EndpointId denial: {error}"
+                        ));
+                        endpoint.close().await;
+                        return Ok(evidence);
+                    }
+                    return Err(anyhow::Error::new(error));
+                }
                 send_control(
                     &mut agent_control,
                     &ControlMessage::AgentReady {
@@ -604,6 +643,9 @@ async fn drive_target(
                     ensure!(
                         server.access.denial_count.load(Ordering::Relaxed) > 0,
                         "private relay access policy did not reject a real client EndpointId"
+                    );
+                    evidence.relay_refusal_stage = Some(
+                        "client private relay registration denied before target dial".to_owned(),
                     );
                     endpoint.close().await;
                     return Ok(evidence);
@@ -665,6 +707,7 @@ async fn drive_target(
                     url == &expected_relay_url,
                     "target selected an unexpected relay URL"
                 );
+                let selected_relay_url = url.clone();
                 send_control(
                     &mut agent_control,
                     &ControlMessage::PathReady {
@@ -754,7 +797,8 @@ async fn drive_target(
                 );
                 evidence.relay_stream = Some(RelayStreamEvidence {
                     session_id,
-                    selected_url: selected_path_after.remote_address,
+                    selected_url: selected_relay_url,
+                    selected_remote_address: selected_path_after.remote_address,
                     tx_delta,
                     rx_delta,
                 });
@@ -952,7 +996,18 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
             }
         }
-        let tokens = super::login_password(server.state()).await;
+        let http = crate::transport::http_client(&server.tls)?;
+        let tokens: LoginTokens = http
+            .post(format!("{}/v1/auth/password", server.issuer))
+            .json(&PasswordLoginRequest {
+                username: ADMIN_USERNAME.to_owned(),
+                password: ADMIN_PASSWORD.to_owned(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         let saved_login = serde_json::json!({
             "server_url": server.issuer.clone(),
             "profile": "route-acceptance",
@@ -978,6 +1033,17 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
         let _agent_control =
             connect_control_ws(&server.issuer, "agent/control", &agent_token, &server.tls).await;
         wait_target_online(server.state(), target_id).await?;
+        let has_grant: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM target_permissions WHERE target_id = ?1 \
+             AND permission = 'ssh_connect')",
+        )
+        .bind(target_id.to_string())
+        .fetch_one(&server.state().inner.db.pool)
+        .await?;
+        ensure!(
+            has_grant == 0,
+            "auth fast-stop fixture unexpectedly has ssh_connect"
+        );
         let sessions_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
             .fetch_one(&server.state().inner.db.pool)
             .await?;
@@ -1081,7 +1147,11 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
         let expected_relay_url = reqwest::Url::parse(&server.issuer)?.to_string();
         ensure!(
             relay.selected_url == expected_relay_url && relay.tx_delta > 0 && relay.rx_delta > 0,
-            "private relay selected-path counters did not grow in both directions: {relay:?}"
+            "private relay typed selected URL/counters do not match: {relay:?}"
+        );
+        ensure!(
+            relay.selected_remote_address.contains(&expected_relay_url),
+            "Iroh selected-path stats report a different private relay: {relay:?}"
         );
         let requested = timeout(Duration::from_secs(5), ssh_task)
             .await
@@ -1108,102 +1178,6 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
     .await;
     if let Err(error) = result {
         panic!("route acceptance failed: {error:#}");
-    }
-}
-
-#[tokio::test]
-async fn client_auth_failure_is_terminal_for_an_online_enrolled_target() {
-    let result = async {
-        let server = LocalServer::start_at(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-        let device_key = SecretKey::generate();
-        let (target_id, agent_token) =
-            create_enrolled_target(server.state(), "route-auth-denied-target", &device_key).await;
-        let config_path = server.client_config()?;
-        let client_data_dir = server.fixture.data_dir.join("route-client-state");
-        let profiles_dir = client_data_dir.join("profiles");
-        let hash_component = |value: &str| URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()));
-        let profile_dir = profiles_dir
-            .join(hash_component(&server.issuer))
-            .join(hash_component("route-acceptance"));
-        fs::create_dir_all(&profile_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for directory in [
-                client_data_dir.as_path(),
-                profiles_dir.as_path(),
-                profile_dir.as_path(),
-            ] {
-                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-            }
-        }
-        let tokens = super::login_password(server.state()).await;
-        let saved_login = serde_json::json!({
-            "server_url": server.issuer,
-            "profile": "route-acceptance",
-            "username": ADMIN_USERNAME,
-            "tokens": tokens,
-        });
-        let login_path = profile_dir.join(format!("{}.json", hash_component(ADMIN_USERNAME)));
-        fs::write(&login_path, serde_json::to_vec(&saved_login)?)?;
-        fs::write(profile_dir.join("active-user"), ADMIN_USERNAME)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&login_path, fs::Permissions::from_mode(0o600))?;
-            fs::set_permissions(
-                profile_dir.join("active-user"),
-                fs::Permissions::from_mode(0o600),
-            )?;
-        }
-
-        let _agent_control =
-            connect_control_ws(&server.issuer, "agent/control", &agent_token, &server.tls).await;
-        wait_target_online(server.state(), target_id).await?;
-        let has_grant: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM target_permissions WHERE target_id = ?1 \
-             AND permission = 'ssh_connect')",
-        )
-        .bind(target_id.to_string())
-        .fetch_one(&server.state().inner.db.pool)
-        .await?;
-        ensure!(
-            has_grant == 0,
-            "auth fast-stop fixture unexpectedly has ssh_connect"
-        );
-        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
-            .fetch_one(&server.state().inner.db.pool)
-            .await?;
-        let error = client::run(Cli {
-            config: Some(config_path),
-            data_dir: None,
-            profile: None,
-            server_url: None,
-            command: ClientCommand::Proxy { target_id },
-        })
-        .await
-        .expect_err("online target without an ssh_connect grant must be denied");
-        let error = format!("{error:#}");
-        ensure!(
-            error.contains("PrivateDirect")
-                && !error.contains("PublicDirect")
-                && !error.contains("PrivateRelay"),
-            "authorization failure retried a later route: {error}"
-        );
-        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
-            .fetch_one(&server.state().inner.db.pool)
-            .await?;
-        ensure!(
-            before == after,
-            "authorization denial created a tunnel session"
-        );
-        drop(_agent_control);
-        server.shutdown().await?;
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    if let Err(error) = result {
-        panic!("auth fast-stop acceptance failed: {error:#}");
     }
 }
 
@@ -1254,6 +1228,10 @@ async fn client_reports_real_private_relay_refusal_after_direct_timeouts() {
         ensure!(
             server.access.denial_count.load(Ordering::Relaxed) > 0,
             "local Iroh relay did not refuse the actual client EndpointId"
+        );
+        ensure!(
+            target_evidence.relay_refusal_stage.is_some(),
+            "private relay refusal stage was not recorded"
         );
         let mut session_ids = target_evidence
             .direct_attempts
