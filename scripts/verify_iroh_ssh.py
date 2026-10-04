@@ -248,7 +248,10 @@ class Verification:
 
         cancelled = subprocess.Popen(
             self.ssh_base(multiplex=True)
-            + ["sh -c 'printf kmesh-cancel-started\\n; sleep 5; printf kmesh-cancelled-command-complete'"],
+            + [
+                "printf '%s\\n' kmesh-cancel-started; sleep 5; "
+                "printf '%s\\n' kmesh-cancelled-command-complete"
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=self.env,
