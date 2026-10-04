@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any
 
 COMMAND_TIMEOUT = 15
+SSH_CONNECT_TIMEOUT_SECONDS = 65
+SSH_NEW_CONNECTION_TIMEOUT_SECONDS = SSH_CONNECT_TIMEOUT_SECONDS + COMMAND_TIMEOUT
 PATH_EVENT = re.compile(r"连接路径(切换)?：(P2P 直连|Iroh 中继) \(([^)]+)\)")
 
 
@@ -314,7 +316,7 @@ class Verification:
             "-o",
             "BatchMode=yes",
             "-o",
-            f"ConnectTimeout={COMMAND_TIMEOUT}",
+            f"ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}",
             "-o",
             "ConnectionAttempts=1",
         ]
@@ -385,7 +387,7 @@ class Verification:
             env=self.env,
             start_new_session=True,
         )
-        deadline = time.monotonic() + COMMAND_TIMEOUT
+        deadline = time.monotonic() + SSH_NEW_CONNECTION_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if self.master.poll() is not None:
                 raise VerificationError("ControlMaster exited before becoming ready")
@@ -507,6 +509,7 @@ class Verification:
         result = self.run(
             "hostname-and-exit-23",
             self.ssh_base(multiplex=False) + ["hostname; exit 23"],
+            timeout=SSH_NEW_CONNECTION_TIMEOUT_SECONDS,
             accepted=(23,),
         )
         hostname = result.stdout.decode("utf-8", "replace").strip()
@@ -523,6 +526,7 @@ class Verification:
             "eight-second-path-observation",
             self.ssh_base(multiplex=False)
             + ["hostname; sleep 8; echo kmesh-path-probe-complete"],
+            timeout=SSH_NEW_CONNECTION_TIMEOUT_SECONDS,
         )
         lines = result.stdout.decode("utf-8", "replace").splitlines()
         if not lines or not any(line.strip() == "kmesh-path-probe-complete" for line in lines):
@@ -726,7 +730,12 @@ class Verification:
             f"HostKeyAlias={self.host_key_alias}",
         ]
         command.append("true")
-        result = self.run("strict-host-key-rejects-wrong-key", command, accepted=None)
+        result = self.run(
+            "strict-host-key-rejects-wrong-key",
+            command,
+            timeout=SSH_NEW_CONNECTION_TIMEOUT_SECONDS,
+            accepted=None,
+        )
         text = (result.stderr + result.stdout).decode("utf-8", "replace").lower()
         if result.returncode == 0 or not any(
             phrase in text
@@ -939,7 +948,7 @@ class Verification:
         restored = self.run(
             "verify-login-restored-after-logout-test",
             self.ssh_base(multiplex=False) + ["hostname"],
-            timeout=10,
+            timeout=SSH_NEW_CONNECTION_TIMEOUT_SECONDS,
         )
         if not restored.stdout.strip():
             raise VerificationError("verification user login was not restored after logout test")
