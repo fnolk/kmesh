@@ -6,9 +6,11 @@ use uuid::Uuid;
 use crate::protocol::{ControlMessage, RouteMode};
 
 mod attempt;
+mod punch;
 mod stdio;
+mod ticket;
 #[cfg(test)]
-pub(in crate::client) use attempt::read_ticket;
+pub(in crate::client) use ticket::read_ticket;
 
 use super::{
     ClientContext,
@@ -18,6 +20,39 @@ use super::{
 };
 
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, thiserror::Error)]
+#[error("SSH access authentication failed: {0}")]
+pub(super) struct SshAuthenticationFailure(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("route network path failed: {0}")]
+pub(super) struct RouteNetworkFailure(#[source] anyhow::Error);
+
+#[derive(Debug, thiserror::Error)]
+#[error("SSH session failed after activation: {0}")]
+pub(super) struct ActivatedSessionFailure(#[source] anyhow::Error);
+
+pub(super) fn ensure_auth(condition: bool, message: &str) -> Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(anyhow!(SshAuthenticationFailure(message.to_owned())))
+    }
+}
+
+pub(super) fn is_retryable_route_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ActivatedSessionFailure>().is_none()
+        && error.downcast_ref::<RouteNetworkFailure>().is_some()
+}
+
+pub(super) fn server_setup_error(code: String, message: String) -> anyhow::Error {
+    match code.as_str() {
+        "authentication" | "authorization" => anyhow!(SshAuthenticationFailure(message)),
+        "network" => anyhow::Error::new(RouteNetworkFailure(anyhow!(message))),
+        _ => anyhow!("server could not prepare SSH access: {message}"),
+    }
+}
 
 pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     let setup_deadline = tokio::time::Instant::now() + SSH_SETUP_TIMEOUT;
@@ -89,7 +124,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                 failures.push(format!(
                     "{route_mode:?} session={session_id} elapsed_ms={elapsed_ms}: {error:#}"
                 ));
-                if !attempt::is_retryable_route_failure(&error) {
+                if !is_retryable_route_failure(&error) {
                     let mut route_history = failures.clone();
                     if private_routes_unavailable {
                         route_history.insert(
