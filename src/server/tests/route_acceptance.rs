@@ -509,15 +509,14 @@ async fn drive_target(
                     )
                     .await
                 });
-                let close_message = loop {
+                let close_message =
                     match next_agent_control(&mut agent_control, Duration::from_secs(40)).await? {
                         ControlMessage::Close {
                             session_id: closed,
                             reason,
-                        } if closed == session_id => break reason,
+                        } if closed == session_id => reason,
                         other => bail!("unexpected direct-session control message: {other:?}"),
-                    }
-                };
+                    };
                 let dial_result = timeout(Duration::from_secs(2), dial)
                     .await
                     .context("Noq direct dial task did not finish its bounded timeout")?

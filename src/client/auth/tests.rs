@@ -133,8 +133,7 @@ async fn read_http_request(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
 }
 
 async fn one_refresh_request(
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
+    listener_and_acceptor: (TcpListener, TlsAcceptor),
     expected_refresh_token: &'static str,
     reply: Option<LoginTokens>,
     delay: Duration,
@@ -142,6 +141,7 @@ async fn one_refresh_request(
     request_seen: Option<oneshot::Sender<()>>,
     release_reply: Option<oneshot::Receiver<()>>,
 ) {
+    let (listener, acceptor) = listener_and_acceptor;
     let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
         .await
         .expect("refresh request arrives")
@@ -278,7 +278,7 @@ async fn sshsig_signing_uses_loaded_agent_key_from_public_key_path() {
     )
     .expect("parse SSH agent public key");
     let signature =
-        SshSig::from_pem(&fs::read_to_string(&output_path).expect("read SSH agent signature"))
+        SshSig::from_pem(fs::read_to_string(&output_path).expect("read SSH agent signature"))
             .expect("parse SSH agent signature");
     public_key
         .verify("kmesh-login", payload, &signature)
@@ -368,8 +368,7 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
     let (request_seen_tx, request_seen_rx) = oneshot::channel();
     let (release_reply_tx, release_reply_rx) = oneshot::channel();
     let server = tokio::spawn(one_refresh_request(
-        listener,
-        acceptor,
+        (listener, acceptor),
         "old-refresh-token",
         Some(new_tokens),
         Duration::ZERO,
@@ -484,8 +483,7 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
         .expect("set active user before uncertain refresh");
     let request_count = Arc::new(AtomicUsize::new(0));
     let server = tokio::spawn(one_refresh_request(
-        listener,
-        acceptor,
+        (listener, acceptor),
         "unknown-result-refresh-token",
         None,
         Duration::ZERO,
