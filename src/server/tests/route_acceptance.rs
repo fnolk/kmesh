@@ -12,11 +12,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use iroh::endpoint::VarInt;
 use iroh::{EndpointAddr, SecretKey};
 use iroh_relay::server::{Access, AccessControl, ClientRequest, DynAccessControl};
 use rcgen::generate_simple_self_signed;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -29,6 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use crate::{
+    client::{self, Cli, Command as ClientCommand},
     config::{Config, TlsConfig},
     identity,
     protocol::{
@@ -97,6 +100,10 @@ struct LocalServer {
 
 impl LocalServer {
     async fn start() -> Result<Self> {
+        Self::start_at(LOCAL_PRIVATE_QAD).await
+    }
+
+    async fn start_at(qad_bind: SocketAddr) -> Result<Self> {
         let port_probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let https_port = port_probe.local_addr()?.port();
         drop(port_probe);
@@ -122,7 +129,7 @@ impl LocalServer {
             super::super::router(fixture.state.clone()),
             Some(relay_access),
             SocketAddr::from(([127, 0, 0, 1], https_port)),
-            LOCAL_PRIVATE_QAD,
+            qad_bind,
             &cert_path,
             &key_path,
         )
@@ -323,20 +330,10 @@ async fn next_agent_control(
         .context("agent control message deadline elapsed")?
 }
 
-async fn drive_target(
-    server: &LocalServer,
-    target_id: Uuid,
-    agent_token: String,
-    device_key: SecretKey,
-    deny_private_relay: bool,
-    ssh_addr: Option<SocketAddr>,
-) -> Result<TargetEvidence> {
-    let mut agent_control =
-        connect_control_ws(&server.issuer, "agent/control", &agent_token, &server.tls).await;
+async fn wait_target_online(state: &super::super::ServerState, target_id: Uuid) -> Result<()> {
     timeout(Duration::from_secs(5), async {
         loop {
-            if server
-                .state()
+            if state
                 .inner
                 .online_agents
                 .read()
@@ -349,7 +346,20 @@ async fn drive_target(
         }
     })
     .await
-    .context("agent did not register as online")?;
+    .context("agent did not register as online")
+}
+
+async fn drive_target(
+    server: &LocalServer,
+    target_id: Uuid,
+    agent_token: String,
+    device_key: SecretKey,
+    deny_private_relay: bool,
+    ssh_addr: Option<SocketAddr>,
+) -> Result<TargetEvidence> {
+    let mut agent_control =
+        connect_control_ws(&server.issuer, "agent/control", &agent_token, &server.tls).await;
+    wait_target_online(server.state(), target_id).await?;
 
     let mut evidence = TargetEvidence::default();
     loop {
@@ -917,6 +927,97 @@ async fn wait_for_tunnel_status(
 }
 
 #[tokio::test]
+async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
+    let result = async {
+        let server = LocalServer::start_at(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let device_key = SecretKey::generate();
+        let (target_id, agent_token) =
+            create_enrolled_target(server.state(), "route-auth-denied-target", &device_key).await;
+        let config_path = server.client_config()?;
+        let client_data_dir = server.fixture.data_dir.join("route-client-state");
+        let profiles_dir = client_data_dir.join("profiles");
+        let hash_component = |value: &str| URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()));
+        let profile_dir = profiles_dir
+            .join(hash_component(&server.issuer))
+            .join(hash_component("route-acceptance"));
+        fs::create_dir_all(&profile_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for directory in [
+                client_data_dir.as_path(),
+                profiles_dir.as_path(),
+                profile_dir.as_path(),
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let tokens = super::login_password(server.state()).await;
+        let saved_login = serde_json::json!({
+            "server_url": server.issuer.clone(),
+            "profile": "route-acceptance",
+            "username": ADMIN_USERNAME,
+            "tokens": tokens,
+        });
+        let login_path = profile_dir.join(format!("{}.json", hash_component(ADMIN_USERNAME)));
+        fs::write(login_path, serde_json::to_vec(&saved_login)?)?;
+        fs::write(profile_dir.join("active-user"), ADMIN_USERNAME)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                profile_dir.join(format!("{}.json", hash_component(ADMIN_USERNAME))),
+                fs::Permissions::from_mode(0o600),
+            )?;
+            fs::set_permissions(
+                profile_dir.join("active-user"),
+                fs::Permissions::from_mode(0o600),
+            )?;
+        }
+
+        let _agent_control =
+            connect_control_ws(&server.issuer, "agent/control", &agent_token, &server.tls).await;
+        wait_target_online(server.state(), target_id).await?;
+        let sessions_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
+            .fetch_one(&server.state().inner.db.pool)
+            .await?;
+        let error = client::run(Cli {
+            config: Some(config_path),
+            data_dir: None,
+            profile: None,
+            server_url: None,
+            command: ClientCommand::Proxy { target_id },
+        })
+        .await
+        .expect_err("online target without a grant must be denied");
+        let error = format!("{error:#}");
+        ensure!(
+            error.contains("PrivateDirect")
+                && !error.contains("PublicDirect")
+                && !error.contains("PrivateRelay"),
+            "authorization denial retried a later route: {error}"
+        );
+        ensure!(
+            error.contains("forbidden") || error.contains("authorization"),
+            "server did not classify the missing ssh_connect grant as authorization: {error}"
+        );
+        let sessions_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
+            .fetch_one(&server.state().inner.db.pool)
+            .await?;
+        ensure!(
+            sessions_before == sessions_after,
+            "authorization denial persisted a tunnel session"
+        );
+        server.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        panic!("auth fast-stop acceptance failed: {error:#}");
+    }
+}
+
+#[tokio::test]
 #[ignore = "uses the SDK default QAD reflectors over UDP in the two direct attempts"]
 async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
     let result = async {
@@ -924,28 +1025,6 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
         let (target_id, agent_token, device_key) = enroll_and_grant_target(&server).await?;
         let config_path = server.client_config()?;
         login_client(&config_path).await?;
-
-        let before_auth_failure: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
-            .fetch_one(&server.state().inner.db.pool)
-            .await?;
-        let denied_output = run_proxy(&config_path, Uuid::new_v4(), &[]).await?;
-        ensure!(
-            !denied_output.status.success(),
-            "unauthorized target proxy unexpectedly succeeded"
-        );
-        let denied_stderr = String::from_utf8_lossy(&denied_output.stderr);
-        ensure!(
-            denied_stderr.matches("SSH route ").count() == 1
-                && denied_stderr.contains("SSH route PrivateDirect failed"),
-            "authorization failure retried another route: {denied_stderr}"
-        );
-        let after_auth_failure: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
-            .fetch_one(&server.state().inner.db.pool)
-            .await?;
-        ensure!(
-            before_auth_failure == after_auth_failure,
-            "unauthorized Open created a tunnel session"
-        );
 
         let (ssh_addr, ssh_task) = start_ssh_fixture().await?;
         let (output, target_evidence) = tokio::join!(
@@ -1029,6 +1108,102 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
     .await;
     if let Err(error) = result {
         panic!("route acceptance failed: {error:#}");
+    }
+}
+
+#[tokio::test]
+async fn client_auth_failure_is_terminal_for_an_online_enrolled_target() {
+    let result = async {
+        let server = LocalServer::start_at(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let device_key = SecretKey::generate();
+        let (target_id, agent_token) =
+            create_enrolled_target(server.state(), "route-auth-denied-target", &device_key).await;
+        let config_path = server.client_config()?;
+        let client_data_dir = server.fixture.data_dir.join("route-client-state");
+        let profiles_dir = client_data_dir.join("profiles");
+        let hash_component = |value: &str| URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()));
+        let profile_dir = profiles_dir
+            .join(hash_component(&server.issuer))
+            .join(hash_component("route-acceptance"));
+        fs::create_dir_all(&profile_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for directory in [
+                client_data_dir.as_path(),
+                profiles_dir.as_path(),
+                profile_dir.as_path(),
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let tokens = super::login_password(server.state()).await;
+        let saved_login = serde_json::json!({
+            "server_url": server.issuer,
+            "profile": "route-acceptance",
+            "username": ADMIN_USERNAME,
+            "tokens": tokens,
+        });
+        let login_path = profile_dir.join(format!("{}.json", hash_component(ADMIN_USERNAME)));
+        fs::write(&login_path, serde_json::to_vec(&saved_login)?)?;
+        fs::write(profile_dir.join("active-user"), ADMIN_USERNAME)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&login_path, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(
+                profile_dir.join("active-user"),
+                fs::Permissions::from_mode(0o600),
+            )?;
+        }
+
+        let _agent_control =
+            connect_control_ws(&server.issuer, "agent/control", &agent_token, &server.tls).await;
+        wait_target_online(server.state(), target_id).await?;
+        let has_grant: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM target_permissions WHERE target_id = ?1 \
+             AND permission = 'ssh_connect')",
+        )
+        .bind(target_id.to_string())
+        .fetch_one(&server.state().inner.db.pool)
+        .await?;
+        ensure!(
+            has_grant == 0,
+            "auth fast-stop fixture unexpectedly has ssh_connect"
+        );
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
+            .fetch_one(&server.state().inner.db.pool)
+            .await?;
+        let error = client::run(Cli {
+            config: Some(config_path),
+            data_dir: None,
+            profile: None,
+            server_url: None,
+            command: ClientCommand::Proxy { target_id },
+        })
+        .await
+        .expect_err("online target without an ssh_connect grant must be denied");
+        let error = format!("{error:#}");
+        ensure!(
+            error.contains("PrivateDirect")
+                && !error.contains("PublicDirect")
+                && !error.contains("PrivateRelay"),
+            "authorization failure retried a later route: {error}"
+        );
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_sessions")
+            .fetch_one(&server.state().inner.db.pool)
+            .await?;
+        ensure!(
+            before == after,
+            "authorization denial created a tunnel session"
+        );
+        drop(_agent_control);
+        server.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        panic!("auth fast-stop acceptance failed: {error:#}");
     }
 }
 
