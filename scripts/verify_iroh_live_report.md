@@ -1,89 +1,53 @@
-# Historical Iroh SSH verification report — earlier route implementation
+# kmesh SSH acceptance report — source `eb359f7`
 
-> **Scope:** This report preserves the 2026-10-03 evidence gathered from several earlier source and binary revisions listed below. Those revisions used the former private/public-default route model; in particular, the public-default runs could carry SSH data over an official Iroh relay. Current `PrivateDirect` and `PublicDirect` endpoints disable relay data paths, and only `PrivateRelay` carries SSH through the self-hosted relay. None of the path outcomes below verifies the current three-route design.
+Source revision: `eb359f76d09ab1d58c3d6ec7cd8f9d42aefcc12e`.
 
-> **Current acceptance status (2026-10-04):** The route-aware fallback run on candidate `be3ca70` exposed a control-message race when `ContinueNative(Standard)` arrives during client QAD discovery. Client-side correction `a27a1b1` is committed on its isolated branch; the target-agent correction and rerun are pending integration. Current direct SSH over `target-1`, the fallback path, and four-platform release artifacts remain unaccepted until a final candidate report records the exact source revision, hashes, and selected path for each connection.
+- Client (`aarch64-apple-darwin`) SHA-256: `770681ecf3b2c4f428db9be9dafabb1e647aab34bbedb1101250bfdceb623aeb`.
+- Server and target agent (`x86_64-unknown-linux-musl`) SHA-256: `7f0e52310289670764b42dbe4cd62795b6aa7f9a7c91b926b4450cc17e1553e9`.
+- Full source/build/test checks and all four release artifact hashes: [build-validation.md](../docs/build-validation.md) and `/Users/example/.cache/kmesh-release-validation/eb359f7/artifacts/manifest.txt`.
 
-Test date: 2026-10-03. The checks used `https://192.0.2.11:9443` and the existing OpenSSH management connection to `target-1`. No long-duration test was run.
+## P2P SSH routes
 
-## Artifacts and service state
+Both reports show each command was gated on an Iroh `Direct` path before SSH bytes were sent. Each command returned `server-1`, observed its marker, and exited with code 23. The selected IPv4 peer and same-path SSH UDP byte deltas were:
 
-The deployment refresh used code revision `548523fc39dffdef84ec9edbd574ac8d944bf38b`:
+| Route | Attempt | Peer | TX/RX bytes |
+|---|---:|---|---:|
+| `PrivateDirect` | 1 | `192.0.2.19:2111` | `10477/10588` |
+| `PrivateDirect` | 2 | `192.0.2.19:2157` | `11617/10727` |
+| `PrivateDirect` | 3 | `192.0.2.19:2158` | `8692/10234` |
+| `PublicDirect` | 1 | `192.0.2.19:4170` | `13212/11772` |
+| `PublicDirect` | 2 | `192.0.2.19:4171` | `10589/12016` |
+| `PublicDirect` | 3 | `192.0.2.19:4172` | `10475/11660` |
 
-| Artifact | SHA-256 |
-|---|---|
-| macOS ARM64 client | `8006a171094a97407feca3143eaf38db47f037b394e7ea987a95d07bb080c56b` |
-| Linux x86_64 musl server/agent | `3b4ae4f4a4c29fec9a62ef29f66b3db8e40d007ffcbd5a25ad589df084d3bb87` |
+Reports: [`PrivateDirect run`](</Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261004T033933Z/report.json>) and [`PublicDirect run`](</Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261004T034050Z/report.json>).
 
-The Linux x86_64 musl artifact was installed on the server and target under `/opt/kmesh-iroh-verification`; its SHA-256 was verified on both hosts before the new services were stopped and atomically refreshed. The macOS ARM64 client ran locally from `/Users/example/GitHub/kmesh/target/aarch64-apple-darwin/release/kmesh`. The schema 3 SQLite database, user/role/target records, target UUID, and persistent agent identity were reused. The original verification binary, database, TLS files, and units remain intact for rollback.
+## Short OpenSSH suite
 
-The target is `target-1-iroh-e423a4a7`, UUID `00000000-0000-4000-8000-000000000006`. Test user `kmesh-verify-e423a4a7` has role UUID `00000000-0000-4000-8000-000000000005`. Its agent config points to `127.0.0.1:22`, verified from the existing target configuration. At the end of the checks, the new private server and its target agent were active; the old verification units remained stopped.
+The private-mode suite report is `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/ssh-suite-eb359f7/ssh-private-20261004T034407Z-5af0d8a3/report.json`. It completed with `status=passed`, 52 passing steps, four expected-observation steps, and no cleanup errors. Coverage included:
 
-## Login and SSH checks
+- 1 MiB SCP upload/SFTP download with matching SHA-256 `943d64207a10f875aac2b4129149d37594bb170381b1e2e37b192bbec07600cb`.
+- A local SSH banner through forwarding; strict rejection of a wrong host key.
+- ControlMaster reuse, a five-second idle stream, two concurrent channels, and a cancelled channel while the master remained alive.
+- Existing activated sessions continued through grant revocation, target disable, and logout; new transports were denied, then access was restored by fresh login.
 
-Password login succeeded. SSHSIG public-key login also succeeded using a temporary Ed25519 key and a dedicated temporary `SSH_AUTH_SOCK`. The test key fingerprint was `SHA256:4qgLlCt0LDdNygvtSbXFf1Gwva6wThM5u3WsdkGV1eI`; its key ID is `00000000-0000-4000-8000-000000000004`. The private key was removed and the dedicated agent stopped. The saved login file had mode `0600`; its profile directories had mode `0700`.
+The generated suite uses a real OpenSSH client and `target-1` target. Long-duration sessions and 1 GiB transfer tests were cancelled and are not claimed.
 
-OpenSSH read the target's Ed25519 host key through the authenticated management connection and used strict host-key checking. SSH returned hostname `server-1` and exit code 23. A separately generated wrong host key was rejected.
+## Control restart while SSH is active
 
-The private-mode extended checks used the 423 release. SCP upload and SFTP download of a 1 MiB file had matching SHA-256 `300177b25e71361eef91e5e2c03727df794f35e3cfcb93003e1e81fa06b4a152`. A local forward returned `SSH-2.0-OpenSSH_7.4`. ControlMaster served repeated commands, SCP/SFTP, and the forward through one kmesh proxy. During RBAC revocation the existing master continued to run a command, while a new transport was denied. The grant was restored, the temporary remote file was removed, and cleanup reported no errors.
+Report `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261004T034551Z/report.json` records a private server control restart while an eight-second SSH command was in flight. The command returned `server-1`, its marker, and exit 23 on direct path `192.0.2.19:2164`, with same-path TX/RX byte deltas `12945/11957`; the target was online after restart. Session ID: `00000000-0000-4000-8000-000000000002`.
 
-After the 548 control-session fix, the public-mode extended run passed the same file, forward, host-key, ControlMaster, and RBAC checks. Its 1 MiB round-trip SHA-256 was `9f92d9eaffc148f513cdfa46c1a652ec945af2c81aabf2041c5d4f8964269911`. Two fresh SSH connections under the same saved kmesh login session also succeeded; both reports contain the same one-way auth-session fingerprint `fb1e811dd5b058151c2754bea7eb83252730163700fff4e683e278c9a199734d`.
+## Bounded transfer, interaction, and memory sample
 
-## Iroh candidates and selected paths
+The report `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/perf-eb359f7-20261004/report.json` records one `PrivateDirect` ControlMaster sample on `192.0.2.19:2123`: two independent random 4 MiB SCP transfers completed concurrently with exit code 0 and matching local/remote SHA-256; the same direct path `192.0.2.19:2123` stayed selected, and transfer time was 1.462 seconds. Four interactive echoes returned in 58.943, 468.781, 517.340, and 50.795 ms. Each probe started with two active transfers; the first three ended with two active, and the final probe ended with zero active. The 24 RSS samples cover proxy PID 90414 only: min/median/max 21,568/22,960/22,976 KiB. The data phase had a 25-second cap. Temporary files, ControlMaster, and proxy were cleaned up; A/B were active, the target online and enabled, database integrity and grants were intact, active and pending session counts were zero, and B retained UDP 3478/TCP 9443. This is a single bounded sample; it establishes no SLO or long-term capacity estimate.
 
-Both 548 probes kept SSH active for 8 seconds and recorded the selected path plus endpoint diagnostics. The PublicDefault probe reported:
+## Private-relay fallback scope
 
-- Target candidate addresses: `10.0.0.1:36451`, `10.0.0.4:36451`, `10.0.0.5:36451`, and public QAD address `192.0.2.19:4150`.
-- Client QAD report: `udp_v4=true`, `global_v4=192.0.2.12:11351`, `mapping_varies_by_dest_ipv4=Some(false)`.
-- Selected path: `relay:https://aps1-1.relay.n0.iroh.link./`; no direct-path selection event appeared during the 8-second session.
+The kmesh CLI passed two controlled route-acceptance tests. The successful test timed out two direct attempts, then selected the local private relay and moved SSH-stub bytes over that Iroh path. The failure test denied the private relay and verified closed sessions with no active rows. The success fixture recorded relay path TX/RX deltas `146/113`, a 22-byte SSH request, and 52 proxy stdout bytes. These are current-code CLI/control/transport tests with a local SSH stub; they are not a live forced private-relay SSH connection to `target-1`.
 
-The private-mode probe reported:
+A real private-relay fallback was observed under the earlier source `4e629ad`: after `PrivateDirect` and `PublicDirect` timeouts, `target-1` completed SSH through `https://192.0.2.11:9443/`. This is historical evidence for 4e only, not a claim that kmesh was forced through the relay in the live short suite.
 
-- Target candidate addresses: `10.0.0.1:59997`, `10.0.0.4:59997`, `10.0.0.5:59997`, and public QAD address `192.0.2.19:4182`.
-- Client QAD report: `udp_v4=true`, `global_v4=192.0.2.12:11462`, `mapping_varies_by_dest_ipv4=None`. This private-mode report used one configured relay; no conclusion about mapping variation beyond that report is recorded.
-- Selected path: `relay:https://192.0.2.11:9443/`; no direct-path selection event appeared during the 8-second session.
+## QAD cleanup correction
 
-These observations confirm that this run exchanged public target candidates and the client obtained a QAD IPv4 mapping. They show the paths selected for these SSH streams; they do not establish direct P2P success or the cause of relay selection. The target-side NetReport value was not captured separately.
+The earlier public-direct run on source 4e returned only a LAN candidate and timed out waiting for the target Iroh connection. Its report did not contain paired QAD observations or target-side discovery logs. A later standalone diagnostic isolated a deadline issue: the old two-second deadline also covered Noq driver shutdown and returned Unavailable while waiting for connections to drain. With a separate cleanup budget, the diagnostic obtained two authenticated official UDP 7842 observations on the same retained socket, both reporting `192.0.2.12:12008`; probing took 1338 ms, cleanup 2430 ms, and total time 3813 ms. Its evidence is `/Users/example/.cache/kmesh-build/public-qad-evidence-4e629ad/public-qad-after-cleanup.json` and the artifact is separate from the production CLI. kmesh includes the QAD deadline fix and passes live `PublicDirect` 3/3 above.
 
-## Latest direct SSH result
-
-The reverse-dial PublicDefault SSH run recorded fresh A and C NetReports. Across three reflectors, A reported the same `192.0.2.19:4152` with `mapping_varies_by_dest_ipv4=Some(false)`; C reported the same `192.0.2.12:12632` with `Some(false)`. The endpoints exchanged their public and local candidates, and C logged 23 off-path probes per A candidate. OpenSSH still selected `relay:https://euc1-1.relay.n0.iroh.link./`; this run did not achieve P2P.
-
-The portmapper-enabled Private SSH check used Linux agent SHA-256 `45b6c9dd8b6a1c92b6385860978925c84e535b92625382fd2b31aecf897040b8` and macOS ARM64 client SHA-256 `bac2df1e0afbe128f961d0d480dfb8108c536ccc9b24dd961cbffb85ac6800bb`. SSH returned `server-1`, the completion marker, and expected exit code 23 after no Direct path was selected within 10.06 seconds. Its path remained `relay:https://192.0.2.11:9443/`, so `ssh_status=passed` and `p2p_status=failed`. The private-relay QAD observations were `192.0.2.19:4187` on A and `192.0.2.12:12484` on C; each used one reflector, so both `mapping_varies_by_dest_ipv4` values were `None`. These QAD addresses are not portmapper mappings.
-
-Portmapper logs record mapping attempts and UPnP failure, with no successful mapping event or external mapped address. With `portmapper=trace,igd_next=debug`, C logged SSDP broadcasts to `239.255.255.250:1900` followed by `UPnP mapping failed`. A’s earlier portmapper-enabled Private SSH run, with `portmapper=debug`, recorded two mapping attempts for `10.0.0.4:34870` followed by the same failure. Separate Doctor three-protocol probes completed with exit 0 on both C and A and reported `UPnP=false`, `PCP=false`, and `NAT-PMP=false`. C logged PCP `IO error during PCP`, NAT-PMP `Connection refused`, and UPnP `No response within timeout`; A logged PCP `IO error during PCP`, NAT-PMP `read timeout`, and UPnP `No response within timeout`. The Doctor evidence is under `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/taskcache/runs/gateway-probe-20261003/`. These results report the detected protocol state for those probe runs; they do not establish the location of peer UDP loss.
-
-In the latest gated SSH run, C logged 19 Noq probes of 35 bytes to A’s public candidate `192.0.2.19:4188`; `iroh::socket::transports` recorded 19 `sent transmit` events to that address and no send errors or pending drops. Before the run, `ss -4` confirmed the single kmesh IPv4 UDP listener at `*:39278` (PID 5675); a separate IPv6 listener uses port 32865. A’s 15-second physical `ens1f0` capture filtered on UDP port 39278 saw 34 packets, all A→C: 17 from `10.0.0.4:39278` to `192.0.2.12:13254` and 17 to `10.0.0.6:56674`, each destination receiving 16 UDP payloads of 35 bytes and one of 1200 bytes. It saw no C→A packet to the listener and dropped none in the kernel. SSH still used the relay and P2P remains unmet. The sender logs show C’s UDP send call returned success; the physical-interface capture shows no reverse packet at A, leaving its loss location unknown.
-
-Read-only host inspection found iptables INPUT/FORWARD policies `ACCEPT`, no matching DROP rule, and firewalld not running. CNI forwarding rules target `virbr0`; the CNI admin chain is empty. The `net.bridge.bridge-nf-call-iptables` sysctl path was absent. A routes C through `br0`; its bridge members are `ens1f0` and `tap0`. C-side `en0` capture remains unavailable because `/dev/bpf0` is root-only mode `0600`; it is still needed to correlate C’s interface traffic with the A-side capture.
-
-After the run, the private server and new agent were active, the public server was inactive, the agent environment was empty, and server B retained its 763 binary. The latest report is `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-private-ens1f0-gated/report.json`; its client stderr and `target-1-ens1f0-39278.txt` capture are mode `0600` beside it. Capture SHA-256: `5779f7c0c3ae8ecb4c3f078714743aff27a33f1e18841a24029e554eb08de82c`. The prior portmapper and br0 evidence is under `runs/run-20261003-private-socket-send/`.
-
-## Direct-first same-connection SSH attempt
-
-The target agent binary was built from worker commit `0f5949d8676708b83677bf74d271f76569dd74b9`; its tree `150ae6d08301ffd5f212cf9e6203f76ec15faa5f` matches primary commit `d96a103220aa077818933a803977a4552629cba6`. Linux x86_64 musl artifact SHA-256 is `f1324d606f10b4c4d6459d7b9313e782f8a786e1d43101ab76162fe99bf59c92`; the prior target binary `45b6c9dd8b6a1c92b6385860978925c84e535b92625382fd2b31aecf897040b8` remains as a SHA-named backup. The macOS ARM64 client remained `bac2df1e0afbe128f961d0d480dfb8108c536ccc9b24dd961cbffb85ac6800bb`; server B remained on binary SHA `32dbb6d670ab7b425b04d8229d36c8191bfd46237be78e0bd5706297f8439c9a`. The existing schema 3 data, target UUID, credentials, and device identity were reused.
-
-Two bounded SSH samples used the existing OpenSSH `ProxyCommand`. The client waited up to 8 seconds for a selected Direct path before sending `hostname`, a completion marker, and expected exit 23. The agent waited up to 2 seconds for a selected IP path on that same QUIC connection before opening its bidirectional stream and writing the ticket.
-
-| Relay mode | SSH result | Client path result | Agent path before ticket | P2P result |
-|---|---|---|---|---|
-| Private | `server-1`, marker observed, exit 23 | 8.057-second wait; selected path remained `relay:https://192.0.2.11:9443/` | `direct_selected=false`; only the selected private relay appeared in the path snapshot | Failed; no Direct path selected |
-| PublicDefault | `server-1`, marker observed, exit 23 | 8.086-second wait; selected path remained `relay:https://aps1-1.relay.n0.iroh.link./` | `direct_selected=false`; only the selected public relay appeared in the path snapshot | Failed; no Direct path selected |
-
-The agent snapshots show only relay paths before ticket setup and before SSH byte forwarding. When `copy_bidirectional` later returned `connection lost`, the private relay counters changed from TX/RX `10904/8504` to `15980/12736` (delta `+5076/+4232`); the PublicDefault relay counters changed from `10894/8453` to `15948/12733` (delta `+5054/+4280`). These are aggregate QUIC path counters, not SSH-only byte counts. The client-side end-of-stream SSH byte summary was absent in both reports, so no SSH-only counter is claimed. Both SSH commands succeeded over their observed relay path; both P2P checks failed. The experiments do not establish why direct paths were not selected, or that the 2-second observation window ends SDK path discovery.
-
-Raw evidence is mode `0600` at these exact paths:
-
-- Private C stderr: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-private/path-probe-private.stderr`
-- Private A snapshots: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-private/agent-path-probe-private-late.log`
-- Private report JSON: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-private/report.json`
-- Public C stderr: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-public/path-probe-public-default.stderr`
-- Public A snapshots: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-public/agent-path-probe-public.log`
-- Public report JSON: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-public/report.json`
-- Private restore report: `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/run-20261003-direct-wait-d96a103-restore/report.json`
-
-After the PublicDefault comparison, Private mode was restored. Server B's private unit and target A's agent are active, the public server unit is inactive, server B still has binary SHA `32dbb6d670ab7b425b04d8229d36c8191bfd46237be78e0bd5706297f8439c9a`, target A runs binary SHA `f1324d606f10b4c4d6459d7b9313e782f8a786e1d43101ab76162fe99bf59c92`, the old target binary remains backed up under SHA `45b6c9dd8b6a1c92b6385860978925c84e535b92625382fd2b31aecf897040b8`, and the target is online. The temporary agent `RUST_LOG` override was removed; the active agent reports an empty environment. No third SSH sample was run.
-
-## Evidence files
-
-The preflight, stage, 423 baseline, login, and 548 refresh reports are under `/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/`. The 548 public extended report is `runs/run-20261003-iroh-upgrade-548523f/public-extended/ssh-public-default-20261003T033346Z-9cb0e000/report.json`. The 548 public and private debug reports are `runs/run-20261003-public548-debugprobe-2/report.json` and `runs/run-20261003-private548-debugprobe/report.json`. Their original stderr files are mode `0600` beside each report. Reports contain no password, refresh token, enrollment token, or private-key contents.
+The prior 4e short-suite harness report ended in a client-process cleanup failure; the script-only harness correction is separate from Rust and binary revisions. Current kmesh's complete suite report above passes.
