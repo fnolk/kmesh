@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    future::Future,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, anyhow};
 use iroh::{Endpoint, SecretKey};
@@ -18,9 +21,9 @@ use crate::{
         TunnelTicketClaims,
     },
     transport::{
-        IrohByteStream, RelayChoice, TransportError, connect_peer, create_endpoint,
-        discover_ipv4_mappings, snapshot_iroh_paths, validate_endpoint_addr, wait_endpoint_ready,
-        wait_for_selected_path,
+        IrohByteStream, MappingDiscovery, RelayChoice, TransportError, connect_peer,
+        create_endpoint, discover_ipv4_mappings, snapshot_iroh_paths, validate_endpoint_addr,
+        wait_endpoint_ready, wait_for_selected_path,
     },
 };
 
@@ -29,6 +32,49 @@ use super::{
     route::endpoint_options, server_session_error, transport_error,
 };
 use super::{control::next_session_message, punch::run_target_punch};
+
+async fn wait_for_target_qad_discovery<F>(
+    discovery: F,
+    control_rx: &mut mpsc::Receiver<ControlMessage>,
+    session_id: Uuid,
+    route_mode: RouteMode,
+    setup_deadline: Instant,
+) -> Result<Option<(MappingDiscovery, bool)>>
+where
+    F: Future<Output = std::result::Result<MappingDiscovery, TransportError>>,
+{
+    let mut discovery = Box::pin(discovery);
+    let mut native_plan_received = false;
+    loop {
+        tokio::select! {
+            biased;
+            control = next_session_message(control_rx, session_id, setup_deadline) => {
+                match control? {
+                    None => return Ok(None),
+                    Some(ControlMessage::ContinueNative {
+                        session_id: received,
+                        route_mode: received_mode,
+                        plan: NativePlan::Standard,
+                    }) if received == session_id && received_mode == route_mode => {
+                        ensure_auth(
+                            !native_plan_received,
+                            "server repeated the native plan during target QAD discovery",
+                        )?;
+                        native_plan_received = true;
+                    }
+                    Some(_) => {
+                        return Err(anyhow!(AgentAuthenticationFailure(
+                            "server sent an unexpected message during target QAD discovery".to_owned()
+                        )));
+                    }
+                }
+            }
+            result = &mut discovery => {
+                return Ok(Some((result.map_err(anyhow::Error::new)?, native_plan_received)));
+            }
+        }
+    }
+}
 
 pub(super) async fn run_agent_session(
     context: &ClientContext,
@@ -97,22 +143,21 @@ pub(super) async fn run_agent_session(
     )
     .context("build target route transport plan")?;
     let mut discovered = None;
+    let mut native_plan_received = false;
     if let Some(qad_plan) = route_plan.qad_plan {
         let discovery_deadline = std::cmp::min(deadline, Instant::now() + DIRECT_PUNCH_TIMEOUT);
-        let discovery = tokio::select! {
-            biased;
-            control = next_session_message(&mut control_rx, session_id, deadline) => {
-                match control? {
-                    None => return Ok(()),
-                    Some(_) => return Err(anyhow!(AgentAuthenticationFailure(
-                        "server sent a control message before target candidate discovery completed".to_owned()
-                    ))),
-                }
-            }
-            result = discover_ipv4_mappings(&qad_plan, &context.config.tls, discovery_deadline) => {
-                result.map_err(anyhow::Error::new)?
-            }
+        let Some((discovery, native_plan_already_selected)) = wait_for_target_qad_discovery(
+            discover_ipv4_mappings(&qad_plan, &context.config.tls, discovery_deadline),
+            &mut control_rx,
+            session_id,
+            route_mode,
+            deadline,
+        )
+        .await?
+        else {
+            return Ok(());
         };
+        native_plan_received = native_plan_already_selected;
         let discovery_message = match discovery {
             crate::transport::MappingDiscovery::Ready(found) => {
                 let message = DiscoveryResult::Ready {
@@ -136,61 +181,65 @@ pub(super) async fn run_agent_session(
             .context("report target QAD candidate discovery")?;
     }
 
-    let first_native_message =
-        match next_session_message(&mut control_rx, session_id, deadline).await? {
-            None => return Ok(()),
-            Some(message) => message,
-        };
-    let (handoff, selection) = match first_native_message {
-        ControlMessage::ContinueNative {
-            session_id: received,
-            route_mode: mode,
-            plan: NativePlan::Standard,
-        } if received == session_id && mode == route_mode => {
-            (discovered.take().map(|found| found.handoff_options()), None)
-        }
-        ControlMessage::PunchPair {
-            session_id: received,
-            route_mode: mode,
-            target_endpoint_id,
-            client_endpoint_id: paired_client_id,
-            peer_discovery,
-        } if received == session_id && mode == route_mode => {
-            ensure_auth(
-                target_endpoint_id == data_id.to_string(),
-                "server paired a different per-session target EndpointId",
-            )?;
-            ensure_auth(
-                paired_client_id == client_endpoint_id,
-                "server paired a different client EndpointId",
-            )?;
-            let discovered = discovered.take().ok_or_else(|| {
-                anyhow!(AgentAuthenticationFailure(
-                    "server requested UDP punching without successful QAD discovery".to_owned()
-                ))
-            })?;
-            let Some(native) = run_target_punch(
-                session_id,
-                route_mode,
-                data_id,
-                client_id,
-                data_key.clone(),
-                discovered,
-                peer_discovery,
-                &mut control_rx,
-                &outbound,
-                deadline,
-            )
-            .await?
-            else {
-                return Ok(());
+    let (handoff, selection) = if native_plan_received {
+        (discovered.take().map(|found| found.handoff_options()), None)
+    } else {
+        let first_native_message =
+            match next_session_message(&mut control_rx, session_id, deadline).await? {
+                None => return Ok(()),
+                Some(message) => message,
             };
-            native
-        }
-        _ => {
-            return Err(anyhow!(AgentAuthenticationFailure(
-                "server sent an unexpected response to target QAD candidates".to_owned()
-            )));
+        match first_native_message {
+            ControlMessage::ContinueNative {
+                session_id: received,
+                route_mode: mode,
+                plan: NativePlan::Standard,
+            } if received == session_id && mode == route_mode => {
+                (discovered.take().map(|found| found.handoff_options()), None)
+            }
+            ControlMessage::PunchPair {
+                session_id: received,
+                route_mode: mode,
+                target_endpoint_id,
+                client_endpoint_id: paired_client_id,
+                peer_discovery,
+            } if received == session_id && mode == route_mode => {
+                ensure_auth(
+                    target_endpoint_id == data_id.to_string(),
+                    "server paired a different per-session target EndpointId",
+                )?;
+                ensure_auth(
+                    paired_client_id == client_endpoint_id,
+                    "server paired a different client EndpointId",
+                )?;
+                let discovered = discovered.take().ok_or_else(|| {
+                    anyhow!(AgentAuthenticationFailure(
+                        "server requested UDP punching without successful QAD discovery".to_owned()
+                    ))
+                })?;
+                let Some(native) = run_target_punch(
+                    session_id,
+                    route_mode,
+                    data_id,
+                    client_id,
+                    data_key.clone(),
+                    discovered,
+                    peer_discovery,
+                    &mut control_rx,
+                    &outbound,
+                    deadline,
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
+                native
+            }
+            _ => {
+                return Err(anyhow!(AgentAuthenticationFailure(
+                    "server sent an unexpected response to target QAD candidates".to_owned()
+                )));
+            }
         }
     };
 
@@ -592,5 +641,60 @@ async fn wait_activated(
             }) if received == session_id => return Ok(false),
             Some(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn early_native_plan_does_not_cancel_target_qad_discovery() {
+        let session_id = Uuid::new_v4();
+        let (control_sender, mut control_receiver) = mpsc::channel(1);
+        let (discovery_started, started) = oneshot::channel();
+        let (finish_discovery, finish) = oneshot::channel();
+        let plan_sender = control_sender.clone();
+        let plan_task = tokio::spawn(async move {
+            started.await.expect("QAD discovery did not start");
+            plan_sender
+                .send(ControlMessage::ContinueNative {
+                    session_id,
+                    route_mode: RouteMode::PrivateDirect,
+                    plan: NativePlan::Standard,
+                })
+                .await
+                .expect("send early native plan");
+            finish_discovery
+                .send(())
+                .expect("finish QAD discovery after native plan");
+        });
+        let discovery = async move {
+            discovery_started.send(()).expect("announce QAD start");
+            finish.await.expect("QAD fixture release");
+            Ok(MappingDiscovery::Unavailable {
+                reason: "controlled QAD timeout".to_owned(),
+            })
+        };
+
+        let (result, native_plan_received) = wait_for_target_qad_discovery(
+            discovery,
+            &mut control_receiver,
+            session_id,
+            RouteMode::PrivateDirect,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("wait for early native plan and QAD result")
+        .expect("session remained active during QAD discovery");
+
+        assert!(native_plan_received);
+        assert!(matches!(
+            result,
+            MappingDiscovery::Unavailable { ref reason }
+                if reason == "controlled QAD timeout"
+        ));
+        plan_task.await.expect("early-plan task panicked");
     }
 }
