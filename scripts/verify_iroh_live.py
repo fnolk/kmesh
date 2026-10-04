@@ -39,6 +39,9 @@ OLD_AGENT_UNIT = "kmesh-verification-agent.service"
 SERVER_PRIVATE_UNIT = "kmesh-iroh-verification-server-private.service"
 SERVER_PUBLIC_UNIT = "kmesh-iroh-verification-server-public.service"
 AGENT_UNIT = "kmesh-iroh-verification-agent@.service"
+SSH_CONNECT_TIMEOUT_SECONDS = 65
+SSH_COMMAND_TIMEOUT_SECONDS = 15
+SSH_NEW_CONNECTION_TIMEOUT_SECONDS = SSH_CONNECT_TIMEOUT_SECONDS + SSH_COMMAND_TIMEOUT_SECONDS
 ADMIN_PASSWORD_DEFAULT = Path("/Users/example/.cache/kmesh-live/server/admin-password")
 CA_DEFAULT = Path("/Users/example/.cache/kmesh-live/server/ca.pem")
 STATE_DEFAULT = Path("/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003")
@@ -441,7 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--reuse-login", action="store_true")
     subparsers.add_parser("key-login", help="verify SSHSIG login with an isolated temporary ssh-agent")
     probe = subparsers.add_parser("path-probe", help="run fresh direct-gated SSH path samples")
-    probe.add_argument("--seconds", type=int, default=8)
+    probe.add_argument("--seconds", type=int, default=SSH_CONNECT_TIMEOUT_SECONDS)
     probe.add_argument("--repetitions", type=int, default=3)
     probe.add_argument("--ssh-config", type=Path, default=None)
     probe.add_argument(
@@ -1322,7 +1325,7 @@ def write_ssh_config(
         "  BatchMode yes\n"
         "  StrictHostKeyChecking yes\n"
         f"  UserKnownHostsFile {known_hosts}\n"
-        "  ConnectTimeout 15\n"
+        f"  ConnectTimeout {SSH_CONNECT_TIMEOUT_SECONDS}\n"
         "  ServerAliveInterval 20\n"
         "  ServerAliveCountMax 2\n"
     )
@@ -1616,7 +1619,7 @@ def verify(harness: Harness, *, reuse_login: bool = False) -> None:
         "ssh-hostname-exit-23",
         command,
         env=env,
-        timeout=30,
+        timeout=SSH_NEW_CONNECTION_TIMEOUT_SECONDS,
         accepted=(23,),
     )
     hostname = result.stdout.decode("utf-8", "replace").strip()
@@ -1702,8 +1705,10 @@ def _path_probe_sample(
     sample_index: int,
     restart_server_after_direct: bool,
 ) -> dict[str, Any]:
-    if not 1 <= seconds <= 30:
-        raise VerificationError("path probe duration must be between 1 and 30 seconds")
+    if not 1 <= seconds <= SSH_CONNECT_TIMEOUT_SECONDS:
+        raise VerificationError(
+            f"path probe duration must be between 1 and {SSH_CONNECT_TIMEOUT_SECONDS} seconds"
+        )
     state = harness.load_state()
     harness.report.setdefault(
         "deployment",
