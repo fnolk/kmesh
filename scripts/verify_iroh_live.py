@@ -56,6 +56,10 @@ QUIC_PATH_SAMPLE_RE = re.compile(
     r"kind=(?P<kind>Direct|Relay) selected=(?P<selected>true|false) "
     r"TX(?: delta)?=(?P<tx>\d+) RX(?: delta)?=(?P<rx>\d+)"
 )
+ROUTE_FAILURE_RE = re.compile(
+    r"SSH route (?P<route_mode>PrivateDirect|PublicDirect|PrivateRelay) failed after "
+    r"(?P<elapsed_ms>\d+) ms: (?P<message>.*)"
+)
 REMOTE_RUNNER = (
     "import json,subprocess,sys; "
     "secret=sys.stdin.buffer.read(); "
@@ -1339,6 +1343,21 @@ def selected_paths(stderr: bytes) -> list[dict[str, str]]:
     ]
 
 
+def route_attempt_failures(stderr: bytes, harness: Harness) -> list[dict[str, Any]]:
+    failures = []
+    for line in stderr.decode("utf-8", "replace").splitlines():
+        match = ROUTE_FAILURE_RE.search(line)
+        if match:
+            failures.append(
+                {
+                    "route_mode": match.group("route_mode"),
+                    "elapsed_ms": int(match.group("elapsed_ms")),
+                    "error": harness.redact(match.group("message")),
+                }
+            )
+    return failures
+
+
 def path_state_observations(stderr: bytes) -> list[dict[str, Any]]:
     observations: list[dict[str, Any]] = []
     for line_number, raw_line in enumerate(stderr.splitlines(), start=1):
@@ -1604,6 +1623,7 @@ def verify(harness: Harness, *, reuse_login: bool = False) -> None:
     if not hostname:
         raise VerificationError("SSH returned exit 23 without a hostname")
     path_events = selected_paths(result.stderr)
+    route_failures = route_attempt_failures(result.stderr, harness)
     if "deployment" in harness.report:
         harness.report["deployment"]["server_mode"] = state["server_mode"]
     harness.report["ssh_basic"] = {
@@ -1621,6 +1641,7 @@ def verify(harness: Harness, *, reuse_login: bool = False) -> None:
         "host_key_source": "Ed25519 public key read over authenticated management SSH",
         "known_hosts_alias": host_alias,
         "path_events_in_stderr_order": path_events,
+        "route_attempt_failures": route_failures,
         "initial_path": path_events[0] if path_events else None,
         "selected_path": path_events[-1] if path_events else None,
         "selected_path_observed": bool(path_events),
@@ -1929,6 +1950,7 @@ def _path_probe_sample(
     stderr_path.write_bytes(stderr)
     os.chmod(stderr_path, 0o600)
     path_events = selected_paths(stderr)
+    route_failures = route_attempt_failures(stderr, harness)
     path_state_events = path_state_observations(stderr)
     selected_path_events = [event for event in path_state_events if event["selected"]]
     final_selected_path = None
@@ -2013,6 +2035,7 @@ def _path_probe_sample(
         "direct_selected_path_ssh_udp_deltas": direct_selected_path_deltas,
         "direct_selected_path_udp_delta_observed": bool(direct_selected_path_deltas),
         "path_events_in_stderr_order": path_events,
+        "route_attempt_failures": route_failures,
         "path_state_observations_in_stderr_order": path_state_events,
         "initial_path": selected_path_events[0] if selected_path_events else None,
         "selected_path": final_selected_path,
