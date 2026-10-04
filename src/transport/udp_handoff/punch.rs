@@ -586,8 +586,8 @@ async fn send_packet(
 mod tests {
     use super::super::super::qad::QadReflector;
     use super::super::discovery::{PRIVATE_QAD_PORT, default_qad_configs};
-    use super::QadPlan;
     use super::*;
+    use crate::transport::QadPlan;
     use uuid::Uuid;
 
     fn private_qad_plan() -> QadPlan {

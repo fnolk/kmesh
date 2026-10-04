@@ -126,7 +126,10 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
     .await
     .expect("standalone QAD observation completes")
     .expect("self-hosted QAD handshake succeeds");
-    assert_eq!(qad_socket.local_addr().unwrap(), local_qad_socket);
+    assert_eq!(
+        qad_socket.local_addr().unwrap(),
+        SocketAddr::V4(local_qad_socket)
+    );
     assert_eq!(observations.len(), 1);
     let observation = &observations[0];
     assert_eq!(observation.local_socket, local_qad_socket);
