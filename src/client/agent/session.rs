@@ -368,7 +368,7 @@ pub(super) async fn handle_dial_offer(
         return Ok(());
     };
     let ticket_written = timeout_at(setup_deadline, async {
-        tokio::select! {
+        let result: Result<bool> = tokio::select! {
             biased;
             control = wait_for_setup_cancellation(offer.session_id, &mut control_rx) => {
                 control?;
@@ -378,7 +378,8 @@ pub(super) async fn handle_dial_offer(
                 result.context("send signed tunnel ticket to client")?;
                 Ok(true)
             }
-        }
+        };
+        result
     })
     .await
     .context("writing the signed ticket exceeded the route deadline")??;
