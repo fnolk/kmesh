@@ -938,15 +938,18 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
         );
 
         let (ssh_addr, ssh_task) = start_ssh_fixture().await?;
-        let target_task = tokio::spawn(drive_target(
-            &server,
-            target_id,
-            agent_token,
-            device_key,
-            false,
-            Some(ssh_addr),
-        ));
-        let output = run_proxy(&config_path, target_id, SSH_REQUEST).await?;
+        let (output, target_evidence) = tokio::join!(
+            run_proxy(&config_path, target_id, SSH_REQUEST),
+            drive_target(
+                &server,
+                target_id,
+                agent_token,
+                device_key,
+                false,
+                Some(ssh_addr),
+            )
+        );
+        let output = output?;
         assert_proxy_response(&output)?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         ensure!(
@@ -954,10 +957,7 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
                 && stderr.contains("SSH route PublicDirect failed"),
             "the real client did not report both direct attempts failing: {stderr}"
         );
-        let target_evidence = timeout(Duration::from_secs(15), target_task)
-            .await
-            .context("target route fixture did not finish")??
-            .context("target route fixture failed")?;
+        let target_evidence = target_evidence.context("target route fixture failed")?;
         ensure!(
             target_evidence.direct_attempts.len() == 2,
             "fixture did not observe both direct attempts: {:?}",
@@ -1030,15 +1030,11 @@ async fn client_reports_real_private_relay_refusal_after_direct_timeouts() {
         let (target_id, agent_token, device_key) = enroll_and_grant_target(&server).await?;
         let config_path = server.client_config()?;
         login_client(&config_path).await?;
-        let target_task = tokio::spawn(drive_target(
-            &server,
-            target_id,
-            agent_token,
-            device_key,
-            true,
-            None,
-        ));
-        let output = run_proxy(&config_path, target_id, &[]).await?;
+        let (output, target_evidence) = tokio::join!(
+            run_proxy(&config_path, target_id, &[]),
+            drive_target(&server, target_id, agent_token, device_key, true, None)
+        );
+        let output = output?;
         ensure!(
             !output.status.success(),
             "proxy succeeded after private relay refusal"
@@ -1065,10 +1061,7 @@ async fn client_reports_real_private_relay_refusal_after_direct_timeouts() {
             stderr.contains("denied") || stderr.contains("refused"),
             "final private relay failure lacks its authentication/refusal reason: {stderr}"
         );
-        let target_evidence = timeout(Duration::from_secs(15), target_task)
-            .await
-            .context("target refusal fixture did not finish")??
-            .context("target refusal fixture failed")?;
+        let target_evidence = target_evidence.context("target refusal fixture failed")?;
         ensure!(
             target_evidence.direct_attempts.len() == 2,
             "refusal test did not observe both direct attempts"
