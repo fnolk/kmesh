@@ -1,20 +1,27 @@
-use std::{io::BufReader, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    io::BufReader,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
-use iroh::{EndpointAddr, RelayUrl, SecretKey, Watcher, unstable_net_report::Probe};
+use iroh::{EndpointAddr, RelayUrl, SecretKey};
 use iroh_relay::server::{
     CertConfig, QuicConfig as RelayQuicConfig, RelayConfig as RelayHttpConfig,
     Server as RelayServer, ServerConfig as RelayServerConfig, TlsConfig as RelayTlsConfig,
 };
+use iroh_relay::tls::CaTlsConfig;
 use kmesh::{
     config::TlsConfig,
     transport::{
-        IrohEndpointOptions, RelayChoice, allowed_relay_urls, create_endpoint,
-        validate_endpoint_addr,
+        IrohEndpointOptions, QadReflector, RelayChoice, allowed_relay_urls, create_endpoint,
+        observe_ipv4_mappings, validate_endpoint_addr, wait_endpoint_ready,
     },
 };
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::PrivateKeyDer;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 struct TestCertificate(PathBuf);
@@ -47,7 +54,7 @@ fn relay_address_allowlist_is_scoped_to_direct_and_private_modes() {
 }
 
 #[tokio::test]
-async fn self_hosted_https_and_qad_report_the_observed_ipv4_address() {
+async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
@@ -88,7 +95,45 @@ async fn self_hosted_https_and_qad_report_the_observed_ipv4_address() {
     let relay_server = RelayServer::spawn(relay_config).await.unwrap();
 
     let https_addr = relay_server.https_addr().unwrap();
-    let qad_addr = relay_server.quic_addr().unwrap();
+    let SocketAddr::V4(qad_addr) = relay_server.quic_addr().unwrap() else {
+        unreachable!("the self-hosted QAD listener is bound to IPv4 loopback")
+    };
+
+    let mut ca_reader = BufReader::new(certificate_pem.as_bytes());
+    let ca_certs = rustls_pemfile::certs(&mut ca_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let ca_tls = CaTlsConfig::default().with_extra_roots(ca_certs);
+    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
+    let qad_tls = ca_tls.client_config(crypto_provider).unwrap();
+    let qad_socket = StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let local_qad_socket = qad_socket.local_addr().unwrap();
+    let reflector = QadReflector {
+        addr: qad_addr,
+        server_name: "127.0.0.1".to_owned(),
+    };
+    let (qad_socket, observations) = timeout(
+        Duration::from_secs(10),
+        observe_ipv4_mappings(
+            qad_socket,
+            qad_tls,
+            &[reflector],
+            Instant::now() + Duration::from_secs(10),
+        ),
+    )
+    .await
+    .expect("standalone QAD observation completes")
+    .expect("self-hosted QAD handshake succeeds");
+    assert_eq!(qad_socket.local_addr().unwrap(), local_qad_socket);
+    assert_eq!(observations.len(), 1);
+    let observation = &observations[0];
+    assert_eq!(observation.local_socket, local_qad_socket);
+    assert_eq!(*observation.observed_addr.ip(), Ipv4Addr::LOCALHOST);
+    assert!(observation.handshake_confirmed);
+    assert!(observation.udp_tx_datagrams > 0 && observation.udp_rx_datagrams > 0);
+    assert!(observation.udp_tx_bytes > 0 && observation.udp_rx_bytes > 0);
+    drop(qad_socket);
+
     let relay_url: reqwest::Url = format!("https://127.0.0.1:{}", https_addr.port())
         .parse()
         .unwrap();
@@ -112,33 +157,31 @@ async fn self_hosted_https_and_qad_report_the_observed_ipv4_address() {
     .await
     .unwrap();
 
-    timeout(Duration::from_secs(10), endpoint.online())
-        .await
-        .expect("self-hosted HTTPS relay connection completes");
-    let mut report_watcher = endpoint.net_report();
-    let report = timeout(Duration::from_secs(15), report_watcher.initialized())
-        .await
-        .expect("self-hosted QAD probe completes");
-
-    assert!(report.udp_v4, "QAD IPv4 probe completed");
-    assert_eq!(report.global_v4.unwrap().ip().to_string(), "127.0.0.1");
-    assert!(report.preferred_relay.as_ref() == Some(&expected_relay));
-    assert!(
-        report
-            .relay_latency
-            .iter()
-            .any(|(probe, url, _)| { probe == Probe::Https && url == &expected_relay })
-    );
-    assert!(
-        report
-            .relay_latency
-            .iter()
-            .any(|(probe, url, _)| { probe == Probe::QadIpv4 && url == &expected_relay })
-    );
+    let relay_choice = RelayChoice::Private {
+        url: format!("https://127.0.0.1:{}", https_addr.port())
+            .parse()
+            .unwrap(),
+        quic_port: qad_addr.port(),
+    };
+    timeout(
+        Duration::from_secs(10),
+        wait_endpoint_ready(
+            &endpoint,
+            &relay_choice,
+            Instant::now() + Duration::from_secs(10),
+        ),
+    )
+    .await
+    .expect("self-hosted HTTPS relay registration completes")
+    .expect("private endpoint registers with the relay");
     assert_eq!(
         endpoint.addr().relay_urls().cloned().collect::<Vec<_>>(),
         vec![expected_relay],
         "private endpoint publishes only its configured relay"
+    );
+    assert!(
+        endpoint.addr().ip_addrs().next().is_none(),
+        "private relay endpoint does not publish IP transports"
     );
 
     drop(endpoint);
