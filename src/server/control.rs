@@ -19,14 +19,14 @@ mod punch;
 mod runtime;
 mod tunnel;
 
-pub(in crate::server) use http::{
-    agent_control, authenticate_agent, client_control, enroll, transport_info,
-};
+#[cfg(test)]
+pub(in crate::server) use http::authenticate_agent;
+pub(in crate::server) use http::{agent_control, client_control, enroll, transport_info};
 use punch::{
     PunchSelection, PunchSide, fail_punch_to_native, register_agent_discovery,
     register_client_discovery, register_punch_ready, register_punch_selection, send_native_plans,
 };
-pub(crate) use runtime::{TunnelPhase, TunnelRuntime};
+pub(crate) use runtime::TunnelRuntime;
 pub(in crate::server) use runtime::{
     allow_agent_data_endpoint, close_pending_client_tunnels, unregister_agent,
 };

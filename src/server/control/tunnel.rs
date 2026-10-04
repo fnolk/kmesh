@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
 use iroh::EndpointAddr;
-use sqlx::Row;
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::{
     identity::{self, TUNNEL_TICKET_AUDIENCE},
-    protocol::{ControlMessage, ReadyDiscovery, RouteMode, SelectedPath, TunnelTicketClaims},
+    protocol::{ControlMessage, RouteMode, SelectedPath, TunnelTicketClaims},
 };
 
 use super::super::{auth::AuthenticatedUser, db::unix_time, error::ApiError};

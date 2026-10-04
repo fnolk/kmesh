@@ -12,7 +12,6 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
-use iroh::Watcher as _;
 use iroh::{EndpointAddr, RelayUrl, SecretKey};
 use iroh_relay::{
     http::ProtocolVersion,
