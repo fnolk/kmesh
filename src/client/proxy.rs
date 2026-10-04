@@ -20,6 +20,7 @@ use super::{
 };
 
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const ENDPOINT_CLOSE_BUDGET: Duration = Duration::from_secs(4);
 
 #[derive(Debug, thiserror::Error)]
 #[error("SSH access authentication failed: {0}")]
@@ -77,13 +78,13 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     for (index, route_mode) in route_modes.into_iter().enumerate() {
         let attempt_started = tokio::time::Instant::now();
         let attempt_deadline = std::cmp::min(
-            setup_deadline,
+            setup_deadline - ENDPOINT_CLOSE_BUDGET,
             attempt_started + attempt_timeout(route_mode),
         );
         let access_token = if index == 0 {
             access_token.clone()
         } else {
-            tokio::time::timeout_at(setup_deadline, auth::valid_access_token(context))
+            tokio::time::timeout_at(attempt_deadline, auth::valid_access_token(context))
                 .await
                 .context("SSH setup expired while refreshing kmesh authentication")??
         };
@@ -92,14 +93,17 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
             .with_context(|| format!("connect kmesh control for route {route_mode:?}"))?;
         let (session_id, secret_key) = attempt::new_attempt_identity();
         match attempt::open_ssh_session(
-            context,
             &mut control,
-            &transport_info,
-            target_id,
-            session_id,
-            secret_key,
-            route_mode,
-            attempt_deadline,
+            attempt::SshAttempt {
+                client: context,
+                transport_info: &transport_info,
+                target_id,
+                session_id,
+                secret_key,
+                route_mode,
+                attempt_deadline,
+                setup_deadline,
+            },
         )
         .await
         {
@@ -108,7 +112,11 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
                 break;
             }
             Err(error) => {
-                close_session_best_effort(&mut control, session_id, "route_attempt_failed").await;
+                let _ = tokio::time::timeout_at(
+                    setup_deadline,
+                    close_session_best_effort(&mut control, session_id, "route_attempt_failed"),
+                )
+                .await;
                 let elapsed_ms = attempt_started.elapsed().as_millis();
                 tracing::warn!(
                     session = %session_id,
@@ -167,40 +175,37 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
         }
     };
     let attempt::OpenSshSession {
-        _endpoint,
+        endpoint,
         mut stream,
     } = ssh_session;
 
-    let (ssh_upload_bytes, ssh_download_bytes) = match stdio::copy_stdio(&mut stream).await {
-        Ok(stats) => stats,
-        Err(error) => {
-            let _ = stream.reset();
-            let _ = Api::send_control(
-                &mut control,
-                &ControlMessage::Close {
-                    session_id,
-                    reason: "client_ssh_stream_failed".to_owned(),
-                },
-            )
-            .await;
-            return Err(error).context("copy local SSH stdio over Iroh");
-        }
+    let transfer = stdio::copy_stdio(&mut stream).await;
+    if transfer.is_err() {
+        let _ = stream.reset();
+    }
+    let reason = if transfer.is_err() {
+        "client_ssh_stream_failed"
+    } else {
+        "ssh_stream_complete"
     };
-    eprintln!(
-        "SSH 流量统计：本地→目标={} bytes；目标→本地={} bytes",
-        ssh_upload_bytes, ssh_download_bytes,
-    );
     if let Err(error) = Api::send_control(
         &mut control,
         &ControlMessage::Close {
             session_id,
-            reason: "ssh_stream_complete".to_owned(),
+            reason: reason.to_owned(),
         },
     )
     .await
     {
         tracing::debug!(session = %session_id, error = %error, "SSH finished after control channel disconnected");
     }
+    attempt::close_endpoint(&endpoint).await;
+    let (ssh_upload_bytes, ssh_download_bytes) =
+        transfer.context("copy local SSH stdio over Iroh")?;
+    eprintln!(
+        "SSH 流量统计：本地→目标={} bytes；目标→本地={} bytes",
+        ssh_upload_bytes, ssh_download_bytes,
+    );
     Ok(())
 }
 

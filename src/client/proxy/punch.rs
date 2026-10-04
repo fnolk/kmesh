@@ -17,26 +17,27 @@ use super::{
     ensure_auth,
 };
 
+pub(super) struct ClientPunchAttempt {
+    pub(super) identity: PunchIdentity,
+    pub(super) secret_key: SecretKey,
+    pub(super) route_mode: RouteMode,
+    pub(super) deadline: tokio::time::Instant,
+}
+
 pub(super) async fn run_client_punch(
     discovered: DiscoveredUdpSocket,
     standard_handoff: HandoffOptions,
     peer_discovery: ReadyDiscovery,
-    session_id: Uuid,
-    target_data_id: iroh::EndpointId,
-    client_id: iroh::EndpointId,
-    secret_key: SecretKey,
+    attempt: ClientPunchAttempt,
     control: &mut WsStream,
-    route_mode: RouteMode,
-    deadline: tokio::time::Instant,
 ) -> Result<(Option<HandoffOptions>, Option<PunchSelection>)> {
+    let session_id = attempt.identity.session_id;
+    let route_mode = attempt.route_mode;
+    let deadline = attempt.deadline;
     let mut punch = match PreparedPunch::prepare(
         PunchRole::Client,
-        PunchIdentity {
-            session_id,
-            target_id: target_data_id,
-            client_id,
-        },
-        secret_key,
+        attempt.identity,
+        attempt.secret_key,
         discovered,
         peer_discovery.local_socket,
         peer_discovery.observations,

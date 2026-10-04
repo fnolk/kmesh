@@ -66,11 +66,53 @@ impl Counters {
     }
 }
 
+#[derive(Clone)]
 struct PunchSocket {
     index: u16,
     local_socket: SocketAddrV4,
     socket: Arc<UdpSocket>,
     counters: Arc<Counters>,
+}
+
+#[derive(Clone)]
+struct PacketSender {
+    secret_key: SecretKey,
+    identity: PunchIdentity,
+    role: PunchRole,
+}
+
+impl PacketSender {
+    async fn send(
+        &self,
+        socket: &UdpSocket,
+        counters: &Counters,
+        kind: PacketKind,
+        index: u16,
+        destination: SocketAddr,
+    ) -> Result<(), PunchError> {
+        let packet = encode_packet(&self.secret_key, self.identity, self.role, kind, index);
+        let sent = socket
+            .send_to(&packet, destination)
+            .await
+            .map_err(io_punch_error)?;
+        if sent != PACKET_LEN {
+            return Err(PunchError::Fatal(TransportError::Iroh(format!(
+                "UDP sent {sent} bytes for a {PACKET_LEN}-byte signed punch packet"
+            ))));
+        }
+        counters.sent(sent);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct TargetReceiverContext {
+    events: mpsc::Sender<TargetEvent>,
+    selected_sender: watch::Sender<Option<u16>>,
+    selected_receiver: watch::Receiver<Option<u16>>,
+    selection: Arc<Mutex<Option<(u16, SocketAddrV4)>>>,
+    packet_sender: PacketSender,
+    peer_id: EndpointId,
 }
 
 enum TargetEvent {
@@ -276,51 +318,43 @@ impl PreparedPunch {
         let (event_sender, mut events) = mpsc::channel(1);
         let (selected_sender, selected_receiver) = watch::channel(SELECT_NONE);
         let selection = Arc::new(Mutex::new(None));
+        let receiver_context = TargetReceiverContext {
+            events: event_sender,
+            selected_sender,
+            selected_receiver,
+            selection: selection.clone(),
+            packet_sender: PacketSender {
+                secret_key: self.secret_key.clone(),
+                identity: self.identity,
+                role: PunchRole::Target,
+            },
+            peer_id: self.peer_id,
+        };
         for local in &self.sockets {
-            let event_sender = event_sender.clone();
-            let selected_sender = selected_sender.clone();
-            let selected_receiver = selected_receiver.clone();
-            let selection = selection.clone();
-            let socket = local.socket.clone();
-            let counters = local.counters.clone();
-            let secret_key = self.secret_key.clone();
-            let identity = self.identity;
-            let peer_id = self.peer_id;
-            let index = local.index;
-            let local_socket = local.local_socket;
-            self.workers.spawn(async move {
-                target_receiver(
-                    index,
-                    local_socket,
-                    socket,
-                    counters,
-                    event_sender,
-                    selected_sender,
-                    selected_receiver,
-                    selection,
-                    secret_key,
-                    identity,
-                    peer_id,
-                )
-                .await
-            });
+            let local = local.clone();
+            let receiver_context = receiver_context.clone();
+            self.workers
+                .spawn(async move { target_receiver(local, receiver_context).await });
         }
-        drop(event_sender);
+        drop(receiver_context);
 
         let peer_addrs = unique_observed_addrs(&self.peer_observations)?;
+        let packet_sender = PacketSender {
+            secret_key: self.secret_key.clone(),
+            identity: self.identity,
+            role: PunchRole::Target,
+        };
         for local in &self.sockets {
             for peer_addr in &peer_addrs {
-                send_packet(
-                    &local.socket,
-                    &local.counters,
-                    &self.secret_key,
-                    self.identity,
-                    PunchRole::Target,
-                    PacketKind::Offer,
-                    local.index,
-                    SocketAddr::V4(*peer_addr),
-                )
-                .await?;
+                packet_sender
+                    .send(
+                        &local.socket,
+                        &local.counters,
+                        PacketKind::Offer,
+                        local.index,
+                        SocketAddr::V4(*peer_addr),
+                    )
+                    .await?;
             }
         }
 
@@ -365,18 +399,21 @@ impl PreparedPunch {
             .filter(|address| *address.ip() == self.target_ip)
             .map(SocketAddrV4::port)
             .collect::<HashSet<_>>();
+        let packet_sender = PacketSender {
+            secret_key: self.secret_key.clone(),
+            identity: self.identity,
+            role: PunchRole::Client,
+        };
         for address in &known_addrs {
-            send_packet(
-                socket,
-                counters,
-                &self.secret_key,
-                self.identity,
-                PunchRole::Client,
-                PacketKind::Probe,
-                PROBE_INDEX,
-                SocketAddr::V4(*address),
-            )
-            .await?;
+            packet_sender
+                .send(
+                    socket,
+                    counters,
+                    PacketKind::Probe,
+                    PROBE_INDEX,
+                    SocketAddr::V4(*address),
+                )
+                .await?;
         }
 
         let raw_deadline = std::cmp::min(Instant::now() + CLIENT_PROBE_BUDGET, deadline);
@@ -392,7 +429,7 @@ impl PreparedPunch {
         loop {
             tokio::select! {
                 received = socket.recv_from(&mut buffer) => {
-                    let (len, source) = received.map_err(|error| io_punch_error(error))?;
+                    let (len, source) = received.map_err(io_punch_error)?;
                     counters.received(len);
                     let Some(source) = ipv4_source(source) else { continue };
                     let Some(packet) = decode_packet(
@@ -402,10 +439,12 @@ impl PreparedPunch {
                         PacketKind::Offer if usize::from(packet.index) < TARGET_SOCKET_COUNT => {
                             if selected.is_none() {
                                 selected = Some((packet.index, source));
-                                send_packet(
-                                    socket, counters, &self.secret_key, self.identity,
-                                    PunchRole::Client, PacketKind::Select, packet.index,
-                                    SocketAddr::V4(source)
+                                packet_sender.send(
+                                    socket,
+                                    counters,
+                                    PacketKind::Select,
+                                    packet.index,
+                                    SocketAddr::V4(source),
                                 ).await?;
                             }
                         }
@@ -422,19 +461,23 @@ impl PreparedPunch {
                             break candidate;
                         }
                     };
-                    send_packet(
-                        socket, counters, &self.secret_key, self.identity,
-                        PunchRole::Client, PacketKind::Probe, PROBE_INDEX,
-                        SocketAddr::V4(SocketAddrV4::new(self.target_ip, port))
+                    packet_sender.send(
+                        socket,
+                        counters,
+                        PacketKind::Probe,
+                        PROBE_INDEX,
+                        SocketAddr::V4(SocketAddrV4::new(self.target_ip, port)),
                     ).await?;
                     random_probes_sent += 1;
                 }
                 _ = select_tick.tick(), if selected.is_some() && !confirmed => {
                     let (index, address) = selected.expect("selection guard checked");
-                    send_packet(
-                        socket, counters, &self.secret_key, self.identity,
-                        PunchRole::Client, PacketKind::Select, index,
-                        SocketAddr::V4(address)
+                    packet_sender.send(
+                        socket,
+                        counters,
+                        PacketKind::Select,
+                        index,
+                        SocketAddr::V4(address),
                     ).await?;
                 }
                 _ = sleep_until(raw_deadline) => {
@@ -457,21 +500,19 @@ impl PreparedPunch {
 }
 
 async fn target_receiver(
-    index: u16,
-    local_socket: SocketAddrV4,
-    socket: Arc<UdpSocket>,
-    counters: Arc<Counters>,
-    events: mpsc::Sender<TargetEvent>,
-    selected_sender: watch::Sender<Option<u16>>,
-    mut selected_receiver: watch::Receiver<Option<u16>>,
-    selection: Arc<Mutex<Option<(u16, SocketAddrV4)>>>,
-    secret_key: SecretKey,
-    identity: PunchIdentity,
-    peer_id: EndpointId,
+    local: PunchSocket,
+    mut context: TargetReceiverContext,
 ) -> Result<(), PunchError> {
+    let index = local.index;
+    let local_socket = local.local_socket;
+    let socket = local.socket;
+    let counters = local.counters;
+    let identity = context.packet_sender.identity;
+    let peer_id = context.peer_id;
     let mut buffer = [0u8; 2048];
     loop {
-        if selected_receiver
+        if context
+            .selected_receiver
             .borrow()
             .is_some_and(|selected| selected != index)
         {
@@ -487,18 +528,21 @@ async fn target_receiver(
                 ) else { continue };
                 match packet.kind {
                     PacketKind::Probe if packet.index == PROBE_INDEX => {
-                        send_packet(
-                            &socket, &counters, &secret_key, identity, PunchRole::Target,
-                            PacketKind::Offer, index, SocketAddr::V4(source)
+                        context.packet_sender.send(
+                            &socket,
+                            &counters,
+                            PacketKind::Offer,
+                            index,
+                            SocketAddr::V4(source),
                         ).await?;
                     }
                     PacketKind::Select if packet.index == index => {
                         let source_selection = {
-                            let mut current = selection.lock().expect("punch selection mutex poisoned");
+                            let mut current = context.selection.lock().expect("punch selection mutex poisoned");
                             match *current {
                                 None => {
                                     *current = Some((index, source));
-                                    let _ = selected_sender.send_replace(Some(index));
+                                    let _ = context.selected_sender.send_replace(Some(index));
                                     Some(true)
                                 }
                                 Some((selected, selected_source)) if selected == index && selected_source == source => Some(false),
@@ -508,12 +552,15 @@ async fn target_receiver(
                         if source_selection.is_none() {
                             continue;
                         }
-                        send_packet(
-                            &socket, &counters, &secret_key, identity, PunchRole::Target,
-                            PacketKind::Confirm, index, SocketAddr::V4(source)
+                        context.packet_sender.send(
+                            &socket,
+                            &counters,
+                            PacketKind::Confirm,
+                            index,
+                            SocketAddr::V4(source),
                         ).await?;
                         if source_selection == Some(true) {
-                            events.send(TargetEvent::Selected(PunchSelection {
+                            context.events.send(TargetEvent::Selected(PunchSelection {
                                 index,
                                 local_socket,
                                 peer_observed_addr: source,
@@ -526,8 +573,8 @@ async fn target_receiver(
                     _ => {}
                 }
             }
-            changed = selected_receiver.changed() => {
-                let selected = *selected_receiver.borrow_and_update();
+            changed = context.selected_receiver.changed() => {
+                let selected = *context.selected_receiver.borrow_and_update();
                 if changed.is_err() || selected.is_some_and(|selected| selected != index) {
                     return Ok(());
                 }
@@ -556,30 +603,6 @@ fn io_punch_error(error: io::Error) -> PunchError {
     } else {
         PunchError::Fatal(transport)
     }
-}
-
-async fn send_packet(
-    socket: &UdpSocket,
-    counters: &Counters,
-    secret_key: &SecretKey,
-    identity: PunchIdentity,
-    role: PunchRole,
-    kind: PacketKind,
-    index: u16,
-    destination: SocketAddr,
-) -> Result<(), PunchError> {
-    let packet = encode_packet(secret_key, identity, role, kind, index);
-    let sent = socket
-        .send_to(&packet, destination)
-        .await
-        .map_err(io_punch_error)?;
-    if sent != PACKET_LEN {
-        return Err(PunchError::Fatal(TransportError::Iroh(format!(
-            "UDP sent {sent} bytes for a {PACKET_LEN}-byte signed punch packet"
-        ))));
-    }
-    counters.sent(sent);
-    Ok(())
 }
 
 #[cfg(test)]

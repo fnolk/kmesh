@@ -9,9 +9,9 @@ use uuid::Uuid;
 use crate::{
     protocol::{ControlMessage, DiscoveryResult, NativePlan, RouteMode, TransportInfo},
     transport::{
-        DiscoveredUdpSocket, IrohByteStream, IrohEndpointOptions, MappingDiscovery, TransportError,
-        accept_peer, create_endpoint, discover_ipv4_mappings, is_auth_failure_source,
-        wait_endpoint_ready, wait_for_selected_path,
+        DiscoveredUdpSocket, IrohByteStream, IrohEndpointOptions, MappingDiscovery, PunchIdentity,
+        TransportError, accept_peer, create_endpoint, discover_ipv4_mappings,
+        is_auth_failure_source, wait_endpoint_ready, wait_for_selected_path,
     },
 };
 
@@ -20,14 +20,30 @@ use super::super::{
     api::{Api, WsStream},
     route::{SSH_SETUP_TIMEOUT, route_transport_plan},
 };
+use super::ENDPOINT_CLOSE_BUDGET;
 use super::{
     ActivatedSessionFailure, RouteNetworkFailure, SshAuthenticationFailure, ensure_auth, punch,
     server_setup_error, ticket,
 };
 
 pub(super) struct OpenSshSession {
-    pub(super) _endpoint: Endpoint,
+    pub(super) endpoint: Endpoint,
     pub(super) stream: IrohByteStream,
+}
+
+pub(super) async fn close_endpoint(endpoint: &Endpoint) {
+    endpoint.close().await;
+}
+
+pub(super) struct SshAttempt<'a> {
+    pub(super) client: &'a ClientContext,
+    pub(super) transport_info: &'a TransportInfo,
+    pub(super) target_id: Uuid,
+    pub(super) session_id: Uuid,
+    pub(super) secret_key: SecretKey,
+    pub(super) route_mode: RouteMode,
+    pub(super) attempt_deadline: tokio::time::Instant,
+    pub(super) setup_deadline: tokio::time::Instant,
 }
 
 pub(super) fn new_attempt_identity() -> (Uuid, SecretKey) {
@@ -35,17 +51,21 @@ pub(super) fn new_attempt_identity() -> (Uuid, SecretKey) {
 }
 
 pub(super) async fn open_ssh_session(
-    context: &ClientContext,
     control: &mut WsStream,
-    transport_info: &TransportInfo,
-    target_id: Uuid,
-    session_id: Uuid,
-    secret_key: SecretKey,
-    route_mode: RouteMode,
-    route_deadline: tokio::time::Instant,
+    attempt: SshAttempt<'_>,
 ) -> Result<OpenSshSession> {
+    let SshAttempt {
+        client: context,
+        transport_info,
+        target_id,
+        session_id,
+        secret_key,
+        route_mode,
+        attempt_deadline: route_deadline,
+        setup_deadline,
+    } = attempt;
     let mut deadline = std::cmp::min(
-        route_deadline,
+        std::cmp::min(route_deadline, setup_deadline),
         tokio::time::Instant::now() + SSH_SETUP_TIMEOUT,
     );
     let route_transport = route_transport_plan(route_mode, transport_info, context.api.issuer())?;
@@ -180,13 +200,17 @@ pub(super) async fn open_ssh_session(
                     discovered,
                     standard_handoff.expect("ready QAD discovery includes its direct tuple"),
                     peer_discovery,
-                    session_id,
-                    target_id_data,
-                    client_id,
-                    secret_key.clone(),
+                    punch::ClientPunchAttempt {
+                        identity: PunchIdentity {
+                            session_id,
+                            target_id: target_id_data,
+                            client_id,
+                        },
+                        secret_key: secret_key.clone(),
+                        route_mode,
+                        deadline,
+                    },
                     control,
-                    route_mode,
-                    deadline,
                 )
                 .await?
             }
@@ -243,20 +267,22 @@ pub(super) async fn open_ssh_session(
             .context("create per-session client Iroh endpoint")?
     };
     let setup_result = async {
-        let mut activated = false;
+        let mut progress = SetupProgress {
+            session_id,
+            route_mode,
+            deadline,
+            activated: false,
+        };
         wait_setup_step(
             control,
             &endpoint,
-            session_id,
-            route_mode,
+            &mut progress,
             "waiting for client Iroh endpoint readiness",
-            &mut activated,
             async {
                 wait_endpoint_ready(&endpoint, &route_transport.relay_choice, deadline)
                     .await
                     .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
             },
-            deadline,
         )
         .await?;
         let client_endpoint_addr = endpoint.addr();
@@ -286,16 +312,13 @@ pub(super) async fn open_ssh_session(
         let connection = wait_setup_step(
             control,
             &endpoint,
-            session_id,
-            route_mode,
+            &mut progress,
             "waiting for target Iroh connection",
-            &mut activated,
             async {
                 accept_peer(&endpoint)
                     .await
                     .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
             },
-            deadline,
         )
         .await?;
         ensure_auth(
@@ -305,16 +328,13 @@ pub(super) async fn open_ssh_session(
         let path = wait_setup_step(
             control,
             &endpoint,
-            session_id,
-            route_mode,
+            &mut progress,
             "waiting for the required Iroh path",
-            &mut activated,
             async {
                 wait_for_selected_path(&connection, route_mode, deadline)
                     .await
                     .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
             },
-            deadline,
         )
         .await?;
         send_setup_control(
@@ -331,34 +351,28 @@ pub(super) async fn open_ssh_session(
         let mut stream = wait_setup_step(
             control,
             &endpoint,
-            session_id,
-            route_mode,
+            &mut progress,
             "waiting for target SSH stream",
-            &mut activated,
             async {
                 IrohByteStream::accept_bi(connection)
                     .await
                     .map_err(|error| classify_client_transport_error(&endpoint, error, route_mode))
             },
-            deadline,
         )
         .await?;
         let received_ticket = wait_setup_step(
             control,
             &endpoint,
-            session_id,
-            route_mode,
+            &mut progress,
             "waiting for signed SSH ticket",
-            &mut activated,
             async { ticket::read_ticket(&mut stream).await },
-            deadline,
         )
         .await?;
         ensure_auth(
             received_ticket == offer.ticket,
             "Iroh stream ticket differs from the signed client offer",
         )?;
-        if !activated {
+        if !progress.activated {
             tokio::time::timeout_at(deadline, wait_activated(control, session_id))
                 .await
                 .map_err(|_| {
@@ -373,16 +387,17 @@ pub(super) async fn open_ssh_session(
     .await;
 
     match setup_result {
-        Ok(stream) => Ok(OpenSshSession {
-            _endpoint: endpoint,
-            stream,
-        }),
+        Ok(stream) => Ok(OpenSshSession { endpoint, stream }),
         Err(error) => {
-            if tokio::time::timeout_at(deadline, endpoint.close())
+            let cleanup_deadline = std::cmp::min(
+                setup_deadline,
+                tokio::time::Instant::now() + ENDPOINT_CLOSE_BUDGET,
+            );
+            if tokio::time::timeout_at(cleanup_deadline, close_endpoint(&endpoint))
                 .await
                 .is_err()
             {
-                tracing::debug!(session = %session_id, "endpoint cleanup reached the shared setup deadline; endpoint drop will abort remaining SDK tasks");
+                tracing::warn!(session = %session_id, "endpoint close exceeded the reserved cleanup budget; dropping the endpoint");
             }
             Err(error)
         }
@@ -527,16 +542,24 @@ fn client_message_session_id(message: &ControlMessage) -> Option<Uuid> {
     }
 }
 
+struct SetupProgress {
+    session_id: Uuid,
+    route_mode: RouteMode,
+    deadline: tokio::time::Instant,
+    activated: bool,
+}
+
 async fn wait_setup_step<T>(
     control: &mut WsStream,
     endpoint: &Endpoint,
-    session_id: Uuid,
-    route_mode: RouteMode,
+    progress: &mut SetupProgress,
     stage: &'static str,
-    activated: &mut bool,
     operation: impl Future<Output = Result<T>>,
-    deadline: tokio::time::Instant,
 ) -> Result<T> {
+    let session_id = progress.session_id;
+    let route_mode = progress.route_mode;
+    let deadline = progress.deadline;
+    let activated = &mut progress.activated;
     let mut operation = Box::pin(operation);
     let wait = async {
         loop {
@@ -957,5 +980,20 @@ mod tests {
             cancel_tx.send(()).is_err(),
             "QAD future was dropped on close"
         );
+    }
+
+    #[tokio::test]
+    async fn endpoint_close_finishes_before_its_owner_is_dropped() {
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![crate::transport::IROH_SSH_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind isolated endpoint");
+
+        close_endpoint(&endpoint).await;
+
+        assert!(endpoint.is_closed());
     }
 }
