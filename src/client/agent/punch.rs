@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use anyhow::{Context, Result, anyhow};
 use iroh::SecretKey;
 use tokio::{sync::mpsc, time::Instant};
@@ -9,7 +7,7 @@ use super::control::next_session_message;
 use super::{AgentAuthenticationFailure, ensure_auth};
 use crate::client::route::DIRECT_PUNCH_TIMEOUT;
 use crate::{
-    protocol::{ControlMessage, NativePlan, ReadyDiscovery, RouteMode},
+    protocol::{ControlMessage, NativePlan, RouteMode},
     transport::{HandoffOptions, PreparedPunch, PunchError, PunchIdentity, PunchRole},
 };
 
@@ -30,6 +28,7 @@ pub(super) async fn run_target_punch(
         Option<crate::transport::PunchSelection>,
     )>,
 > {
+    let standard_handoff = discovered.handoff_options();
     let mut punch = match PreparedPunch::prepare(
         PunchRole::Target,
         PunchIdentity {
@@ -49,7 +48,7 @@ pub(super) async fn run_target_punch(
             )
             .await?
             {
-                Ok(Some((None, None)))
+                Ok(Some((Some(standard_handoff), None)))
             } else {
                 Ok(None)
             };
@@ -90,7 +89,7 @@ pub(super) async fn run_target_punch(
     };
     if !start {
         punch.finish(false).await.map_err(anyhow::Error::new)?;
-        return Ok(Some((None, None)));
+        return Ok(Some((Some(standard_handoff), None)));
     }
 
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -107,7 +106,7 @@ pub(super) async fn run_target_punch(
         )
         .await?
         {
-            Ok(Some((None, None)))
+            Ok(Some((Some(standard_handoff), None)))
         } else {
             Ok(None)
         };
@@ -151,7 +150,7 @@ pub(super) async fn run_target_punch(
                 )
                 .await?
                 {
-                    Ok(Some((None, None)))
+                    Ok(Some((Some(standard_handoff), None)))
                 } else {
                     Ok(None)
                 };
@@ -214,7 +213,7 @@ pub(super) async fn run_target_punch(
             plan: NativePlan::Standard,
         }) if received == session_id && mode == route_mode => {
             punch.finish(false).await.map_err(anyhow::Error::new)?;
-            Ok(Some((None, Some(selection))))
+            Ok(Some((Some(standard_handoff), Some(selection))))
         }
         Some(_) => {
             punch.finish(false).await.map_err(anyhow::Error::new)?;

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::{ServerState, auth::AuthenticatedUser, db::unix_time};
-use crate::protocol::{ControlMessage, RouteMode};
+use crate::protocol::{ControlMessage, NativePlan, RouteMode};
 
 mod http;
 mod punch;

@@ -221,7 +221,7 @@ fn validate_token_keys(keys: &TokenKeySet, issuer: &str) -> Result<()> {
         target_id: Uuid::new_v4(),
         client_endpoint_id: String::new(),
         target_endpoint_id: String::new(),
-        relay_mode: crate::protocol::RelayMode::Private,
+        route_mode: crate::protocol::RouteMode::PrivateRelay,
         iss: issuer.to_owned(),
         aud: identity::TUNNEL_TICKET_AUDIENCE.to_owned(),
         iat: now,

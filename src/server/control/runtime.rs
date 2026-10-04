@@ -1,15 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
+use iroh::EndpointAddr;
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-use crate::protocol::{ControlMessage, RouteMode, SelectedPath};
+use crate::protocol::{ControlMessage, ReadyDiscovery, RouteMode, SelectedPath};
 
+use super::super::{auth::AuthenticatedUser, db::unix_time, error::ApiError};
 use super::{
     ServerState,
-    auth::AuthenticatedUser,
-    db::unix_time,
-    error::ApiError,
     punch::{PunchSelection, PunchStage},
     send_agent_error, send_error,
     tunnel::authorized_for_target,
@@ -395,4 +394,90 @@ pub(in crate::server) async fn unregister_agent(
     }
     drop(online);
     close_pending_target_tunnels(state, target_id, connection_id).await;
+}
+
+pub(super) fn spawn_pending_expiry(state: ServerState, runtime: Arc<TunnelRuntime>) {
+    tokio::spawn(async move {
+        let seconds = runtime.expires_at.saturating_sub(unix_time()).max(0) as u64;
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        close_pending_tunnel(
+            &state,
+            &runtime,
+            "SSH authorization expired before activation",
+        )
+        .await;
+    });
+}
+
+pub(super) async fn close_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntime>, reason: &str) {
+    let mut phase = runtime.phase.lock().await;
+    if *phase == TunnelPhase::Closed {
+        return;
+    }
+    *phase = TunnelPhase::Closed;
+    drop(phase);
+    finish_tunnel_close(state, runtime, reason).await;
+}
+
+async fn close_pending_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntime>, reason: &str) {
+    let mut phase = runtime.phase.lock().await;
+    if *phase != TunnelPhase::Pending {
+        return;
+    }
+    *phase = TunnelPhase::Closed;
+    drop(phase);
+    finish_tunnel_close(state, runtime, reason).await;
+}
+
+async fn finish_tunnel_close(state: &ServerState, runtime: &Arc<TunnelRuntime>, reason: &str) {
+    let _ = sqlx::query(
+        "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
+         WHERE id = ?2 AND status IN ('pending', 'active')",
+    )
+    .bind(unix_time())
+    .bind(runtime.session_id.to_string())
+    .execute(&state.inner.db.pool)
+    .await;
+    let message = ControlMessage::Close {
+        session_id: runtime.session_id,
+        reason: reason.to_owned(),
+    };
+    let _ = runtime.client_sender.send(message.clone()).await;
+    let _ = runtime.target_sender.send(message).await;
+    remove_tunnel(state, runtime.session_id, runtime).await;
+}
+
+async fn fail_tunnel(state: &ServerState, runtime: &Arc<TunnelRuntime>, code: &str, message: &str) {
+    let mut phase = runtime.phase.lock().await;
+    if *phase == TunnelPhase::Closed {
+        return;
+    }
+    *phase = TunnelPhase::Closed;
+    drop(phase);
+    let _ = sqlx::query(
+        "UPDATE tunnel_sessions SET status = 'closed', closed_at = ?1 \
+         WHERE id = ?2 AND status IN ('pending', 'active')",
+    )
+    .bind(unix_time())
+    .bind(runtime.session_id.to_string())
+    .execute(&state.inner.db.pool)
+    .await;
+    let error = ControlMessage::Error {
+        session_id: Some(runtime.session_id),
+        code: code.to_owned(),
+        message: message.to_owned(),
+    };
+    let _ = runtime.client_sender.send(error.clone()).await;
+    let _ = runtime.target_sender.send(error).await;
+    remove_tunnel(state, runtime.session_id, runtime).await;
+}
+
+async fn remove_tunnel(state: &ServerState, session_id: Uuid, runtime: &Arc<TunnelRuntime>) {
+    let mut tunnels = state.inner.tunnels.write().await;
+    if tunnels
+        .get(&session_id)
+        .is_some_and(|current| Arc::ptr_eq(current, runtime))
+    {
+        tunnels.remove(&session_id);
+    }
 }

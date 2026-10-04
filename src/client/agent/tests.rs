@@ -1,18 +1,24 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        TunnelOffer, control::agent_session_error_code, route::endpoint_options,
+        server_session_error, session::handle_dial_offer,
+    };
     use crate::client::proxy::read_ticket;
     use crate::{
         client::{api::Api, profile},
+        protocol::{ControlMessage, RouteMode, TransportInfo},
         transport::{IrohByteStream, RelayChoice, TransportError, accept_peer, connect_peer},
     };
-    use iroh::{Endpoint, endpoint::presets};
+    use anyhow::Result;
+    use iroh::{Endpoint, SecretKey, endpoint::presets};
     use std::{io, time::Duration};
     use tokio::time::Instant;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
     };
+    use uuid::Uuid;
 
     #[test]
     fn per_session_error_classification_keeps_auth_and_protocol_failures_terminal() {

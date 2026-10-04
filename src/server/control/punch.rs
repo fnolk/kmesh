@@ -5,8 +5,9 @@ use uuid::Uuid;
 
 use crate::protocol::{ControlMessage, DiscoveryResult, NativePlan, ReadyDiscovery, RouteMode};
 
+use super::super::{auth::AuthenticatedUser, db::unix_time, error::ApiError};
+use super::ServerState;
 use super::runtime::{TunnelPhase, TunnelRuntime, close_tunnel};
-use super::{ServerState, auth::AuthenticatedUser, db::unix_time, error::ApiError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PunchStage {

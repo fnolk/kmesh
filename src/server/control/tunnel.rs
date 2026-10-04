@@ -10,13 +10,11 @@ use crate::{
     protocol::{ControlMessage, ReadyDiscovery, RouteMode, SelectedPath, TunnelTicketClaims},
 };
 
+use super::super::{auth::AuthenticatedUser, db::unix_time, error::ApiError};
 use super::{
     ServerState,
-    auth::AuthenticatedUser,
-    db::unix_time,
-    error::ApiError,
     punch::PunchStage,
-    runtime::{TunnelPhase, TunnelRuntime, close_tunnel},
+    runtime::{PendingTransport, TunnelPhase, TunnelRuntime, close_tunnel, spawn_pending_expiry},
 };
 
 const TICKET_TTL_SECS: i64 = 60;

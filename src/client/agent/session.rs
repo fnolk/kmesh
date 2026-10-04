@@ -6,7 +6,7 @@ use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
     sync::mpsc,
-    time::{Instant, timeout, timeout_at},
+    time::{Instant, timeout_at},
 };
 use uuid::Uuid;
 
@@ -19,7 +19,7 @@ use crate::{
     },
     transport::{
         IrohByteStream, RelayChoice, TransportError, connect_peer, create_endpoint,
-        discover_ipv4_mappings, validate_endpoint_addr, wait_endpoint_ready,
+        discover_ipv4_mappings, snapshot_iroh_paths, validate_endpoint_addr, wait_endpoint_ready,
         wait_for_selected_path,
     },
 };
@@ -96,7 +96,6 @@ pub(super) async fn run_agent_session(
         context.api.issuer(),
     )
     .context("build target route transport plan")?;
-    let relay_choice = route_plan.relay_choice.clone();
     let mut discovered = None;
     if let Some(qad_plan) = route_plan.qad_plan {
         let discovery_deadline = std::cmp::min(deadline, Instant::now() + DIRECT_PUNCH_TIMEOUT);
@@ -148,8 +147,7 @@ pub(super) async fn run_agent_session(
             route_mode: mode,
             plan: NativePlan::Standard,
         } if received == session_id && mode == route_mode => {
-            drop(discovered.take());
-            (None, None)
+            (discovered.take().map(|found| found.handoff_options()), None)
         }
         ControlMessage::PunchPair {
             session_id: received,

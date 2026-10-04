@@ -23,10 +23,6 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-pub(super) use control::agent_session_error_code;
-pub(super) use route::endpoint_options;
-pub(super) use session::handle_dial_offer;
-
 const CONTROL_RETRY_MAX: Duration = Duration::from_secs(30);
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_TICKET_FRAME: usize = 8 * 1024;

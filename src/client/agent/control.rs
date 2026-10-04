@@ -7,20 +7,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     sync::mpsc,
-    task::JoinSet,
     time::{Instant, timeout_at},
 };
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use super::{
-    AgentAuthenticationFailure, AgentRuntime, CONTROL_CONNECT_TIMEOUT, CONTROL_RETRY_MAX,
-    ClientContext, ServerAuthenticationFailure, ensure_auth, is_authentication_error,
-    server_session_error, session,
+    AgentRuntime, CONTROL_CONNECT_TIMEOUT, ClientContext, ServerAuthenticationFailure, ensure_auth,
+    is_authentication_error, server_session_error, session,
 };
 use crate::{
     client::api::{Api, WsStream},
-    protocol::{AgentCredentials, ControlMessage, RouteMode},
+    protocol::{AgentCredentials, ControlMessage},
     transport::TransportError,
 };
 
