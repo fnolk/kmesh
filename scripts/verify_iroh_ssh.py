@@ -924,7 +924,9 @@ class Verification:
                 self.ssh_base(multiplex=False) + ["true"],
                 accepted=None,
             )
-            denial = (denied.stderr + denied.stdout).decode("utf-8", "replace").lower()
+            path_text = self.path_log.read_text(errors="replace")
+            latest_attempt = path_text.rsplit("[proxy-start]", 1)[-1].lower()
+            denial = (denied.stderr + denied.stdout).decode("utf-8", "replace").lower() + latest_attempt
             if denied.returncode == 0 or not any(
                 phrase in denial for phrase in ("read active kmesh login", "please run kmesh login")
             ):
