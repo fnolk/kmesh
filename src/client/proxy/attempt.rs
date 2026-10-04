@@ -9,9 +9,9 @@ use uuid::Uuid;
 use crate::{
     protocol::{ControlMessage, DiscoveryResult, NativePlan, RouteMode, TransportInfo},
     transport::{
-        IrohByteStream, IrohEndpointOptions, MappingDiscovery, TransportError, accept_peer,
-        create_endpoint, discover_ipv4_mappings, is_auth_failure_source, wait_endpoint_ready,
-        wait_for_selected_path,
+        DiscoveredUdpSocket, IrohByteStream, IrohEndpointOptions, MappingDiscovery, TransportError,
+        accept_peer, create_endpoint, discover_ipv4_mappings, is_auth_failure_source,
+        wait_endpoint_ready, wait_for_selected_path,
     },
 };
 
@@ -22,8 +22,7 @@ use super::super::{
 };
 use super::{
     ActivatedSessionFailure, RouteNetworkFailure, SshAuthenticationFailure, ensure_auth, punch,
-    server_setup_error,
-    ticket::{self, TunnelOffer},
+    server_setup_error, ticket,
 };
 
 pub(super) struct OpenSshSession {
@@ -658,7 +657,7 @@ async fn wait_activated(control: &mut WsStream, session_id: Uuid) -> Result<()> 
 mod tests {
     use super::super::is_retryable_route_failure;
     use super::*;
-    use crate::{protocol::RouteMode, transport::TransportError};
+    use crate::transport::TransportError;
     use anyhow::anyhow;
     use std::io;
 

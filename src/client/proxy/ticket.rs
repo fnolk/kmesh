@@ -10,9 +10,7 @@ use crate::{
     transport::IrohByteStream,
 };
 
-use super::{
-    Api, ClientContext, SshAuthenticationFailure, WsStream, ensure_auth, server_setup_error,
-};
+use super::{Api, SshAuthenticationFailure, WsStream, ensure_auth, server_setup_error};
 
 const MAX_TICKET_FRAME: usize = 8 * 1024;
 
