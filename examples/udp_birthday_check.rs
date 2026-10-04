@@ -91,6 +91,14 @@ struct Paired {
     peer_observations: Vec<Value>,
 }
 
+#[derive(Clone, Copy)]
+struct RawIdentity {
+    sid: Uuid,
+    target_id: EndpointId,
+    client_id: EndpointId,
+    peer_id: EndpointId,
+}
+
 #[derive(Deserialize)]
 struct HandOff {
     event: String,
@@ -160,11 +168,57 @@ impl Counters {
     }
 }
 
+#[derive(Clone)]
 struct LocalSocket {
     index: u16,
     addr: SocketAddr,
     socket: Arc<UdpSocket>,
     counters: Arc<Counters>,
+}
+
+#[derive(Clone)]
+struct PacketSender {
+    secret_key: SecretKey,
+    identity: RawIdentity,
+    role: Role,
+}
+
+impl PacketSender {
+    async fn send(
+        &self,
+        socket: &UdpSocket,
+        counters: &Counters,
+        kind: PacketKind,
+        index: u16,
+        destination: SocketAddr,
+    ) -> Result<()> {
+        let packet = encode_packet(
+            &self.secret_key,
+            self.identity.sid,
+            self.identity.target_id,
+            self.identity.client_id,
+            self.role,
+            kind,
+            index,
+        );
+        let sent = socket
+            .send_to(&packet, destination)
+            .await
+            .with_context(|| format!("send signed UDP packet to {destination}"))?;
+        ensure!(
+            sent == PACKET_LEN,
+            "UDP socket sent an incomplete diagnostic datagram"
+        );
+        counters.sent(sent);
+        Ok(())
+    }
+}
+
+struct TargetReceiverContext {
+    local: LocalSocket,
+    events: tokio::sync::mpsc::Sender<TargetEvent>,
+    selected: Arc<AtomicUsize>,
+    packet_sender: PacketSender,
 }
 
 struct RawSelection {
@@ -377,16 +431,22 @@ async fn run() -> Result<()> {
     }))?;
     read_control(&mut control, "start_probe", deadline).await?;
 
+    let raw_identity = RawIdentity {
+        sid,
+        target_id,
+        client_id,
+        peer_id,
+    };
     let selection = match args.role {
         Role::Target => {
             let mut runtime = start_target_raw(
                 &local_sockets,
-                &client_mappings,
-                secret_key.clone(),
-                sid,
-                target_id,
-                client_id,
-                peer_id,
+                client_mappings,
+                PacketSender {
+                    secret_key: secret_key.clone(),
+                    identity: raw_identity,
+                    role: Role::Target,
+                },
             )
             .await?;
             let raw_deadline = std::cmp::min(Instant::now() + TARGET_PROBE_TIMEOUT, deadline);
@@ -426,13 +486,13 @@ async fn run() -> Result<()> {
         Role::Client => {
             let selected = run_client_raw(
                 &local_sockets[0],
-                &target_mappings,
+                target_mappings,
                 target_ip,
-                secret_key.clone(),
-                sid,
-                target_id,
-                client_id,
-                peer_id,
+                PacketSender {
+                    secret_key: secret_key.clone(),
+                    identity: raw_identity,
+                    role: Role::Client,
+                },
                 deadline,
             )
             .await?;
@@ -933,11 +993,7 @@ fn emit_raw_selected(role: Role, selected: &RawSelection) -> Result<()> {
 async fn start_target_raw(
     sockets: &[LocalSocket],
     client_mappings: &[Mapping],
-    secret_key: SecretKey,
-    sid: Uuid,
-    target_id: EndpointId,
-    client_id: EndpointId,
-    peer_id: EndpointId,
+    packet_sender: PacketSender,
 ) -> Result<TargetRawRuntime> {
     ensure!(
         sockets.len() == MAX_TARGET_SOCKETS,
@@ -948,30 +1004,16 @@ async fn start_target_raw(
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
     let mut workers = JoinSet::new();
     for local in sockets {
-        let index = local.index;
-        let local_addr = local.addr;
-        let socket = local.socket.clone();
-        let counters = local.counters.clone();
-        let event_tx = event_tx.clone();
-        let selected = selected.clone();
-        let secret_key = secret_key.clone();
+        let failure_tx = event_tx.clone();
+        let context = TargetReceiverContext {
+            local: local.clone(),
+            events: failure_tx.clone(),
+            selected: selected.clone(),
+            packet_sender: packet_sender.clone(),
+        };
         workers.spawn(async move {
-            if let Err(error) = target_receiver(
-                index,
-                local_addr,
-                socket,
-                counters,
-                event_tx.clone(),
-                selected,
-                secret_key,
-                sid,
-                target_id,
-                client_id,
-                peer_id,
-            )
-            .await
-            {
-                let _ = event_tx
+            if let Err(error) = target_receiver(context).await {
+                let _ = failure_tx
                     .send(TargetEvent::Failed(format!("{error:#}")))
                     .await;
             }
@@ -981,20 +1023,18 @@ async fn start_target_raw(
 
     for local in sockets {
         for peer_addr in &peer_addrs {
-            send_packet(
-                &local.socket,
-                &local.counters,
-                &secret_key,
-                sid,
-                target_id,
-                client_id,
-                Role::Target,
-                PacketKind::Offer,
-                local.index,
-                *peer_addr,
-            )
-            .await
-            .with_context(|| format!("send initial Offer from target socket {}", local.index))?;
+            packet_sender
+                .send(
+                    &local.socket,
+                    &local.counters,
+                    PacketKind::Offer,
+                    local.index,
+                    *peer_addr,
+                )
+                .await
+                .with_context(|| {
+                    format!("send initial Offer from target socket {}", local.index)
+                })?;
         }
     }
 
@@ -1004,19 +1044,17 @@ async fn start_target_raw(
     })
 }
 
-async fn target_receiver(
-    index: u16,
-    local_addr: SocketAddr,
-    socket: Arc<UdpSocket>,
-    counters: Arc<Counters>,
-    events: tokio::sync::mpsc::Sender<TargetEvent>,
-    selected: Arc<AtomicUsize>,
-    secret_key: SecretKey,
-    sid: Uuid,
-    target_id: EndpointId,
-    client_id: EndpointId,
-    peer_id: EndpointId,
-) -> Result<()> {
+async fn target_receiver(context: TargetReceiverContext) -> Result<()> {
+    let TargetReceiverContext {
+        local,
+        events,
+        selected,
+        packet_sender,
+    } = context;
+    let index = local.index;
+    let socket = local.socket;
+    let counters = local.counters;
+    let local_addr = local.addr;
     let mut buffer = [0u8; 2048];
     loop {
         let (len, source) = socket
@@ -1026,30 +1064,20 @@ async fn target_receiver(
         counters.received(len);
         let Some(packet) = decode_packet(
             &buffer[..len],
-            sid,
-            target_id,
-            client_id,
-            peer_id,
+            packet_sender.identity.sid,
+            packet_sender.identity.target_id,
+            packet_sender.identity.client_id,
+            packet_sender.identity.peer_id,
             Role::Client,
         ) else {
             continue;
         };
         match packet.kind {
             PacketKind::Probe if packet.index == PROBE_INDEX => {
-                send_packet(
-                    &socket,
-                    &counters,
-                    &secret_key,
-                    sid,
-                    target_id,
-                    client_id,
-                    Role::Target,
-                    PacketKind::Offer,
-                    index,
-                    source,
-                )
-                .await
-                .context("reply to valid client Probe")?;
+                packet_sender
+                    .send(&socket, &counters, PacketKind::Offer, index, source)
+                    .await
+                    .context("reply to valid client Probe")?;
             }
             PacketKind::Select if packet.index == index && source.is_ipv4() => {
                 let current = selected.load(Ordering::Acquire);
@@ -1068,20 +1096,10 @@ async fn target_receiver(
                 if selected.load(Ordering::Acquire) != usize::from(index) {
                     continue;
                 }
-                send_packet(
-                    &socket,
-                    &counters,
-                    &secret_key,
-                    sid,
-                    target_id,
-                    client_id,
-                    Role::Target,
-                    PacketKind::Confirm,
-                    index,
-                    source,
-                )
-                .await
-                .context("confirm selected target socket")?;
+                packet_sender
+                    .send(&socket, &counters, PacketKind::Confirm, index, source)
+                    .await
+                    .context("confirm selected target socket")?;
                 if won_selection {
                     events
                         .send(TargetEvent::Selected(RawSelection {
@@ -1105,11 +1123,7 @@ async fn run_client_raw(
     local: &LocalSocket,
     target_mappings: &[Mapping],
     target_ip: Ipv4Addr,
-    secret_key: SecretKey,
-    sid: Uuid,
-    target_id: EndpointId,
-    client_id: EndpointId,
-    peer_id: EndpointId,
+    packet_sender: PacketSender,
     deadline: Instant,
 ) -> Result<RawSelection> {
     let raw_deadline = std::cmp::min(Instant::now() + CLIENT_PROBE_TIMEOUT, deadline);
@@ -1117,7 +1131,7 @@ async fn run_client_raw(
     let counters = local.counters.clone();
     let scanner_socket = socket.clone();
     let scanner_counters = counters.clone();
-    let scanner_key = secret_key.clone();
+    let scanner_packet_sender = packet_sender.clone();
     let scanner_addrs = unique_observed_addrs(target_mappings);
     let already_probed_ports = scanner_addrs
         .iter()
@@ -1137,19 +1151,15 @@ async fn run_client_raw(
     let mut scanner = JoinSet::new();
     scanner.spawn(async move {
         for address in &scanner_addrs {
-            send_packet(
-                &scanner_socket,
-                &scanner_counters,
-                &scanner_key,
-                sid,
-                target_id,
-                client_id,
-                Role::Client,
-                PacketKind::Probe,
-                PROBE_INDEX,
-                *address,
-            )
-            .await?;
+            scanner_packet_sender
+                .send(
+                    &scanner_socket,
+                    &scanner_counters,
+                    PacketKind::Probe,
+                    PROBE_INDEX,
+                    *address,
+                )
+                .await?;
             scanner_known_probe_count.fetch_add(1, Ordering::Relaxed);
         }
         let mut seen = already_probed_ports;
@@ -1163,20 +1173,16 @@ async fn run_client_raw(
                     break port;
                 }
             };
-            send_packet(
-                &scanner_socket,
-                &scanner_counters,
-                &scanner_key,
-                sid,
-                target_id,
-                client_id,
-                Role::Client,
-                PacketKind::Probe,
-                PROBE_INDEX,
-                SocketAddr::V4(SocketAddrV4::new(target_ip, port)),
-            )
-            .await
-            .with_context(|| format!("send bounded mode-2 probe to {target_ip}:{port}"))?;
+            scanner_packet_sender
+                .send(
+                    &scanner_socket,
+                    &scanner_counters,
+                    PacketKind::Probe,
+                    PROBE_INDEX,
+                    SocketAddr::V4(SocketAddrV4::new(target_ip, port)),
+                )
+                .await
+                .with_context(|| format!("send bounded mode-2 probe to {target_ip}:{port}"))?;
             scanner_random_probe_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok::<(), anyhow::Error>(())
@@ -1206,7 +1212,12 @@ async fn run_client_raw(
                 let (len, source) = received.context("receive raw client datagram")?;
                 counters.received(len);
                 let Some(packet) = decode_packet(
-                    &buffer[..len], sid, target_id, client_id, peer_id, Role::Target
+                    &buffer[..len],
+                    packet_sender.identity.sid,
+                    packet_sender.identity.target_id,
+                    packet_sender.identity.client_id,
+                    packet_sender.identity.peer_id,
+                    Role::Target
                 ) else {
                     continue;
                 };
@@ -1215,9 +1226,12 @@ async fn run_client_raw(
                         && source.is_ipv4() => {
                         if selected.is_none() {
                             selected = Some((packet.index, source));
-                            send_select(
-                                &socket, &counters, &secret_key, sid, target_id, client_id,
-                                packet.index, source
+                            packet_sender.send(
+                                &socket,
+                                &counters,
+                                PacketKind::Select,
+                                packet.index,
+                                source,
                             ).await?;
                         }
                     }
@@ -1229,8 +1243,12 @@ async fn run_client_raw(
             }
             _ = cadence.tick(), if selected.is_some() && !confirmed => {
                 if let Some((index, address)) = selected {
-                    send_select(
-                        &socket, &counters, &secret_key, sid, target_id, client_id, index, address
+                    packet_sender.send(
+                        &socket,
+                        &counters,
+                        PacketKind::Select,
+                        index,
+                        address,
                     ).await?;
                 }
             }
@@ -1271,56 +1289,6 @@ async fn run_client_raw(
         known_candidate_probes_sent: known_probe_count.load(Ordering::Relaxed),
         random_port_probes_sent: random_probe_count.load(Ordering::Relaxed),
     })
-}
-
-async fn send_select(
-    socket: &UdpSocket,
-    counters: &Counters,
-    secret_key: &SecretKey,
-    sid: Uuid,
-    target_id: EndpointId,
-    client_id: EndpointId,
-    index: u16,
-    address: SocketAddr,
-) -> Result<()> {
-    send_packet(
-        socket,
-        counters,
-        secret_key,
-        sid,
-        target_id,
-        client_id,
-        Role::Client,
-        PacketKind::Select,
-        index,
-        address,
-    )
-    .await
-}
-
-async fn send_packet(
-    socket: &UdpSocket,
-    counters: &Counters,
-    secret_key: &SecretKey,
-    sid: Uuid,
-    target_id: EndpointId,
-    client_id: EndpointId,
-    role: Role,
-    kind: PacketKind,
-    index: u16,
-    destination: SocketAddr,
-) -> Result<()> {
-    let packet = encode_packet(secret_key, sid, target_id, client_id, role, kind, index);
-    let sent = socket
-        .send_to(&packet, destination)
-        .await
-        .with_context(|| format!("send signed UDP packet to {destination}"))?;
-    ensure!(
-        sent == PACKET_LEN,
-        "UDP socket sent an incomplete diagnostic datagram"
-    );
-    counters.sent(sent);
-    Ok(())
 }
 
 fn encode_packet(
