@@ -50,20 +50,7 @@ async fn main() {
         .with(fmt_layer)
         .init();
 
-    let cli = match kmesh::client::Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(error) => {
-            let exit_code = error.exit_code();
-            let rendered = error.render().to_string();
-            let text = rendered;
-            if error.use_stderr() {
-                eprint!("{text}");
-            } else {
-                print!("{text}");
-            }
-            std::process::exit(exit_code);
-        }
-    };
+    let cli = kmesh::client::Cli::parse();
     let proxy = matches!(&cli.command, kmesh::client::Command::Proxy { .. });
     match kmesh::client::run(cli).await {
         Ok(()) if proxy => std::process::exit(0),

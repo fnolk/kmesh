@@ -10,9 +10,9 @@ fn cli_help_and_global_data_directory_parse_after_subcommand() {
     let help = Command::new(binary).arg("--help").output().unwrap();
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    assert!(help.starts_with("kmesh"));
-    assert!(help.contains("ssh-config"));
-    assert!(help.contains("proxy"));
+    assert!(help.starts_with("SSH access over direct QUIC or relay"));
+    assert!(help.contains("Print an OpenSSH configuration entry for a target"));
+    assert!(help.contains("Open an SSH stream to a target"));
 
     let server_help = Command::new(binary)
         .args(["server", "init", "--help"])
@@ -21,7 +21,8 @@ fn cli_help_and_global_data_directory_parse_after_subcommand() {
     assert!(server_help.status.success());
     let server_help = String::from_utf8(server_help.stdout).unwrap();
     assert!(server_help.contains("--data-dir <DATA_DIR>"));
-    assert!(server_help.starts_with("Usage:"));
+    assert!(server_help.contains("Usage: kmesh server init"));
+    assert!(server_help.contains("Initialize server data and create the first administrator"));
 }
 
 #[test]

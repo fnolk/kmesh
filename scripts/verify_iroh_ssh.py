@@ -1064,9 +1064,9 @@ def main() -> int:
     }
     print(json.dumps(result, ensure_ascii=False))
     if failure:
-        print(f"SSH验收失败：{failure}", file=sys.stderr)
+        print(f"SSH 验收失败：{failure}", file=sys.stderr)
         return 1
-    print(f"SSH验收通过，证据保存在 {verifier.report_path}")
+    print(f"SSH 验收通过，证据保存在 {verifier.report_path}")
     return 0
 
 

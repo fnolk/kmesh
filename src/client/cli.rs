@@ -10,17 +10,20 @@ use crate::protocol::TargetPermission;
 #[command(
     name = "kmesh",
     version,
-    about = "SSH access over direct QUIC or relay",
-    before_help = "kmesh 通过 SSH 专用隧道连接目标机器。"
+    about = "SSH access over direct QUIC or relay"
 )]
 pub struct Cli {
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Path to the configuration file")]
     pub config: Option<PathBuf>,
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Directory for configuration and local data"
+    )]
     pub data_dir: Option<PathBuf>,
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Name of the credential profile to use")]
     pub profile: Option<String>,
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "HTTPS URL of the kmesh server")]
     pub server_url: Option<String>,
     #[command(subcommand)]
     pub command: Command,
@@ -28,78 +31,96 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(about = "Initialize or run the kmesh server")]
     Server {
         #[command(subcommand)]
         command: ServerCommand,
     },
+    #[command(about = "Enroll or run an SSH agent on a target machine")]
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    #[command(about = "Sign in to a kmesh server")]
     Login(LoginArgs),
+    #[command(about = "Sign out and remove the active credentials")]
     Logout,
+    #[command(about = "List targets available to the current user")]
     Targets {
         #[command(subcommand)]
         command: TargetsCommand,
     },
+    #[command(about = "Print an OpenSSH configuration entry for a target")]
     SshConfig {
+        #[arg(help = "Target name or ID")]
         target: String,
     },
+    #[command(about = "Open an SSH stream to a target")]
     Proxy {
+        #[arg(help = "ID of the target to connect to")]
         target_id: Uuid,
     },
+    #[command(about = "Manage users, SSH keys, roles, grants, and targets")]
     Admin(AdminArgs),
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ServerCommand {
+    #[command(about = "Initialize server data and create the first administrator")]
     Init(ServerInitArgs),
+    #[command(about = "Run the kmesh HTTPS and relay services")]
     Run(ServerRunArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ServerInitArgs {
-    #[arg(long)]
+    #[arg(long, help = "Username for the first administrator")]
     pub admin: String,
-    #[arg(long)]
+    #[arg(long, help = "Read the administrator password from standard input")]
     pub password_stdin: bool,
-    #[arg(long)]
+    #[arg(long, help = "Public HTTPS origin of this server")]
     pub issuer: String,
 }
 
 #[derive(Debug, Args)]
 pub struct ServerRunArgs {
-    #[arg(long)]
+    #[arg(long, help = "Public HTTPS origin of this server")]
     pub issuer: String,
-    #[arg(long, default_value = "0.0.0.0:9443")]
+    #[arg(long, default_value = "0.0.0.0:9443", help = "HTTPS listen address")]
     pub bind: SocketAddr,
-    #[arg(long)]
+    #[arg(long, help = "Path to the TLS certificate chain")]
     pub tls_cert: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Path to the TLS private key")]
     pub tls_key: PathBuf,
-    #[arg(long, default_value = "0.0.0.0:3478")]
+    #[arg(
+        long,
+        default_value = "0.0.0.0:3478",
+        help = "UDP listen address for QAD"
+    )]
     pub qad_bind: SocketAddr,
-    #[arg(long)]
+    #[arg(long, help = "Disable the private Iroh relay")]
     pub disable_private_relay: bool,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
+    #[command(about = "Enroll this machine as a target agent")]
     Enroll(AgentEnrollArgs),
+    #[command(about = "Run the target agent")]
     Run(AgentRunArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct AgentEnrollArgs {
-    #[arg(long)]
+    #[arg(long, help = "ID of the target to enroll")]
     pub target_id: Uuid,
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, help = "One-time enrollment code")]
     pub enrollment_code: String,
 }
 
 #[derive(Debug, Args)]
 pub struct AgentRunArgs {
-    #[arg(long)]
+    #[arg(long, help = "ID of the enrolled target")]
     pub target_id: Uuid,
 }
 
@@ -111,24 +132,29 @@ pub enum LoginMethod {
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    #[arg(long, value_enum)]
+    #[arg(
+        long,
+        value_enum,
+        help = "Authentication method: password or public-key"
+    )]
     pub method: LoginMethod,
-    #[arg(long)]
+    #[arg(long, help = "Account username")]
     pub username: String,
-    #[arg(long)]
+    #[arg(long, help = "Read the password from standard input")]
     pub password_stdin: bool,
-    #[arg(long)]
+    #[arg(long, help = "Path to the SSH private key used for public-key login")]
     pub key: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum TargetsCommand {
+    #[command(about = "List available targets")]
     List,
 }
 
 #[derive(Debug, Args)]
 pub struct AdminArgs {
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Output the response as JSON")]
     pub json: bool,
     #[command(subcommand)]
     pub command: Option<AdminCommand>,
@@ -136,22 +162,27 @@ pub struct AdminArgs {
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum AdminCommand {
+    #[command(about = "Manage user accounts and role assignments")]
     Users {
         #[command(subcommand)]
         action: UserAction,
     },
+    #[command(about = "Manage user SSH public keys")]
     Keys {
         #[command(subcommand)]
         action: KeyAction,
     },
+    #[command(about = "Manage authorization roles")]
     Roles {
         #[command(subcommand)]
         action: RoleAction,
     },
+    #[command(about = "Manage role permissions for targets")]
     Grants {
         #[command(subcommand)]
         action: GrantAction,
     },
+    #[command(about = "Manage SSH targets")]
     Targets {
         #[command(subcommand)]
         action: TargetAction,
@@ -160,70 +191,108 @@ pub enum AdminCommand {
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum UserAction {
+    #[command(about = "List user accounts")]
     List,
+    #[command(about = "Create a user account")]
     Create {
+        #[arg(help = "Username for the new account")]
         username: String,
-        #[arg(long)]
+        #[arg(long, help = "Read the new password from standard input")]
         password_stdin: bool,
     },
+    #[command(about = "Disable a user account")]
     Disable {
+        #[arg(help = "ID of the user to disable")]
         user_id: Uuid,
     },
+    #[command(about = "Enable a user account")]
     Enable {
+        #[arg(help = "ID of the user to enable")]
         user_id: Uuid,
     },
+    #[command(about = "Reset a user's password")]
     ResetPassword {
+        #[arg(help = "ID of the user whose password will be reset")]
         user_id: Uuid,
-        #[arg(long)]
+        #[arg(long, help = "Read the new password from standard input")]
         password_stdin: bool,
     },
+    #[command(about = "Replace a user's role assignments")]
     Roles {
+        #[arg(help = "ID of the user to update")]
         user_id: Uuid,
+        #[arg(help = "IDs of the roles to assign")]
         role_ids: Vec<Uuid>,
     },
+    #[command(about = "List roles assigned to a user")]
     ShowRoles {
+        #[arg(help = "ID of the user")]
         user_id: Uuid,
     },
 }
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum KeyAction {
+    #[command(about = "List a user's SSH public keys")]
     List {
+        #[arg(help = "ID of the user")]
         user_id: Uuid,
     },
+    #[command(about = "Add an SSH public key to a user")]
     Add {
+        #[arg(help = "ID of the user")]
         user_id: Uuid,
+        #[arg(help = "Path to the SSH public key file")]
         public_key_file: PathBuf,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", help = "Label for the public key")]
         label: String,
     },
+    #[command(about = "Remove an SSH public key")]
     Remove {
+        #[arg(help = "ID of the key to remove")]
         key_id: Uuid,
     },
 }
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum RoleAction {
+    #[command(about = "List authorization roles")]
     List,
-    Create { name: String },
-    Delete { role_id: Uuid },
+    #[command(about = "Create an authorization role")]
+    Create {
+        #[arg(help = "Name of the role")]
+        name: String,
+    },
+    #[command(about = "Delete an authorization role")]
+    Delete {
+        #[arg(help = "ID of the role to delete")]
+        role_id: Uuid,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum GrantAction {
+    #[command(about = "List permissions granted to a role")]
     List {
+        #[arg(help = "ID of the role")]
         role_id: Uuid,
     },
+    #[command(about = "Grant a role permission to access a target")]
     Add {
+        #[arg(help = "ID of the role")]
         role_id: Uuid,
+        #[arg(help = "ID of the target")]
         target_id: Uuid,
-        #[arg(long, value_enum, default_value_t = PermissionArg::SshConnect)]
+        #[arg(long, value_enum, default_value_t = PermissionArg::SshConnect, help = "Permission to grant")]
         permission: PermissionArg,
     },
+    #[command(about = "Revoke a role's permission to access a target")]
     Remove {
+        #[arg(help = "ID of the role")]
         role_id: Uuid,
+        #[arg(help = "ID of the target")]
         target_id: Uuid,
-        #[arg(long, value_enum, default_value_t = PermissionArg::SshConnect)]
+        #[arg(long, value_enum, default_value_t = PermissionArg::SshConnect, help = "Permission to revoke")]
         permission: PermissionArg,
     },
 }
@@ -241,11 +310,38 @@ impl From<PermissionArg> for TargetPermission {
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum TargetAction {
+    #[command(about = "List SSH targets")]
     List,
-    Create { name: String },
-    Rename { target_id: Uuid, name: String },
-    Enable { target_id: Uuid },
-    Disable { target_id: Uuid },
-    Delete { target_id: Uuid },
-    IssueEnrollment { target_id: Uuid },
+    #[command(about = "Create an SSH target")]
+    Create {
+        #[arg(help = "Name of the target")]
+        name: String,
+    },
+    #[command(about = "Rename an SSH target")]
+    Rename {
+        #[arg(help = "ID of the target")]
+        target_id: Uuid,
+        #[arg(help = "New name for the target")]
+        name: String,
+    },
+    #[command(about = "Enable an SSH target")]
+    Enable {
+        #[arg(help = "ID of the target to enable")]
+        target_id: Uuid,
+    },
+    #[command(about = "Disable an SSH target")]
+    Disable {
+        #[arg(help = "ID of the target to disable")]
+        target_id: Uuid,
+    },
+    #[command(about = "Delete an SSH target")]
+    Delete {
+        #[arg(help = "ID of the target to delete")]
+        target_id: Uuid,
+    },
+    #[command(about = "Issue a one-time enrollment code for a target")]
+    IssueEnrollment {
+        #[arg(help = "ID of the target")]
+        target_id: Uuid,
+    },
 }

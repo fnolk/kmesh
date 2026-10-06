@@ -21,9 +21,13 @@ use super::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "admin", disable_help_subcommand = true)]
+#[command(
+    name = "admin",
+    about = "Manage users, SSH keys, roles, grants, and targets",
+    disable_help_subcommand = true
+)]
 struct AdminLine {
-    #[arg(long)]
+    #[arg(long, help = "Output the response as JSON")]
     json: bool,
     #[command(subcommand)]
     command: Option<AdminCommand>,
