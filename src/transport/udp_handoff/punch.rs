@@ -608,7 +608,7 @@ fn io_punch_error(error: io::Error) -> PunchError {
 #[cfg(test)]
 mod tests {
     use super::super::super::qad::QadReflector;
-    use super::super::discovery::{PRIVATE_QAD_PORT, default_qad_configs};
+    use super::super::discovery::default_qad_configs;
     use super::*;
     use crate::transport::QadPlan;
     use uuid::Uuid;
@@ -616,7 +616,7 @@ mod tests {
     fn private_qad_plan() -> QadPlan {
         QadPlan::PrivateAndOfficial {
             server_url: "https://192.0.2.11:9443".parse().unwrap(),
-            udp_port: PRIVATE_QAD_PORT,
+            udp_port: 3478,
         }
     }
 
@@ -656,8 +656,7 @@ mod tests {
         ]
     }
 
-    const B_QAD_ADDR_FOR_TEST: SocketAddrV4 =
-        SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 11), PRIVATE_QAD_PORT);
+    const B_QAD_ADDR_FOR_TEST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 11), 3478);
 
     #[tokio::test]
     async fn selected_target_index_matches_client_offer_and_releases_tuple() {

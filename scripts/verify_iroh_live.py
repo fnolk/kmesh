@@ -11,6 +11,7 @@ import base64
 import argparse
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -30,7 +31,8 @@ from pathlib import Path
 from typing import Any
 
 
-ISSUER_DEFAULT = "https://192.0.2.11:9443"
+SERVER_ADDR_DEFAULT = "192.0.2.11"
+SERVER_PORT_DEFAULT = 9443
 SERVER_DEFAULT = "root@192.0.2.11"
 TARGET_DEFAULT = "target-1"
 REMOTE_ROOT = "/opt/kmesh-iroh-verification"
@@ -332,12 +334,8 @@ class Harness:
             str(self.args.client_binary),
             "--config",
             str(self.client_config),
-            "--data-dir",
-            str(self.client_state),
             "--profile",
             profile,
-            "--server-url",
-            self.args.issuer,
             *subcommand,
         ]
 
@@ -366,13 +364,8 @@ class Harness:
         return json.loads(self.state_file.read_text())
 
 
-def server_units(issuer: str) -> dict[str, str]:
-    base = (
-        f"{REMOTE_ROOT}/bin/kmesh --data-dir {REMOTE_ROOT}/server-data "
-        f"server run --issuer {issuer} --bind 0.0.0.0:9443 "
-        f"--tls-cert {REMOTE_ROOT}/tls/server-cert.pem "
-        f"--tls-key {REMOTE_ROOT}/tls/server-key.pem --qad-bind 0.0.0.0:3478"
-    )
+def server_units() -> dict[str, str]:
+    base = f"{REMOTE_ROOT}/bin/kmesh --config {REMOTE_ROOT}/server-data/config.toml server run"
     template = """[Unit]
 Description=kmesh Iroh verification server ({mode})
 After=network-online.target
@@ -396,7 +389,7 @@ WantedBy=multi-user.target
     }
 
 
-def agent_unit(issuer: str) -> str:
+def agent_unit() -> str:
     return f"""[Unit]
 Description=kmesh Iroh verification agent for target %i
 After=network-online.target
@@ -404,7 +397,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={REMOTE_ROOT}/bin/kmesh --data-dir {REMOTE_ROOT}/agent-data --server-url {issuer} agent run --target-id %i
+ExecStart={REMOTE_ROOT}/bin/kmesh --config {REMOTE_ROOT}/agent-data/config.toml agent run --target-id %i
 Restart=always
 RestartSec=2
 TimeoutStopSec=20
@@ -420,7 +413,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--server-ssh", default=SERVER_DEFAULT)
     parser.add_argument("--target-ssh", default=TARGET_DEFAULT)
-    parser.add_argument("--issuer", default=ISSUER_DEFAULT)
+    parser.add_argument("--server-addr", default=SERVER_ADDR_DEFAULT, help="Server IP address or hostname")
+    parser.add_argument("--server-port", type=int, default=SERVER_PORT_DEFAULT, help="Server HTTPS port")
     parser.add_argument("--state-dir", type=Path, default=STATE_DEFAULT)
     repo = Path(__file__).resolve().parents[1]
     parser.add_argument("--client-binary", type=Path, default=repo / "target/aarch64-apple-darwin/release/kmesh")
@@ -646,7 +640,26 @@ def stage(harness: Harness) -> None:
         args.target_ssh,
         f"install -m 0644 /opt/kmesh-verification/ca.pem {REMOTE_ROOT}/ca.pem",
     )
-    for unit, contents in server_units(args.issuer).items():
+    server_config = (
+        f"server_addr = {json.dumps(args.server_addr)}\n"
+        f"server_port = {args.server_port}\n"
+        f"data_dir = {json.dumps(REMOTE_ROOT + '/server-data')}\n"
+        "profile = \"verification-server\"\n\n"
+        "[server]\n"
+        "bind_addr = \"0.0.0.0\"\n"
+        "udp_port = 3478\n"
+        f"tls_cert = {json.dumps(REMOTE_ROOT + '/tls/server-cert.pem')}\n"
+        f"tls_key = {json.dumps(REMOTE_ROOT + '/tls/server-key.pem')}\n"
+        "disable_private_relay = false\n"
+    )
+    harness.remote(
+        "stage",
+        "write-server-config",
+        args.server_ssh,
+        ["python3", "-c", REMOTE_WRITE, f"{REMOTE_ROOT}/server-data/config.toml", "0640"],
+        stdin=server_config.encode(),
+    )
+    for unit, contents in server_units().items():
         harness.remote(
             "stage",
             f"write-{unit}",
@@ -659,10 +672,12 @@ def stage(harness: Harness) -> None:
         "write-agent-unit",
         args.target_ssh,
         ["python3", "-c", REMOTE_WRITE, f"/etc/systemd/system/{AGENT_UNIT}", "0644"],
-        stdin=agent_unit(args.issuer).encode(),
+        stdin=agent_unit().encode(),
     )
     agent_config = (
-        f"server_url = {json.dumps(args.issuer)}\n"
+        f"server_addr = {json.dumps(args.server_addr)}\n"
+        f"server_port = {args.server_port}\n"
+        f"data_dir = {json.dumps(REMOTE_ROOT + '/agent-data')}\n"
         "profile = \"verification\"\n\n"
         "[tls]\n"
         f"ca_certificates = [{json.dumps(REMOTE_ROOT + '/ca.pem')}]\n\n"
@@ -684,14 +699,12 @@ def stage(harness: Harness) -> None:
     harness.protect_secret(admin_password.decode("utf-8", "replace"))
     init_command = [
         f"{REMOTE_ROOT}/bin/kmesh",
-        "--data-dir",
-        f"{REMOTE_ROOT}/server-data",
+        "--config",
+        f"{REMOTE_ROOT}/server-data/config.toml",
         "server",
         "init",
         "--admin",
         "verification-admin",
-        "--issuer",
-        args.issuer,
         "--password-stdin",
     ]
     harness.remote(
@@ -907,7 +920,8 @@ def write_private_file(path: Path, value: bytes) -> None:
 def client_config(harness: Harness) -> None:
     args = harness.args
     text = (
-        f"server_url = {json.dumps(args.issuer)}\n"
+        f"server_addr = {json.dumps(args.server_addr)}\n"
+        f"server_port = {args.server_port}\n"
         f"profile = \"verification\"\n"
         f"data_dir = {json.dumps(str(harness.client_state))}\n\n"
         "[tls]\n"
@@ -1223,10 +1237,8 @@ def deploy(harness: Harness) -> None:
 
     enroll_args = [
         f"{REMOTE_ROOT}/bin/kmesh",
-        "--server-url",
-        args.issuer,
-        "--data-dir",
-        f"{REMOTE_ROOT}/agent-data",
+        "--config",
+        f"{REMOTE_ROOT}/agent-data/config.toml",
         "agent",
         "enroll",
         "--target-id",
@@ -2130,6 +2142,21 @@ def rollback(harness: Harness) -> None:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if not 1 <= args.server_port <= 65535:
+        parser.error("--server-port must be between 1 and 65535")
+    if not args.server_addr or args.server_addr != args.server_addr.strip() or any(
+        character in args.server_addr for character in "/?#@"
+    ):
+        parser.error("--server-addr must be an IP address or hostname without a scheme or path")
+    try:
+        address = ipaddress.ip_address(args.server_addr)
+    except ValueError:
+        if ":" in args.server_addr or "[" in args.server_addr or "]" in args.server_addr:
+            parser.error("--server-addr must be an IP address or hostname without a scheme or path")
+        host = args.server_addr
+    else:
+        host = f"[{address}]" if isinstance(address, ipaddress.IPv6Address) else str(address)
+    args.issuer = f"https://{host}:{args.server_port}"
     if args.command == "plan":
         print_plan(args)
         return 0

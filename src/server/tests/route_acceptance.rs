@@ -158,9 +158,18 @@ impl LocalServer {
 
     fn client_config(&self) -> Result<PathBuf> {
         let data_dir = self.fixture.data_dir.join("route-client-state");
+        let issuer = reqwest::Url::parse(&self.issuer)?;
         let config = Config {
             profile: "route-acceptance".to_owned(),
-            server_url: self.issuer.clone(),
+            server_addr: issuer
+                .host_str()
+                .context("issuer has no host")?
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned(),
+            server_port: issuer
+                .port_or_known_default()
+                .context("issuer has no port")?,
             data_dir,
             tls: self.tls.clone(),
             ..Config::default()
@@ -1044,7 +1053,8 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
             config: Some(config_path),
             data_dir: None,
             profile: None,
-            server_url: None,
+            server_addr: None,
+            server_port: None,
             command: ClientCommand::Proxy { target_id },
         })
         .await

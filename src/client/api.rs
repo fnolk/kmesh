@@ -41,7 +41,7 @@ impl Api {
     pub async fn new(config: &Config) -> Result<Self> {
         let http =
             http_client(&config.tls).map_err(|error| anyhow!("build HTTP client: {error}"))?;
-        let base_url = canonical_origin(&config.server_url)?;
+        let base_url = config.server_origin()?;
         Ok(Self {
             base_url,
             tls: config.tls.clone(),
@@ -235,20 +235,6 @@ impl Api {
             .map_err(|_| anyhow!("invalid WebSocket URL scheme"))?;
         Ok(url)
     }
-}
-
-pub fn canonical_origin(server_url: &str) -> Result<String> {
-    let url = Url::parse(server_url).context("parse server URL")?;
-    anyhow::ensure!(
-        url.path() == "/" && url.query().is_none() && url.fragment().is_none(),
-        "server URL must be an origin without a path, query, or fragment"
-    );
-    anyhow::ensure!(url.scheme() == "https", "server URL must use HTTPS");
-    anyhow::ensure!(
-        url.username().is_empty() && url.password().is_none(),
-        "server URL cannot include credentials"
-    );
-    Ok(url.origin().ascii_serialization())
 }
 
 async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T> {

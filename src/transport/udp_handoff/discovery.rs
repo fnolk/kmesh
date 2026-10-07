@@ -20,7 +20,6 @@ use super::super::{
 use super::{DiscoveredUdpSocket, MappingDiscovery, PunchError, PunchRole, QadPlan};
 use crate::config::TlsConfig;
 
-pub(super) const PRIVATE_QAD_PORT: u16 = 3478;
 const MAPPING_DISCOVERY_BUDGET: Duration = Duration::from_secs(2);
 
 /// Discover this node's IPv4 QAD mappings on the same wildcard-bound socket retained for punch.
@@ -113,11 +112,6 @@ async fn qad_reflectors(
             server_url,
             udp_port,
         } => {
-            if *udp_port != PRIVATE_QAD_PORT {
-                return Err(TransportError::Configuration(
-                    "private server QAD port is fixed at UDP 3478".to_owned(),
-                ));
-            }
             let host = server_url.host_str().ok_or_else(|| {
                 TransportError::Configuration("private relay URL has no host".to_owned())
             })?;
@@ -313,16 +307,10 @@ fn expected_reflector_servers(qad_plan: &QadPlan) -> Result<Vec<(String, u16)>, 
             server_url,
             udp_port,
         } => {
-            if *udp_port != PRIVATE_QAD_PORT {
-                return Err(TransportError::Configuration(
-                    "private server QAD port is fixed at UDP 3478".to_owned(),
-                )
-                .into());
-            }
             let server_name = server_url.host_str().ok_or_else(|| {
                 TransportError::Configuration("private relay URL has no host".to_owned())
             })?;
-            reflectors.push((server_name.to_owned(), PRIVATE_QAD_PORT));
+            reflectors.push((server_name.to_owned(), *udp_port));
             reflectors.extend(default_qad_configs(1)?);
         }
         QadPlan::OfficialDefault => reflectors.extend(default_qad_configs(2)?),
@@ -345,4 +333,21 @@ pub(super) fn unique_observed_addrs(
         }
     }
     Ok(addresses)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expected_reflector_servers;
+    use crate::transport::QadPlan;
+
+    #[test]
+    fn private_qad_uses_server_advertised_nondefault_port() {
+        let plan = QadPlan::PrivateAndOfficial {
+            server_url: "https://192.0.2.11:9443".parse().unwrap(),
+            udp_port: 4000,
+        };
+
+        let reflectors = expected_reflector_servers(&plan).unwrap();
+        assert_eq!(reflectors[0], ("192.0.2.11".to_owned(), 4000));
+    }
 }
