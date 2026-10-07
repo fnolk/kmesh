@@ -35,8 +35,8 @@ use crate::{
     config::{Config, TlsConfig},
     identity,
     protocol::{
-        ControlMessage, DiscoveryResult, LoginTokens, NativePlan, PasswordLoginRequest, RouteMode,
-        SelectedPath, TunnelTicketClaims,
+        ControlMessage, DiscoveryResult, LoginTokens, NativePlan, RouteMode, SelectedPath,
+        TokenLoginRequest, TunnelTicketClaims,
     },
     transport::{
         IrohByteStream, IrohEndpointOptions, IrohPathKind, QadReflector, RelayChoice, connect_peer,
@@ -50,7 +50,6 @@ use super::{
 
 const LOCAL_PRIVATE_QAD: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3478);
 const ADMIN_USERNAME: &str = "admin";
-const ADMIN_PASSWORD: &str = "initial-admin-password";
 const SSH_BANNER: &[u8] = b"SSH-2.0-kmesh-route-fixture\r\n";
 const SSH_REQUEST: &[u8] = b"kmesh fixture command\n";
 const SSH_RESPONSE: &[u8] = b"fixture command output\n";
@@ -172,6 +171,11 @@ impl LocalServer {
                 .context("issuer has no port")?,
             data_dir,
             tls: self.tls.clone(),
+            auth: crate::config::AuthConfig {
+                method: Some(crate::config::LoginMethod::Token),
+                token: Some(self.fixture.admin_token.clone()),
+                ..crate::config::AuthConfig::default()
+            },
             ..Config::default()
         };
         let path = self.fixture.data_dir.join("route-client-config.toml");
@@ -840,14 +844,7 @@ async fn run_client_cli(
         .kill_on_drop(true);
     match mode {
         "login" => {
-            command.args([
-                "login",
-                "--method",
-                "password",
-                "--username",
-                ADMIN_USERNAME,
-                "--password-stdin",
-            ]);
+            command.args(["login", "--method", "token"]);
         }
         "proxy" => {
             command.arg("proxy").arg(
@@ -877,18 +874,10 @@ async fn run_client_cli(
 }
 
 async fn login_client(config_path: &Path) -> Result<()> {
-    let password = format!("{ADMIN_PASSWORD}\n");
-    let output = run_client_cli(
-        "login",
-        config_path,
-        None,
-        password.as_bytes(),
-        Duration::from_secs(15),
-    )
-    .await?;
+    let output = run_client_cli("login", config_path, None, &[], Duration::from_secs(15)).await?;
     ensure!(
         output.status.success(),
-        "client CLI password login failed: {}",
+        "client CLI token login failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
@@ -1000,10 +989,9 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
         }
         let http = crate::transport::http_client(&server.tls)?;
         let tokens: LoginTokens = http
-            .post(format!("{}/v1/auth/password", server.issuer))
-            .json(&PasswordLoginRequest {
-                username: ADMIN_USERNAME.to_owned(),
-                password: ADMIN_PASSWORD.to_owned(),
+            .post(format!("{}/v1/auth/token", server.issuer))
+            .json(&TokenLoginRequest {
+                token: server.fixture.admin_token.clone(),
             })
             .send()
             .await?

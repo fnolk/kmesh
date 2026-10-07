@@ -52,19 +52,17 @@ pub(crate) struct ServerInner {
     pub transport_info: RwLock<crate::protocol::TransportInfo>,
 }
 
-/// Create the database, token keys and initial management account once.
+/// Create the database, token keys, initial management account, and initial API token once.
 pub async fn initialize(
     data_dir: impl AsRef<Path>,
     admin_username: &str,
-    admin_password: &str,
     issuer: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let data_dir = data_dir.as_ref();
     if issuer.trim().is_empty() || issuer.len() > 512 {
-        bail!("initial admin username, password and issuer must be non-empty");
+        bail!("issuer must be non-empty");
     }
     let admin_username = auth::normalize_username(admin_username)?;
-    auth::validate_password(admin_password)?;
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create server data directory {}", data_dir.display()))?;
     set_private_dir(data_dir)?;
@@ -87,15 +85,19 @@ pub async fn initialize(
         let keys = identity::generate_token_key_set().context("generate server token keys")?;
         write_private_atomically(&key_path, &serde_json::to_vec(&PersistedKeys::from(&keys))?)?;
     }
-    let admin_password_hash = if user_count == 0 {
-        Some(auth::password_hash_limited(admin_password.to_owned()).await?)
+    let initial_api_token = if user_count == 0 {
+        Some(new_api_token())
     } else {
         None
     };
-    db.initialize(issuer, &admin_username, admin_password_hash)
-        .await?;
+    db.initialize(
+        issuer,
+        &admin_username,
+        initial_api_token.as_deref().map(hash_secret),
+    )
+    .await?;
     FileExt::unlock(&lock).context("unlock server initialization")?;
-    Ok(())
+    Ok(initial_api_token)
 }
 
 /// Run the HTTPS API, embedded Iroh relay, and Iroh QAD using persistent server state.
@@ -242,6 +244,10 @@ pub(crate) fn hash_secret(value: &str) -> String {
 pub(crate) fn new_secret() -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random::<[u8; 32]>())
+}
+
+pub(crate) fn new_api_token() -> String {
+    format!("kmesh_{}", new_secret())
 }
 
 pub(crate) fn hex_digest(bytes: &[u8]) -> String {

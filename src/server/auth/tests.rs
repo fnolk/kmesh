@@ -22,8 +22,8 @@ use crate::{
     identity,
     protocol::{
         AdminOperation, AdminRequest, AdminResponse, AgentEnrollmentRequest, LoginTokens,
-        PasswordLoginRequest, PublicKeyChallengeRequest, PublicKeyLoginRequest, RouteMode,
-        TargetPermission,
+        PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest, RouteMode,
+        TargetPermission, TokenLoginRequest,
     },
 };
 
@@ -31,11 +31,10 @@ use super::super::{ServerInner, ServerState, admin, control, db::Database};
 use super::*;
 
 const TEST_ISSUER: &str = "https://kmesh-auth-contract.test";
-const INITIAL_ADMIN_PASSWORD: &str = "initial-admin-password";
-
 struct Fixture {
     state: ServerState,
     data_dir: PathBuf,
+    admin_token: String,
 }
 
 impl Drop for Fixture {
@@ -52,12 +51,14 @@ async fn fixture() -> Fixture {
         .expect("open test database");
     db.apply_schema().await.expect("apply test schema");
     let keys = identity::generate_token_key_set().expect("generate test token keys");
-    let admin_hash = password_hash_limited(INITIAL_ADMIN_PASSWORD.to_owned())
-        .await
-        .expect("hash initial admin password");
-    db.initialize(TEST_ISSUER, "admin", Some(admin_hash))
-        .await
-        .expect("initialize test admin");
+    let admin_token = super::super::new_api_token();
+    db.initialize(
+        TEST_ISSUER,
+        "admin",
+        Some(super::super::hash_secret(&admin_token)),
+    )
+    .await
+    .expect("initialize test admin");
     Fixture {
         state: ServerState {
             inner: Arc::new(ServerInner {
@@ -74,6 +75,7 @@ async fn fixture() -> Fixture {
             }),
         },
         data_dir,
+        admin_token,
     }
 }
 
@@ -91,17 +93,12 @@ fn bearer(token: &str) -> HeaderMap {
     headers
 }
 
-async fn login(
-    state: &ServerState,
-    username: &str,
-    password: &str,
-) -> Result<LoginTokens, ApiError> {
-    password_login(
+async fn login(state: &ServerState, token: &str) -> Result<LoginTokens, ApiError> {
+    token_login(
         State(state.clone()),
         remote(),
-        Json(PasswordLoginRequest {
-            username: username.to_owned(),
-            password: password.to_owned(),
+        Json(TokenLoginRequest {
+            token: token.to_owned(),
         }),
     )
     .await
@@ -121,6 +118,96 @@ async fn admin_request(
     .await
     .map(|response| response.0)
     .map_err(|error| error.into_response().status())
+}
+
+#[tokio::test]
+async fn api_token_issue_list_revoke_and_derived_sessions_contract() {
+    let fixture = fixture().await;
+    let state = &fixture.state;
+    let admin_tokens = login(state, &fixture.admin_token)
+        .await
+        .expect("login initial administrator");
+    let admin_id = identity::decode_user_access_token(
+        &admin_tokens.access_token,
+        &state.inner.keys.user_access.public_key_pem,
+        TEST_ISSUER,
+    )
+    .expect("decode administrator access token")
+    .sub;
+    let issued = admin_request(
+        state,
+        &admin_tokens.access_token,
+        AdminOperation::CreateApiToken {
+            user_id: admin_id,
+            label: "automation".to_owned(),
+        },
+    )
+    .await
+    .expect("issue API token");
+    let AdminResponse::ApiTokenIssued { api_token, token } = issued else {
+        panic!("token issue returned an unexpected response");
+    };
+    assert!(token.starts_with("kmesh_"));
+    let stored_hash: String = sqlx::query_scalar("SELECT token_hash FROM api_tokens WHERE id = ?1")
+        .bind(api_token.token_id.to_string())
+        .fetch_one(&state.inner.db.pool)
+        .await
+        .expect("read API token hash");
+    assert_eq!(stored_hash, super::super::hash_secret(&token));
+    assert_ne!(stored_hash, token);
+
+    let user_tokens = login(state, &token)
+        .await
+        .expect("login with issued API token");
+    let listed = admin_request(
+        state,
+        &admin_tokens.access_token,
+        AdminOperation::ListApiTokens { user_id: admin_id },
+    )
+    .await
+    .expect("list API tokens");
+    assert!(matches!(
+        listed,
+        AdminResponse::ApiTokens(tokens)
+            if tokens.iter().any(|listed| listed.token_id == api_token.token_id
+                && listed.label == "automation"
+                && listed.revoked_at.is_none())
+    ));
+
+    admin_request(
+        state,
+        &admin_tokens.access_token,
+        AdminOperation::RevokeApiToken {
+            token_id: api_token.token_id,
+        },
+    )
+    .await
+    .expect("revoke API token");
+    assert!(
+        authenticate(state, &bearer(&user_tokens.access_token))
+            .await
+            .is_err()
+    );
+    let refresh_result = refresh(
+        State(state.clone()),
+        remote(),
+        Json(RefreshRequest {
+            refresh_token: user_tokens.refresh_token.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        refresh_result.unwrap_err().into_response().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login(state, &token)
+            .await
+            .unwrap_err()
+            .into_response()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 fn generate_ssh_key(directory: &Path, name: &str, algorithm: &str) -> PathBuf {
@@ -179,33 +266,37 @@ async fn key_challenge(
 }
 
 #[tokio::test]
-async fn password_and_ssh_sig_contracts_cover_algorithms_expiry_action_and_replay() {
+async fn api_token_and_ssh_sig_contracts_cover_algorithms_expiry_action_and_replay() {
     let fixture = fixture().await;
     let state = &fixture.state;
-    let password_tokens = login(state, "ADMIN", INITIAL_ADMIN_PASSWORD)
+    let api_tokens = login(state, &fixture.admin_token)
         .await
-        .expect("password login");
-    let header = decode_header(&password_tokens.access_token).expect("decode JWT header");
+        .expect("API token login");
+    let header = decode_header(&api_tokens.access_token).expect("decode JWT header");
     assert_eq!(header.alg, Algorithm::EdDSA);
     let claims = identity::decode_user_access_token(
-        &password_tokens.access_token,
+        &api_tokens.access_token,
         &state.inner.keys.user_access.public_key_pem,
         TEST_ISSUER,
     )
     .expect("verify Ed25519 access token");
     assert_eq!(claims.exp - claims.iat, 15 * 60);
-    assert_eq!(password_tokens.access_expires_at, claims.exp);
+    assert_eq!(api_tokens.access_expires_at, claims.exp);
     assert_eq!(
-        password_tokens.refresh_expires_at - claims.iat,
+        api_tokens.refresh_expires_at - claims.iat,
         30 * 24 * 60 * 60
     );
-    let password_hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?1")
-        .bind(claims.sub.to_string())
-        .fetch_one(&state.inner.db.pool)
-        .await
-        .expect("read stored Argon2 password hash");
-    assert!(password_hash.starts_with("$argon2id$"));
-    assert_ne!(password_hash, INITIAL_ADMIN_PASSWORD);
+    let stored_api_token_hash: String =
+        sqlx::query_scalar("SELECT token_hash FROM api_tokens WHERE user_id = ?1")
+            .bind(claims.sub.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("read stored API token hash");
+    assert_eq!(
+        stored_api_token_hash,
+        super::super::hash_secret(&fixture.admin_token)
+    );
+    assert_ne!(stored_api_token_hash, fixture.admin_token);
     let stored_refresh_hash: String =
         sqlx::query_scalar("SELECT token_hash FROM refresh_tokens WHERE session_id = ?1")
             .bind(claims.sid.to_string())
@@ -214,12 +305,12 @@ async fn password_and_ssh_sig_contracts_cover_algorithms_expiry_action_and_repla
             .expect("read stored refresh-token hash");
     assert_eq!(
         stored_refresh_hash,
-        super::super::hash_secret(&password_tokens.refresh_token)
+        super::super::hash_secret(&api_tokens.refresh_token)
     );
-    assert_ne!(stored_refresh_hash, password_tokens.refresh_token);
-    let wrong_password = login(state, "admin", "wrong-password").await;
+    assert_ne!(stored_refresh_hash, api_tokens.refresh_token);
+    let wrong_token = login(state, "invalid-api-token").await;
     assert_eq!(
-        wrong_password.unwrap_err().into_response().status(),
+        wrong_token.unwrap_err().into_response().status(),
         StatusCode::UNAUTHORIZED
     );
 
@@ -336,7 +427,7 @@ async fn password_and_ssh_sig_contracts_cover_algorithms_expiry_action_and_repla
 async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     let fixture = fixture().await;
     let state = &fixture.state;
-    let admin_tokens = login(state, "admin", INITIAL_ADMIN_PASSWORD)
+    let admin_tokens = login(state, &fixture.admin_token)
         .await
         .expect("login administrator");
 
@@ -345,13 +436,26 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         &admin_tokens.access_token,
         AdminOperation::CreateUser {
             username: "ssh-user".to_owned(),
-            password: "ssh-user-initial-password".to_owned(),
         },
     )
     .await
     .expect("create user through admin handler");
     let AdminResponse::User(user) = created_user else {
         panic!("create user returned an unexpected response");
+    };
+    let user_token = match admin_request(
+        state,
+        &admin_tokens.access_token,
+        AdminOperation::CreateApiToken {
+            user_id: user.user_id,
+            label: "ssh-user test".to_owned(),
+        },
+    )
+    .await
+    .expect("issue SSH-only user API token")
+    {
+        AdminResponse::ApiTokenIssued { token, .. } => token,
+        _ => panic!("API token creation returned an unexpected response"),
     };
     assert!(matches!(
         admin_request(state, &admin_tokens.access_token, AdminOperation::ListUsers)
@@ -644,7 +748,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     assert_eq!(
         admin_request(
             state,
-            &login(state, "ssh-user", "ssh-user-initial-password")
+            &login(state, &user_token)
                 .await
                 .expect("login SSH-only user")
                 .access_token,
@@ -655,7 +759,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         StatusCode::FORBIDDEN,
         "the ssh_connect grant does not imply administrative authority"
     );
-    let user_tokens = login(state, "ssh-user", "ssh-user-initial-password")
+    let user_tokens = login(state, &user_token)
         .await
         .expect("login SSH-only user for connection test");
     let visible_targets = admin::targets(State(state.clone()), bearer(&user_tokens.access_token))
@@ -745,7 +849,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     .await
     .expect("disable user");
     assert_eq!(
-        login(state, "ssh-user", "ssh-user-initial-password")
+        login(state, &user_token)
             .await
             .unwrap_err()
             .into_response()
@@ -763,25 +867,9 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     )
     .await
     .expect("re-enable user after disabled-login check");
-    admin_request(
-        state,
-        &admin_tokens.access_token,
-        AdminOperation::ResetPassword {
-            user_id: user.user_id,
-            password: "ssh-user-reset-password".to_owned(),
-        },
-    )
-    .await
-    .expect("reset user password");
-    login(state, "ssh-user", "ssh-user-reset-password")
+    login(state, &user_token)
         .await
-        .expect("login using reset password");
-    assert!(
-        login(state, "ssh-user", "ssh-user-initial-password")
-            .await
-            .is_err(),
-        "password reset invalidates the old password"
-    );
+        .expect("login with the user's API token after re-enable");
 
     admin_request(
         state,

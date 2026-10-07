@@ -84,7 +84,7 @@ class Verification:
         self.forward: str | None = None
         self.revocation_attempted = False
         self.target_disable_attempted = False
-        self.logout_restore: tuple[str, bytes] | None = None
+        self.logout_restore: bytes | None = None
         self.cleanup_errors: list[str] = []
         self.host_key_alias = ""
         self.known_hosts = Path()
@@ -855,21 +855,23 @@ class Verification:
         finally:
             self.restore_target()
 
-    def verification_user_password(self) -> tuple[str, bytes]:
+    def verification_user_token(self) -> bytes:
         deployment_file = self.args.admin_config.parent / "deployment.json"
         if not deployment_file.is_file() or stat.S_IMODE(deployment_file.stat().st_mode) != 0o600:
             raise VerificationError("protected verification deployment state is missing")
         deployment = json.loads(deployment_file.read_text())
-        username = deployment.get("username")
-        password_file = deployment.get("user_password_file")
-        if not isinstance(username, str) or not username or not isinstance(password_file, str) or not password_file:
+        token_file = deployment.get("user_token_file")
+        if not isinstance(token_file, str) or not token_file:
             raise VerificationError("verification user credentials are unavailable")
-        password_path = Path(password_file)
-        if not password_path.is_file():
-            raise VerificationError("verification user password file is missing")
-        if stat.S_IMODE(password_path.stat().st_mode) != 0o600:
-            raise VerificationError("verification password file is not owner-only")
-        return username, password_path.read_bytes()
+        token_path = Path(token_file)
+        if not token_path.is_file():
+            raise VerificationError("verification user API token file is missing")
+        if stat.S_IMODE(token_path.stat().st_mode) != 0o600:
+            raise VerificationError("verification API token file is not owner-only")
+        token = token_path.read_bytes().rstrip(b"\r\n")
+        if not token:
+            raise VerificationError("verification user API token file is empty")
+        return token
 
     def verification_user_cli(self, *command: str) -> list[str]:
         if (
@@ -887,25 +889,22 @@ class Verification:
     def restore_verification_login(self) -> None:
         if self.logout_restore is None:
             return
-        username, password = self.logout_restore
+        token = self.logout_restore.decode("utf-8")
         self.run(
             "restore-verification-user-login",
             self.verification_user_cli(
                 "login",
                 "--method",
-                "password",
-                "--username",
-                username,
-                "--password-stdin",
+                "token",
             ),
-            input_data=password,
+            env={"KMESH_TOKEN": token},
             timeout=30,
         )
         self.logout_restore = None
 
     def verify_logout_boundary(self) -> None:
-        username, password = self.verification_user_password()
-        self.logout_restore = (username, password)
+        token = self.verification_user_token()
+        self.logout_restore = token
         self.run(
             "verification-user-logout",
             self.verification_user_cli("logout"),

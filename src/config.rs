@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub profile: String,
+    pub auth: AuthConfig,
     pub server_addr: String,
     pub server_port: u16,
     pub data_dir: PathBuf,
@@ -23,6 +24,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             profile: "default".to_owned(),
+            auth: AuthConfig::default(),
             server_addr: "localhost".to_owned(),
             server_port: 9443,
             data_dir: default_data_dir(),
@@ -31,6 +33,22 @@ impl Default for Config {
             server: ServerConfig::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoginMethod {
+    Token,
+    PublicKey,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    pub method: Option<LoginMethod>,
+    pub username: Option<String>,
+    pub key: Option<PathBuf>,
+    pub token: Option<String>,
 }
 
 impl Config {
@@ -177,6 +195,26 @@ mod tests {
         assert_eq!(config.server_addr, "localhost");
         assert_eq!(config.server_port, 9443);
         assert_eq!(config.server.udp_port, 3478);
+        assert!(config.auth.method.is_none());
+        assert!(config.auth.username.is_none());
+        assert!(config.auth.key.is_none());
+        assert!(config.auth.token.is_none());
+    }
+
+    #[test]
+    fn auth_method_serializes_as_the_cli_value() {
+        assert_eq!(
+            toml::from_str::<AuthConfig>("method = \"public-key\"")
+                .unwrap()
+                .method,
+            Some(LoginMethod::PublicKey)
+        );
+        assert_eq!(
+            toml::from_str::<AuthConfig>("method = \"token\"")
+                .unwrap()
+                .method,
+            Some(LoginMethod::Token)
+        );
     }
 
     #[test]

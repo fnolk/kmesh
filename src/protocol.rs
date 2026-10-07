@@ -12,9 +12,17 @@ pub struct LoginTokens {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PasswordLoginRequest {
-    pub username: String,
-    pub password: String,
+pub struct TokenLoginRequest {
+    pub token: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApiTokenView {
+    pub token_id: Uuid,
+    pub user_id: Uuid,
+    pub label: String,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,15 +104,20 @@ pub enum AdminOperation {
     ListUsers,
     CreateUser {
         username: String,
-        password: String,
     },
     SetUserEnabled {
         user_id: Uuid,
         enabled: bool,
     },
-    ResetPassword {
+    CreateApiToken {
         user_id: Uuid,
-        password: String,
+        label: String,
+    },
+    ListApiTokens {
+        user_id: Uuid,
+    },
+    RevokeApiToken {
+        token_id: Uuid,
     },
     AddUserKey {
         user_id: Uuid,
@@ -175,6 +188,11 @@ pub enum AdminResponse {
     Ok,
     Users(Vec<UserView>),
     User(UserView),
+    ApiTokenIssued {
+        api_token: ApiTokenView,
+        token: String,
+    },
+    ApiTokens(Vec<ApiTokenView>),
     Keys(Vec<UserKeyView>),
     Role(RoleView),
     Roles(Vec<RoleView>),

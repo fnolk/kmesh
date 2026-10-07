@@ -91,6 +91,11 @@ fn load_config_at(cli: &Cli, default_config_path: &Path) -> Result<Config> {
         .tls_key
         .as_deref()
         .map(|path| resolve_path(path, config_dir));
+    config.auth.key = config
+        .auth
+        .key
+        .as_deref()
+        .map(|path| resolve_path(path, config_dir));
     if let Some(data_dir) = &cli.data_dir {
         config.data_dir = resolve_path(data_dir, &current_dir);
     }
@@ -114,10 +119,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         cli::Command::Server { command } => match command {
             cli::ServerCommand::Init(args) => {
-                let password = auth::read_password("请设置管理员密码：", args.password_stdin)?;
                 let issuer = config.server_origin()?;
-                server::initialize(&config.data_dir, &args.admin, &password, &issuer).await?;
+                let initial_token =
+                    server::initialize(&config.data_dir, &args.admin, &issuer).await?;
                 println!("服务端已初始化。issuer={issuer}");
+                if let Some(token) = initial_token {
+                    println!("初始管理员 API token（仅显示一次）：{token}");
+                }
             }
             cli::ServerCommand::Run(args) => {
                 let issuer = config.server_origin()?;
@@ -238,7 +246,7 @@ mod tests {
         let config_path = directory.join("config.toml");
         fs::write(
             &config_path,
-            "server_addr = \"toml.example\"\nserver_port = 9443\nprofile = \"work\"\ndata_dir = \"state\"\n\n[tls]\nca_certificates = [\"ca.pem\"]\n\n[server]\nudp_port = 4000\ntls_cert = \"server.crt\"\ntls_key = \"server.key\"\n",
+            "server_addr = \"toml.example\"\nserver_port = 9443\nprofile = \"work\"\ndata_dir = \"state\"\n\n[auth]\nmethod = \"public-key\"\nusername = \"toml-user\"\nkey = \"keys/id_ed25519\"\ntoken = \"toml-token\"\n\n[tls]\nca_certificates = [\"ca.pem\"]\n\n[server]\nudp_port = 4000\ntls_cert = \"server.crt\"\ntls_key = \"server.key\"\n",
         )
         .expect("write temporary config");
         let target = Uuid::new_v4().to_string();
@@ -261,6 +269,13 @@ mod tests {
         assert_eq!(config.server_addr, "cli.example");
         assert_eq!(config.server_port, 9555);
         assert_eq!(config.profile, "ops");
+        assert_eq!(
+            config.auth.method,
+            Some(crate::config::LoginMethod::PublicKey)
+        );
+        assert_eq!(config.auth.username.as_deref(), Some("toml-user"));
+        assert_eq!(config.auth.key, Some(directory.join("keys/id_ed25519")));
+        assert_eq!(config.auth.token.as_deref(), Some("toml-token"));
         assert_eq!(config.server.udp_port, 4000);
         assert_eq!(
             config.data_dir,
@@ -279,6 +294,23 @@ mod tests {
         let cli = Cli::try_parse_from(["kmesh", "--config", directory.to_str().unwrap(), "logout"])
             .expect("parse explicit config argument");
         assert!(load_config_at(&cli, &PathBuf::from("unused-config.toml")).is_err());
+    }
+
+    #[test]
+    fn non_login_commands_load_config_without_complete_auth_settings() {
+        let directory = std::env::temp_dir().join(format!("kmesh-config-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create temporary config directory");
+        let config_path = directory.join("config.toml");
+        fs::write(&config_path, "server_addr = \"example.test\"\n")
+            .expect("write config without login settings");
+        let cli =
+            Cli::try_parse_from(["kmesh", "--config", config_path.to_str().unwrap(), "logout"])
+                .expect("parse non-login command");
+
+        let config = load_config_at(&cli, &config_path).expect("load non-login config");
+        assert!(config.auth.method.is_none());
+        assert!(config.auth.token.is_none());
+        fs::remove_dir_all(directory).expect("remove temporary config directory");
     }
 
     #[tokio::test]

@@ -89,6 +89,62 @@ fn cli_splits_server_address_and_ports_and_removes_server_url() {
 }
 
 #[test]
+fn cli_accepts_token_and_public_key_login_inputs() {
+    let cli = Cli::try_parse_from([
+        "kmesh",
+        "login",
+        "--method",
+        "public-key",
+        "--username",
+        "alice",
+        "--key",
+        "~/.ssh/id_ed25519",
+    ])
+    .expect("parse public-key login overrides");
+    let kmesh::client::Command::Login(args) = cli.command else {
+        panic!("expected login command");
+    };
+    assert_eq!(args.method, Some(kmesh::config::LoginMethod::PublicKey));
+    assert_eq!(args.username.as_deref(), Some("alice"));
+    assert_eq!(
+        args.key.as_deref(),
+        Some(std::path::Path::new("~/.ssh/id_ed25519"))
+    );
+
+    let cli = Cli::try_parse_from([
+        "kmesh",
+        "login",
+        "--method",
+        "token",
+        "--token",
+        "kmesh_opaque_token",
+    ])
+    .expect("parse token login override");
+    let kmesh::client::Command::Login(args) = cli.command else {
+        panic!("expected login command");
+    };
+    assert_eq!(args.method, Some(kmesh::config::LoginMethod::Token));
+    assert_eq!(args.token.as_deref(), Some("kmesh_opaque_token"));
+    assert!(Cli::try_parse_from(["kmesh", "login", "--password-stdin"]).is_err());
+}
+
+#[test]
+fn admin_token_commands_parse_and_password_user_commands_are_gone() {
+    let user_id = Uuid::new_v4().to_string();
+    let token_id = Uuid::new_v4().to_string();
+    assert!(
+        Cli::try_parse_from([
+            "kmesh", "admin", "tokens", "create", &user_id, "--label", "laptop",
+        ])
+        .is_ok()
+    );
+    assert!(Cli::try_parse_from(["kmesh", "admin", "tokens", "list", &user_id]).is_ok());
+    assert!(Cli::try_parse_from(["kmesh", "admin", "tokens", "revoke", &token_id]).is_ok());
+    assert!(Cli::try_parse_from(["kmesh", "admin", "users", "create", "alice"]).is_ok());
+    assert!(Cli::try_parse_from(["kmesh", "admin", "users", "reset-password", &user_id]).is_err());
+}
+
+#[test]
 fn admin_key_registration_takes_a_public_key_file() {
     let user_id = Uuid::new_v4().to_string();
     let args = [

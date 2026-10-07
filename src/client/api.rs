@@ -9,9 +9,8 @@ use crate::{
     config::{Config, TlsConfig},
     protocol::{
         AdminRequest, AdminResponse, AgentEnrollmentRequest, AgentEnrollmentResponse,
-        ControlMessage, LoginTokens, PasswordLoginRequest, PublicKeyChallenge,
-        PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest, TargetView,
-        TransportInfo,
+        ControlMessage, LoginTokens, PublicKeyChallenge, PublicKeyChallengeRequest,
+        PublicKeyLoginRequest, RefreshRequest, TargetView, TokenLoginRequest, TransportInfo,
     },
     transport::{connect_wss, http_client},
 };
@@ -53,8 +52,8 @@ impl Api {
         &self.base_url
     }
 
-    pub async fn password_login(&self, request: &PasswordLoginRequest) -> Result<LoginTokens> {
-        self.post("auth/password", request, None).await
+    pub async fn token_login(&self, request: &TokenLoginRequest) -> Result<LoginTokens> {
+        self.post("auth/token", request, None).await
     }
 
     pub async fn public_key_challenge(

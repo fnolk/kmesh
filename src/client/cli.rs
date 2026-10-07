@@ -94,8 +94,6 @@ pub enum ServerCommand {
 pub struct ServerInitArgs {
     #[arg(long, help = "Username for the first administrator")]
     pub admin: String,
-    #[arg(long, help = "Read the administrator password from standard input")]
-    pub password_stdin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -143,26 +141,23 @@ pub struct AgentRunArgs {
     pub target_id: Uuid,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum LoginMethod {
-    Password,
-    PublicKey,
-}
+pub use crate::config::LoginMethod;
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Default)]
 pub struct LoginArgs {
-    #[arg(
-        long,
-        value_enum,
-        help = "Authentication method: password or public-key"
-    )]
-    pub method: LoginMethod,
-    #[arg(long, help = "Account username")]
-    pub username: String,
-    #[arg(long, help = "Read the password from standard input")]
-    pub password_stdin: bool,
+    #[arg(long, value_enum, help = "Authentication method: token or public-key")]
+    pub method: Option<LoginMethod>,
+    #[arg(long, help = "Account username for public-key login")]
+    pub username: Option<String>,
     #[arg(long, help = "Path to the SSH private key used for public-key login")]
     pub key: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "KMESH_TOKEN",
+        hide_env_values = true,
+        help = "API token (also read from KMESH_TOKEN)"
+    )]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -185,6 +180,11 @@ pub enum AdminCommand {
     Users {
         #[command(subcommand)]
         action: UserAction,
+    },
+    #[command(about = "Manage long-lived API tokens")]
+    Tokens {
+        #[command(subcommand)]
+        action: ApiTokenAction,
     },
     #[command(about = "Manage user SSH public keys")]
     Keys {
@@ -209,6 +209,27 @@ pub enum AdminCommand {
 }
 
 #[derive(Debug, Subcommand, Clone)]
+pub enum ApiTokenAction {
+    #[command(about = "Create and display a user's API token once")]
+    Create {
+        #[arg(help = "ID of the user who will own the token")]
+        user_id: Uuid,
+        #[arg(long, help = "Label describing this token")]
+        label: String,
+    },
+    #[command(about = "List a user's API tokens")]
+    List {
+        #[arg(help = "ID of the user")]
+        user_id: Uuid,
+    },
+    #[command(about = "Revoke an API token")]
+    Revoke {
+        #[arg(help = "ID of the token to revoke")]
+        token_id: Uuid,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone)]
 pub enum UserAction {
     #[command(about = "List user accounts")]
     List,
@@ -216,8 +237,6 @@ pub enum UserAction {
     Create {
         #[arg(help = "Username for the new account")]
         username: String,
-        #[arg(long, help = "Read the new password from standard input")]
-        password_stdin: bool,
     },
     #[command(about = "Disable a user account")]
     Disable {
@@ -228,13 +247,6 @@ pub enum UserAction {
     Enable {
         #[arg(help = "ID of the user to enable")]
         user_id: Uuid,
-    },
-    #[command(about = "Reset a user's password")]
-    ResetPassword {
-        #[arg(help = "ID of the user whose password will be reset")]
-        user_id: Uuid,
-        #[arg(long, help = "Read the new password from standard input")]
-        password_stdin: bool,
     },
     #[command(about = "Replace a user's role assignments")]
     Roles {

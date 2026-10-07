@@ -38,9 +38,9 @@ use crate::{
     identity,
     protocol::{
         AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, DiscoveryResult,
-        LoginTokens, NativePlan, PasswordLoginRequest, PublicKeyChallengeRequest,
-        PublicKeyLoginRequest, ReadyDiscovery, RefreshRequest, RouteMode, SelectedPath,
-        TargetPermission, TunnelTicketClaims,
+        LoginTokens, NativePlan, PublicKeyChallengeRequest, PublicKeyLoginRequest, ReadyDiscovery,
+        RefreshRequest, RouteMode, SelectedPath, TargetPermission, TokenLoginRequest,
+        TunnelTicketClaims,
     },
     transport::{
         IrohByteStream, IrohEndpointOptions, QadObservation, QadReflector, RelayChoice,
@@ -57,6 +57,7 @@ use super::{
 struct Fixture {
     state: ServerState,
     data_dir: PathBuf,
+    admin_token: String,
 }
 
 impl Drop for Fixture {
@@ -67,9 +68,10 @@ impl Drop for Fixture {
 
 async fn fixture(issuer: &str) -> Fixture {
     let data_dir = std::env::temp_dir().join(format!("kmesh-server-test-{}", Uuid::new_v4()));
-    super::initialize(&data_dir, "Admin", "initial-admin-password", issuer)
+    let admin_token = super::initialize(&data_dir, "Admin", issuer)
         .await
-        .expect("initialize test server");
+        .expect("initialize test server")
+        .expect("new server returns initial admin token");
     let key_bytes = std::fs::read(data_dir.join("token-keys.json")).expect("read generated keys");
     let db = Database::open(data_dir.join("server.sqlite3"))
         .await
@@ -94,6 +96,7 @@ async fn fixture(issuer: &str) -> Fixture {
             }),
         },
         data_dir,
+        admin_token,
     }
 }
 
@@ -110,17 +113,16 @@ fn bearer(token: &str) -> HeaderMap {
     headers
 }
 
-async fn login_password(state: &ServerState) -> LoginTokens {
-    auth::password_login(
+async fn login_api_token(state: &ServerState, token: &str) -> LoginTokens {
+    auth::token_login(
         State(state.clone()),
         remote(),
-        Json(PasswordLoginRequest {
-            username: "ADMIN".to_owned(),
-            password: "initial-admin-password".to_owned(),
+        Json(TokenLoginRequest {
+            token: token.to_owned(),
         }),
     )
     .await
-    .expect("password login")
+    .expect("API token login")
     .0
 }
 
@@ -853,13 +855,11 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
     let actor_id = admin_user_id(state).await;
-    let password = "audit-user-password-secret";
     let created_user = super::admin::apply_operation(
         state,
         actor_id,
         AdminOperation::CreateUser {
             username: "audit-user".to_owned(),
-            password: password.to_owned(),
         },
     )
     .await
@@ -867,6 +867,26 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     let AdminResponse::User(user) = created_user else {
         panic!("user creation returned an unexpected result");
     };
+    let issued = super::admin::apply_operation(
+        state,
+        actor_id,
+        AdminOperation::CreateApiToken {
+            user_id: user.user_id,
+            label: "audit token secret label".to_owned(),
+        },
+    )
+    .await
+    .expect("issue audited API token");
+    let AdminResponse::ApiTokenIssued { token, .. } = issued else {
+        panic!("API token issuance returned an unexpected result");
+    };
+    let stored_token_hash: String = sqlx::query_scalar(
+        "SELECT token_hash FROM api_tokens WHERE user_id = ?1 AND label = 'audit token secret label'",
+    )
+    .bind(user.user_id.to_string())
+    .fetch_one(&state.inner.db.pool)
+    .await
+    .expect("read stored API token hash");
 
     let created_target = super::admin::apply_operation(
         state,
@@ -905,17 +925,6 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     )
     .await
     .expect("register audited SSH key");
-    super::admin::apply_operation(
-        state,
-        actor_id,
-        AdminOperation::ResetPassword {
-            user_id: user.user_id,
-            password: "replacement-password-secret".to_owned(),
-        },
-    )
-    .await
-    .expect("reset password");
-
     let created_role = super::admin::apply_operation(
         state,
         actor_id,
@@ -970,15 +979,8 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
         .map(|row| row.try_get::<String, _>("context_json").unwrap())
         .collect::<Vec<_>>();
     let audit_dump = contexts.join("\n");
-    let password_hash =
-        sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE id = ?1")
-            .bind(user.user_id.to_string())
-            .fetch_one(&state.inner.db.pool)
-            .await
-            .expect("read stored password hash");
-    assert!(!audit_dump.contains(password));
-    assert!(!audit_dump.contains("replacement-password-secret"));
-    assert!(!audit_dump.contains(&password_hash));
+    assert!(!audit_dump.contains(&token));
+    assert!(!audit_dump.contains(&stored_token_hash));
     assert!(!audit_dump.contains(&enrollment_token));
     assert!(!audit_dump.contains(&public_key));
 
@@ -1011,6 +1013,33 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
 }
 
 #[tokio::test]
+async fn server_initialization_returns_initial_admin_token_only_once() {
+    let data_dir = std::env::temp_dir().join(format!("kmesh-init-token-{}", Uuid::new_v4()));
+    let token = super::initialize(&data_dir, "Admin", "https://kmesh-init.test")
+        .await
+        .expect("initialize server")
+        .expect("new server returns initial API token");
+    assert!(token.starts_with("kmesh_"));
+    assert_eq!(
+        super::initialize(&data_dir, "Admin", "https://kmesh-init.test")
+            .await
+            .expect("reinitialize server"),
+        None
+    );
+    let db = Database::open(data_dir.join("server.sqlite3"))
+        .await
+        .expect("open initialized database");
+    let stored_hash: String = sqlx::query_scalar("SELECT token_hash FROM api_tokens")
+        .fetch_one(&db.pool)
+        .await
+        .expect("read initial API token hash");
+    assert_eq!(stored_hash, super::hash_secret(&token));
+    assert_ne!(stored_hash, token);
+    drop(db);
+    std::fs::remove_dir_all(data_dir).expect("remove initialized test data");
+}
+
+#[tokio::test]
 async fn relay_access_scopes_target_data_identity_to_its_live_session() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
@@ -1036,7 +1065,7 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
         Access::Deny { .. }
     ));
 
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate relay test user");
@@ -1089,7 +1118,7 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
 async fn per_session_target_identity_requires_the_enrolled_device_signature() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate identity test user");
@@ -1179,7 +1208,7 @@ async fn per_session_target_identity_requires_the_enrolled_device_signature() {
 async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate duplicate endpoint test user");
@@ -1353,7 +1382,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
 async fn measured_candidate_pair_and_matching_punch_selection_reach_native_handoff() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate punch test user");
@@ -1620,7 +1649,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
 async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatched_index() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate punch selection test user");
@@ -1811,7 +1840,7 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
  {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate admin");
@@ -2002,7 +2031,7 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
 async fn closing_client_control_only_closes_its_pending_tunnels() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate admin");
@@ -2290,7 +2319,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
 async fn target_control_disconnect_only_closes_its_pending_sessions() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate target disconnect test user");
@@ -2438,7 +2467,7 @@ async fn public_default_mode_works_without_a_private_relay() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
     state.inner.transport_info.write().await.private_relay_url = None;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate admin");
@@ -2589,7 +2618,7 @@ async fn public_default_mode_works_without_a_private_relay() {
 async fn public_direct_attempt_rejects_a_relay_data_path() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate public direct test user");
@@ -2698,7 +2727,7 @@ async fn public_direct_attempt_rejects_a_relay_data_path() {
 async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let user = auth::authenticate(state, &bearer(&login.access_token))
         .await
         .expect("authenticate admin");
@@ -2965,7 +2994,7 @@ async fn sshsig_comment_canonicalization_and_challenge_replay() {
 async fn rotated_refresh_replay_revokes_the_session() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let tokens = login_password(state).await;
+    let tokens = login_api_token(state, &fixture.admin_token).await;
     let request = RefreshRequest {
         refresh_token: tokens.refresh_token,
     };
@@ -3066,7 +3095,7 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     };
     let mut agent_control = connect_control_ws(&issuer, "agent/control", &agent_token, &tls).await;
 
-    let login = login_password(state).await;
+    let login = login_api_token(state, &fixture.admin_token).await;
     let mut client_control =
         connect_control_ws(&issuer, "connect", &login.access_token, &tls).await;
     let client_secret = SecretKey::generate();

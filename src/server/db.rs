@@ -2,7 +2,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use argon2::{Argon2, PasswordHash};
 use sqlx::Row;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
@@ -43,7 +42,7 @@ impl Database {
                     .await?;
             if let Some(version) = version {
                 anyhow::ensure!(
-                    version == 3,
+                    version == 4,
                     "server database schema version {version} requires a fresh data directory"
                 );
             }
@@ -59,7 +58,7 @@ impl Database {
         &self,
         issuer: &str,
         admin_username: &str,
-        admin_password_hash: Option<String>,
+        initial_api_token_hash: Option<String>,
     ) -> Result<()> {
         let mut tx = self
             .pool
@@ -85,18 +84,17 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
         if user_count == 0 {
-            let admin_password_hash =
-                admin_password_hash.context("initial administrator password hash is required")?;
+            let initial_api_token_hash = initial_api_token_hash
+                .context("initial administrator API token hash is required")?;
             let user_id = uuid::Uuid::new_v4();
             let role_id = uuid::Uuid::new_v4();
             let now = unix_time();
             sqlx::query(
-                "INSERT INTO users(id, username, password_hash, enabled, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, 1, ?4, ?4)",
+                "INSERT INTO users(id, username, enabled, created_at, updated_at) \
+                 VALUES (?1, ?2, 1, ?3, ?3)",
             )
             .bind(user_id.to_string())
             .bind(admin_username)
-            .bind(admin_password_hash)
             .bind(now)
             .execute(&mut *tx)
             .await
@@ -119,6 +117,17 @@ impl Database {
                 .bind(role_id.to_string())
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query(
+                "INSERT INTO api_tokens(id, user_id, token_hash, label, created_at) \
+                 VALUES (?1, ?2, ?3, 'initial administrator token', ?4)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(user_id.to_string())
+            .bind(initial_api_token_hash)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .context("create initial administrator API token")?;
         }
         tx.commit().await.context("commit server initialization")?;
         Ok(())
@@ -164,6 +173,9 @@ impl Database {
         let found = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(SELECT 1 FROM auth_sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.id = ?1 AND s.user_id = ?2 AND s.revoked_at IS NULL \
+               AND (s.api_token_id IS NULL OR EXISTS (\
+                 SELECT 1 FROM api_tokens t WHERE t.id = s.api_token_id AND t.revoked_at IS NULL\
+               )) \
                AND s.refresh_expires_at > ?3 AND u.enabled = 1)",
         )
         .bind(session_id.to_string())
@@ -222,16 +234,6 @@ pub(crate) fn unix_time() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is before Unix epoch")
         .as_secs() as i64
-}
-
-pub(crate) fn password_matches(password: &str, encoded_hash: &str) -> bool {
-    let Ok(hash) = PasswordHash::new(encoded_hash) else {
-        return false;
-    };
-    use argon2::password_hash::PasswordVerifier;
-    Argon2::default()
-        .verify_password(password.as_bytes(), &hash)
-        .is_ok()
 }
 
 pub(crate) fn row_uuid(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<uuid::Uuid> {

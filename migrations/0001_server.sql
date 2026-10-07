@@ -11,7 +11,6 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    password_hash TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -41,6 +40,16 @@ CREATE TABLE IF NOT EXISTS user_roles (
     PRIMARY KEY (user_id, role_id)
 );
 CREATE INDEX IF NOT EXISTS user_roles_role_id_idx ON user_roles(role_id);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS api_tokens_user_id_idx ON api_tokens(user_id, revoked_at);
 
 CREATE TABLE IF NOT EXISTS role_global_permissions (
     role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
@@ -73,11 +82,16 @@ CREATE INDEX IF NOT EXISTS target_permissions_target_idx ON target_permissions(t
 CREATE TABLE IF NOT EXISTS auth_sessions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    auth_method TEXT NOT NULL CHECK (auth_method IN ('password', 'ssh_key')),
+    api_token_id TEXT REFERENCES api_tokens(id) ON DELETE CASCADE,
+    auth_method TEXT NOT NULL CHECK (auth_method IN ('api_token', 'ssh_key')),
     created_at INTEGER NOT NULL,
     access_expires_at INTEGER NOT NULL,
     refresh_expires_at INTEGER NOT NULL,
-    revoked_at INTEGER
+    revoked_at INTEGER,
+    CHECK (
+        (auth_method = 'api_token' AND api_token_id IS NOT NULL) OR
+        (auth_method = 'ssh_key' AND api_token_id IS NULL)
+    )
 );
 CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx ON auth_sessions(user_id, revoked_at);
 
@@ -134,4 +148,4 @@ CREATE TABLE IF NOT EXISTS admin_audit (
 CREATE INDEX IF NOT EXISTS admin_audit_actor_time_idx ON admin_audit(actor_user_id, occurred_at);
 CREATE INDEX IF NOT EXISTS admin_audit_object_idx ON admin_audit(object_type, object_id, occurred_at);
 
-INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, unixepoch());
+INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, unixepoch());

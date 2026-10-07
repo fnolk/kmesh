@@ -15,7 +15,6 @@ import ipaddress
 import json
 import os
 import re
-import secrets
 import select
 import signal
 import shlex
@@ -44,7 +43,7 @@ AGENT_UNIT = "kmesh-iroh-verification-agent@.service"
 SSH_CONNECT_TIMEOUT_SECONDS = 65
 SSH_COMMAND_TIMEOUT_SECONDS = 15
 SSH_NEW_CONNECTION_TIMEOUT_SECONDS = SSH_CONNECT_TIMEOUT_SECONDS + SSH_COMMAND_TIMEOUT_SECONDS
-ADMIN_PASSWORD_DEFAULT = Path("/Users/example/.cache/kmesh-live/server/admin-password")
+INITIAL_ADMIN_TOKEN_PREFIX = "初始管理员 API token（仅显示一次）："
 CA_DEFAULT = Path("/Users/example/.cache/kmesh-live/server/ca.pem")
 STATE_DEFAULT = Path("/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003")
 PATH_EVENT_RE = re.compile(
@@ -68,13 +67,17 @@ ROUTE_FAILURE_RE = re.compile(
 REMOTE_RUNNER = (
     "import json,subprocess,sys; "
     "secret=sys.stdin.buffer.read(); "
-    "args=[secret.decode() if x=='__KMESH_SECRET_STDIN__' else x for x in sys.argv[1:]]; "
-    "p=subprocess.run(args,input=(b'' if '__KMESH_SECRET_STDIN__' in sys.argv[1:] else secret),"
+    "raw_args=sys.argv[1:]; capture_stdout='__KMESH_CAPTURE_STDOUT__' in raw_args; "
+    "secret_stdin='__KMESH_SECRET_STDIN__' in raw_args; "
+    "args=[secret.decode() if x=='__KMESH_SECRET_STDIN__' else x for x in raw_args "
+    "if x!='__KMESH_CAPTURE_STDOUT__']; "
+    "p=subprocess.run(args,input=(b'' if secret_stdin else secret),"
     "stdout=subprocess.PIPE,stderr=subprocess.PIPE); "
     "err=p.stderr.decode('utf-8','replace'); "
     "err=err.replace(secret.decode('utf-8','replace'),'<redacted>') if secret else err; "
-    "print(json.dumps({'exit_code':p.returncode,'stdout_bytes':len(p.stdout),"
-    "'stderr':err[-4096:]},ensure_ascii=False)); sys.exit(p.returncode)"
+    "out={'exit_code':p.returncode,'stdout_bytes':len(p.stdout),'stderr':err[-4096:]}; "
+    "out['stdout']=p.stdout.decode('utf-8','replace') if capture_stdout else None; "
+    "print(json.dumps(out,ensure_ascii=False)); sys.exit(p.returncode)"
 )
 REMOTE_WRITE = (
     "import os,pathlib,sys\n"
@@ -135,7 +138,7 @@ class Harness:
             flags=re.DOTALL,
         )
         text = re.sub(
-            r"(?i)(password|enrollment[_ -]?token|access[_ -]?token|refresh[_ -]?token|secret)"
+            r"(?i)(password|api[_ -]?token|enrollment[_ -]?token|access[_ -]?token|refresh[_ -]?token|secret)"
             r"(\s*[:=]\s*)[^\s,;]+",
             r"\1\2<redacted>",
             text,
@@ -230,10 +233,13 @@ class Harness:
         argv: list[str],
         *,
         stdin: bytes | None = None,
+        capture_initial_admin_token: bool = False,
         timeout: float = 30,
         accepted: tuple[int, ...] = (0,),
     ) -> tuple[subprocess.CompletedProcess[bytes], dict[str, Any] | None]:
         remote_argv = ["python3", "-c", REMOTE_RUNNER, *argv]
+        if capture_initial_admin_token:
+            remote_argv.append("__KMESH_CAPTURE_STDOUT__")
         remote_command = shlex.join(remote_argv)
         ssh_argv = [
             "ssh",
@@ -264,6 +270,22 @@ class Harness:
         if remote_report:
             exit_code = int(remote_report.get("exit_code", exit_code))
             stderr = str(remote_report.get("stderr", "")).encode()
+            if capture_initial_admin_token:
+                output = str(remote_report.get("stdout") or "")
+                token = next(
+                    (
+                        line[len(INITIAL_ADMIN_TOKEN_PREFIX) :].strip()
+                        for line in output.splitlines()
+                        if line.startswith(INITIAL_ADMIN_TOKEN_PREFIX)
+                        and line[len(INITIAL_ADMIN_TOKEN_PREFIX) :].strip()
+                    ),
+                    None,
+                )
+                if token is None:
+                    raise VerificationError("server initialization did not return its initial admin API token")
+                self.protect_secret(token)
+                remote_report["captured_token"] = token
+                remote_report.pop("stdout", None)
         status = "passed" if exit_code in accepted else "failed"
         self.record(
             phase,
@@ -282,6 +304,8 @@ class Harness:
             raise VerificationError(
                 f"{phase}/{label} on {host} exited {exit_code}: {self.redact(stderr).strip()}"
             )
+        if capture_initial_admin_token and remote_report is None:
+            raise VerificationError("server initialization output was unavailable for token capture")
         return result, remote_report
 
     def ssh_raw(
@@ -425,7 +449,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--artifact-revision", default=None)
     parser.add_argument("--ca-file", type=Path, default=CA_DEFAULT)
-    parser.add_argument("--admin-password-file", type=Path, default=ADMIN_PASSWORD_DEFAULT)
     parser.add_argument("--run-id", default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("plan", help="print planned boundaries without contacting hosts")
@@ -434,7 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("stage-binary", help="copy a new Linux artifact into inactive temp paths and verify SHA-256")
     subparsers.add_parser("refresh-binary", help="atomically update only the staged verification server and agent")
     subparsers.add_parser("deploy", help="transition from old services to the staged new services")
-    verify_parser = subparsers.add_parser("verify", help="run password login or reuse its saved session, then test SSH")
+    verify_parser = subparsers.add_parser("verify", help="run API-token login or reuse its saved session, then test SSH")
     verify_parser.add_argument("--reuse-login", action="store_true")
     subparsers.add_parser("key-login", help="verify SSHSIG login with an isolated temporary ssh-agent")
     probe = subparsers.add_parser("path-probe", help="run fresh direct-gated SSH path samples")
@@ -457,7 +480,7 @@ def print_plan(args: argparse.Namespace) -> None:
         "stage": [
             "read-only preflight; fail if /opt/kmesh-iroh-verification already exists",
             "copy the Linux musl binary, reuse the existing TLS files, write two new server units and one agent template",
-            "initialize a fresh SQLite data directory using the admin password through stdin",
+            "initialize a fresh SQLite data directory and capture the one-time admin API token into a 0600 local file",
             "leave both old units, binaries, and data running and untouched",
         ],
         "stage-binary": [
@@ -467,7 +490,7 @@ def print_plan(args: argparse.Namespace) -> None:
         "refresh-binary": [
             "stop only the current new target agent and the active new server mode",
             "atomically install the verified binary on both new hosts and restart in the same mode",
-            "reuse the schema 3 database, target UUID, and persistent agent identity",
+            "reuse the schema 4 database, target UUID, and persistent agent identity",
         ],
         "deploy": [
             "stop the old target agent, then the old public server to release TCP 9443 and UDP 3478",
@@ -476,10 +499,10 @@ def print_plan(args: argparse.Namespace) -> None:
             "start one new target agent and wait for the new target to report online",
         ],
         "verify": [
-            "password login in an isolated kmesh profile, then real OpenSSH hostname and expected exit code 23",
+            "API-token login in an isolated kmesh profile, then real OpenSSH hostname and expected exit code 23",
             "record the Iroh-selected path and remote address; the relay-mode label alone is not direct-path evidence",
             "key-login verifies SSHSIG with a separate temporary SSH_AUTH_SOCK; verify_iroh_ssh.py runs the extended SSH checks",
-            "write only sanitized results to a 0600 evidence report; preserve raw secrets in protected files/stdin",
+            "write only sanitized results to a 0600 evidence report; preserve raw secrets in protected files or environment variables",
         ],
         "mode": [
             "stop only the new target agent and active new server unit",
@@ -512,8 +535,6 @@ def ensure_client_inputs(harness: Harness) -> None:
         raise VerificationError("client binary is not executable")
     if not args.ca_file.is_file():
         raise VerificationError("--ca-file does not exist")
-    if not args.admin_password_file.is_file():
-        raise VerificationError("--admin-password-file does not exist")
 
 
 def preflight(harness: Harness) -> None:
@@ -695,8 +716,6 @@ def stage(harness: Harness) -> None:
     harness.ssh_raw("stage", "server-systemd-reload", args.server_ssh, "systemctl daemon-reload")
     harness.ssh_raw("stage", "target-systemd-reload", args.target_ssh, "systemctl daemon-reload")
 
-    admin_password = read_secret_file(args.admin_password_file)
-    harness.protect_secret(admin_password.decode("utf-8", "replace"))
     init_command = [
         f"{REMOTE_ROOT}/bin/kmesh",
         "--config",
@@ -705,15 +724,22 @@ def stage(harness: Harness) -> None:
         "init",
         "--admin",
         "verification-admin",
-        "--password-stdin",
     ]
-    harness.remote(
+    _, init_report = harness.remote(
         "stage",
         "initialize-new-server-database",
         args.server_ssh,
         init_command,
-        stdin=admin_password + b"\n",
+        stdin=b"",
+        capture_initial_admin_token=True,
         timeout=30,
+    )
+    if init_report is None:
+        raise VerificationError("initial administrator API token was not returned")
+    initial_admin_token = init_report["captured_token"]
+    write_private_file(
+        args.state_dir / "credentials" / "initial-admin-api-token",
+        initial_admin_token.encode("utf-8") + b"\n",
     )
     harness.report["staged_linux_binary"] = {
         "sha256": hashlib.sha256(args.linux_binary.read_bytes()).hexdigest(),
@@ -1111,27 +1137,25 @@ def wait_health(harness: Harness, phase: str) -> None:
     raise VerificationError(f"{phase}/https-health did not pass: {harness.redact(last_error)}")
 
 
-def admin_login(harness: Harness) -> bytes:
-    password = read_secret_file(harness.args.admin_password_file)
-    harness.protect_secret(password.decode("utf-8", "replace"))
+def admin_login(harness: Harness) -> None:
+    admin_token = read_secret_file(
+        harness.args.state_dir / "credentials" / "initial-admin-api-token"
+    ).decode("utf-8")
+    harness.protect_secret(admin_token)
     result = harness.local(
         "deploy",
-        "administrator-password-login",
+        "administrator-api-token-login",
         harness.kmesh_args(
             "admin",
             "login",
             "--method",
-            "password",
-            "--username",
-            "verification-admin",
-            "--password-stdin",
+            "token",
         ),
-        input_data=password + b"\n",
+        env={"KMESH_TOKEN": admin_token},
         timeout=30,
     )
     if result.returncode != 0:
         raise VerificationError("administrator login failed")
-    return password
 
 
 def deploy(harness: Harness) -> None:
@@ -1170,10 +1194,6 @@ def deploy(harness: Harness) -> None:
     enrollment_code = target_data["enrollment_token"]
     harness.protect_secret(enrollment_code)
 
-    password = secrets.token_urlsafe(32)
-    password_path = args.state_dir / "verification-user-password"
-    write_private_file(password_path, password.encode() + b"\n")
-    harness.protect_secret(password)
     user = expect_data(
         kmesh_admin_json(
             harness,
@@ -1181,14 +1201,30 @@ def deploy(harness: Harness) -> None:
             "users",
             "create",
             username,
-            "--password-stdin",
-            input_data=(password + "\n" + password + "\n").encode(),
             label="create-user",
         ),
         "user",
         "create-user",
     )
     user_id = user["user_id"]
+    issued_token = expect_data(
+        kmesh_admin_json(
+            harness,
+            "admin",
+            "tokens",
+            "create",
+            user_id,
+            "--label",
+            "verification-user",
+            label="create-user-api-token",
+        ),
+        "api_token_issued",
+        "create-user-api-token",
+    )
+    user_token = issued_token["token"]
+    harness.protect_secret(user_token)
+    user_token_file = args.state_dir / "credentials" / "verification-user-api-token"
+    write_private_file(user_token_file, user_token.encode("utf-8") + b"\n")
     role = expect_data(
         kmesh_admin_json(
             harness,
@@ -1225,7 +1261,7 @@ def deploy(harness: Harness) -> None:
         "target_name": target_name,
         "user_id": user_id,
         "username": username,
-        "user_password_file": str(password_path),
+        "user_token_file": str(user_token_file),
         "role_id": role_id,
         "role_name": role_name,
         "server_mode": "private",
@@ -1584,33 +1620,30 @@ def verify(harness: Harness, *, reuse_login: bool = False) -> None:
     if not config_path.is_file():
         client_config(harness)
     if reuse_login:
-        harness.record("verify", "reuse-saved-password-login-session", status="passed")
+        harness.record("verify", "reuse-saved-api-token-login-session", status="passed")
     else:
-        password = read_secret_file(Path(state["user_password_file"]))
-        harness.protect_secret(password.decode("utf-8", "replace"))
+        user_token = read_secret_file(Path(state["user_token_file"])).decode("utf-8")
+        harness.protect_secret(user_token)
         harness.local(
             "verify",
-            "verification-user-password-login",
+            "verification-user-api-token-login",
             harness.kmesh_args(
-                "ssh-password",
+                "ssh-token",
                 "login",
                 "--method",
-                "password",
-                "--username",
-                state["username"],
-                "--password-stdin",
+                "token",
             ),
-            input_data=password + b"\n",
+            env={"KMESH_TOKEN": user_token},
             timeout=30,
         )
-    session_fingerprint = auth_session_fingerprint(harness, "ssh-password", state["username"])
+    session_fingerprint = auth_session_fingerprint(harness, "ssh-token", state["username"])
     host_alias, known_host = fetch_target_host_key(harness, state)
     mode_suffix = "private" if state["server_mode"] == "private" else "public-direct"
     known_hosts = harness.run_dir / f"known_hosts-{mode_suffix}"
     write_private_file(known_hosts, known_host.encode())
     config_suffix = "" if mode_suffix == "private" else "-public-direct"
-    ssh_config = harness.run_dir / f"ssh-password{config_suffix}.conf"
-    alias = write_ssh_config(harness, state, "ssh-password", known_hosts, ssh_config)
+    ssh_config = harness.run_dir / f"ssh-token{config_suffix}.conf"
+    alias = write_ssh_config(harness, state, "ssh-token", known_hosts, ssh_config)
     env = {
         "PATH": str(harness.args.client_binary.parent) + os.pathsep + os.environ.get("PATH", ""),
     }
@@ -1646,7 +1679,7 @@ def verify(harness: Harness, *, reuse_login: bool = False) -> None:
         "source_revision": harness.args.artifact_revision,
         "client_binary_sha256": harness.report.get("client_artifact", {}).get("sha256"),
         "server_agent_binary_sha256": state.get("server_agent_binary_sha256"),
-        "login_profile": "ssh-password",
+        "login_profile": "ssh-token",
         "reused_login_session": reuse_login,
         "auth_session_sha256": session_fingerprint,
         "target_id": state["target_id"],
@@ -1736,10 +1769,10 @@ def _path_probe_sample(
         raise VerificationError("control-disconnect probe requires the new private server mode")
     mode_suffix = "private" if state["server_mode"] == "private" else "public-direct"
     config_suffix = "" if mode_suffix == "private" else "-public-direct"
-    ssh_config = ssh_config or harness.run_dir / f"ssh-password{config_suffix}.conf"
+    ssh_config = ssh_config or harness.run_dir / f"ssh-token{config_suffix}.conf"
     if not ssh_config.is_file():
         candidates = sorted(
-            harness.args.state_dir.glob(f"runs/*/ssh-password{config_suffix}.conf"),
+            harness.args.state_dir.glob(f"runs/*/ssh-token{config_suffix}.conf"),
             key=lambda path: path.stat().st_mtime,
         )
         if candidates:
