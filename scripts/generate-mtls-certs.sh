@@ -24,16 +24,24 @@ mkdir "$work_dir/newcerts"
 : > "$work_dir/index.txt"
 printf '1000\n' > "$work_dir/serial"
 
+config_output_dir=$output_dir
+config_work_dir=$work_dir
+if [ "${RUNNER_OS:-}" = "Windows" ]; then
+    config_output_dir=$(cygpath --mixed "$output_dir")
+    config_work_dir=$(cygpath --mixed "$work_dir")
+    export MSYS2_ARG_CONV_EXCL=/CN=
+fi
+
 cat > "$work_dir/openssl.cnf" <<EOF
 [ ca ]
 default_ca = kmesh_ca
 
 [ kmesh_ca ]
-database = $work_dir/index.txt
-new_certs_dir = $work_dir/newcerts
-serial = $work_dir/serial
-certificate = $output_dir/ca-cert.pem
-private_key = $output_dir/ca-key.pem
+database = $config_work_dir/index.txt
+new_certs_dir = $config_work_dir/newcerts
+serial = $config_work_dir/serial
+certificate = $config_output_dir/ca-cert.pem
+private_key = $config_output_dir/ca-key.pem
 default_md = sha384
 default_days = 26784
 policy = policy

@@ -1,10 +1,10 @@
 # Build and route acceptance
 
-The CI workflow runs formatting, Clippy, all-target tests, and a release build for each supported target. A successful CI run verifies those checks for its exact source revision; live P2P and SSH route selection need separate evidence from the deployed server, target agent, and client.
+The CI workflow runs formatting, Clippy, all-target tests, and release builds for Linux x86_64/aarch64 musl, macOS Apple Silicon, and Windows x86_64. A successful CI run verifies those checks for its exact source revision; live P2P and SSH route selection need separate evidence from the deployed server, target agent, and client.
 
 ## Reproducible release builds
 
-`scripts/build-release.sh` builds the four release targets: Linux x86_64 and aarch64 with musl, plus macOS Intel and Apple Silicon. It requires `cargo-zigbuild`, Zig, and the Rust targets. Set an explicit target directory before running it:
+`scripts/build-release.sh` builds four Linux and macOS release targets. It requires `cargo-zigbuild`, Zig, and the Rust targets. CI builds Windows x86_64 on a Windows runner. Set an explicit target directory before running the script:
 
 ```sh
 export CARGO_TARGET_DIR=/path/to/cargo-target
@@ -23,6 +23,8 @@ $CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/kmesh
 $CARGO_TARGET_DIR/x86_64-apple-darwin/release/kmesh
 $CARGO_TARGET_DIR/aarch64-apple-darwin/release/kmesh
 ```
+
+The Windows CI artifact is `target/x86_64-pc-windows-msvc/release/kmesh.exe` and is attached to GitHub releases as `kmesh-x86_64-pc-windows-msvc.zip`.
 
 Record the source revision and SHA-256 of each file before deployment. Check Linux binaries are static ELF executables with no interpreter or dynamic dependencies:
 

@@ -46,12 +46,19 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             install-musl: true
+            binary: kmesh
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             install-musl: true
+            binary: kmesh
           - os: macos-15
             target: aarch64-apple-darwin
             install-musl: false
+            binary: kmesh
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            install-musl: false
+            binary: kmesh.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -65,12 +72,19 @@ jobs:
           printf 'KMESH_CLIENT_KEY_PATH=%s/kmesh-mtls/client-key.pem\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Reject an untrusted manual build ref
         if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        shell: bash
         run: |
           echo 'workflow_dispatch builds must run from main.' >&2
           exit 1
       - name: Generate test mTLS certificates for pull requests
         if: github.event_name == 'pull_request'
-        run: scripts/generate-mtls-certs.sh "$RUNNER_TEMP/kmesh-mtls"
+        shell: bash
+        run: |
+          certificate_dir="$RUNNER_TEMP/kmesh-mtls"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            certificate_dir="$(cygpath --unix "$certificate_dir")"
+          fi
+          scripts/generate-mtls-certs.sh "$certificate_dir"
       - name: Load trusted mTLS certificates
         if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
         env:
@@ -114,7 +128,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: kmesh-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/kmesh
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 14
 
@@ -150,9 +164,17 @@ jobs:
             tar -C "release-artifacts/kmesh-${target}" \
               -czf "release-assets/kmesh-${target}.tar.gz" kmesh
           done
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          binary = Path("release-artifacts/kmesh-x86_64-pc-windows-msvc/kmesh.exe")
+          with ZipFile("release-assets/kmesh-x86_64-pc-windows-msvc.zip", "w", ZIP_DEFLATED) as archive:
+              archive.write(binary, binary.name)
+          PY
       - name: Upload binaries to the published release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" release-assets/*.tar.gz --repo "$GH_REPO" --clobber
+        run: gh release upload "$RELEASE_TAG" release-assets/* --repo "$GH_REPO" --clobber
