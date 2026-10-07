@@ -881,10 +881,7 @@ fn validate_reflector_sources(mappings: &[Mapping], official_server_name: &str) 
     );
     let b_reflector = mappings.iter().find(|mapping| {
         mapping.reflector_addr
-            == SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::new(192, 0, 2, 11),
-                B_QAD_PORT,
-            ))
+            == SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 11), B_QAD_PORT))
     });
     ensure!(
         b_reflector.is_some_and(|mapping| mapping.reflector_server_name == "192.0.2.11"),
