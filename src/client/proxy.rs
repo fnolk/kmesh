@@ -50,6 +50,7 @@ pub(super) fn is_retryable_route_failure(error: &anyhow::Error) -> bool {
 pub(super) fn server_setup_error(code: String, message: String) -> anyhow::Error {
     match code.as_str() {
         "authentication" | "authorization" => anyhow!(SshAuthenticationFailure(message)),
+        "incompatible_version" => anyhow!("kmesh client/server version incompatibility: {message}"),
         "network" => anyhow::Error::new(RouteNetworkFailure(anyhow!(message))),
         _ => anyhow!("server could not prepare SSH access: {message}"),
     }

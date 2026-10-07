@@ -13,8 +13,9 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use super::{
-    AgentRuntime, CONTROL_CONNECT_TIMEOUT, ClientContext, ServerAuthenticationFailure, ensure_auth,
-    is_authentication_error, server_session_error, session,
+    AgentRuntime, AgentVersionIncompatibility, CONTROL_CONNECT_TIMEOUT, ClientContext,
+    ServerAuthenticationFailure, ensure_auth, is_authentication_error, server_session_error,
+    session,
 };
 use crate::{
     client::api::{Api, WsStream},
@@ -208,6 +209,11 @@ pub(super) async fn control_session(
                         if code == "authentication" || code == "authorization" =>
                     {
                         return Err(anyhow!(ServerAuthenticationFailure(format!("server rejected agent control: {message}"))));
+                    }
+                    ControlMessage::Error { session_id: None, code, message }
+                        if code == "incompatible_version" =>
+                    {
+                        return Err(anyhow!(AgentVersionIncompatibility(message)));
                     }
                     message => {
                         route_session_message(&mut sessions, message).await;

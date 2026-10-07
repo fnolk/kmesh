@@ -1,6 +1,7 @@
 use super::{
-    TunnelOffer,
+    AgentVersionIncompatibility, TunnelOffer,
     control::{agent_session_error_code, route_session_message},
+    is_terminal_connection_error,
     route::endpoint_options,
     server_session_error,
     session::handle_dial_offer,
@@ -19,6 +20,14 @@ use tokio::{
     sync::mpsc,
 };
 use uuid::Uuid;
+
+#[test]
+fn incompatible_server_version_stops_agent_reconnection() {
+    let error = anyhow::Error::new(AgentVersionIncompatibility(
+        "client kmesh version 0.2.0 is incompatible with server kmesh 0.1.0".to_owned(),
+    ));
+    assert!(is_terminal_connection_error(&error));
+}
 
 #[test]
 fn per_session_error_classification_keeps_auth_and_protocol_failures_terminal() {

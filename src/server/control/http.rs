@@ -85,6 +85,9 @@ pub(in crate::server) async fn client_control(
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let user = authenticate(&state, &headers).await?;
+    if let Some(message) = client_version_mismatch(&headers) {
+        return Ok(ws.on_upgrade(move |socket| super::reject_incompatible_version(socket, message)));
+    }
     Ok(ws
         .max_message_size(MAX_CONTROL_MESSAGE)
         .max_frame_size(MAX_CONTROL_MESSAGE)
@@ -97,10 +100,20 @@ pub(in crate::server) async fn agent_control(
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let target_id = authenticate_agent(&state, &headers).await?;
+    if let Some(message) = client_version_mismatch(&headers) {
+        return Ok(ws.on_upgrade(move |socket| super::reject_incompatible_version(socket, message)));
+    }
     Ok(ws
         .max_message_size(MAX_CONTROL_MESSAGE)
         .max_frame_size(MAX_CONTROL_MESSAGE)
         .on_upgrade(move |socket| super::run_agent_control(state, target_id, socket)))
+}
+
+fn client_version_mismatch(headers: &HeaderMap) -> Option<String> {
+    let version = headers
+        .get(crate::version::VERSION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    crate::version::mismatch(version)
 }
 
 pub(in crate::server) async fn authenticate_agent(

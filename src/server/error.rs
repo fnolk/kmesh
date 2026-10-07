@@ -54,6 +54,14 @@ impl ApiError {
         )
     }
 
+    pub fn incompatible_version(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UPGRADE_REQUIRED,
+            "incompatible_version",
+            message,
+        )
+    }
+
     pub fn internal(error: impl std::fmt::Display) -> Self {
         tracing::error!(error = %error, "server request failed");
         Self::new(

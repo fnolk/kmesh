@@ -43,6 +43,17 @@ use tunnel::{
 
 pub(super) const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 
+async fn reject_incompatible_version(mut socket: WebSocket, message: String) {
+    let rejection = ControlMessage::Error {
+        session_id: None,
+        code: "incompatible_version".to_owned(),
+        message,
+    };
+    let payload = serde_json::to_string(&rejection).expect("encode version rejection message");
+    let _ = socket.send(Message::Text(payload.into())).await;
+    let _ = socket.send(Message::Close(None)).await;
+}
+
 #[derive(Clone)]
 pub struct OnlineAgent {
     pub(crate) connection_id: Uuid,

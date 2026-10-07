@@ -31,6 +31,7 @@ use tokio::{
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, http::HeaderValue as WsHeaderValue,
 };
+use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::{
@@ -124,6 +125,67 @@ async fn login_api_token(state: &ServerState, token: &str) -> LoginTokens {
     .await
     .expect("API token login")
     .0
+}
+
+#[tokio::test]
+async fn api_requires_a_semver_compatible_kmesh_client() {
+    let fixture = fixture("https://kmesh.test:9443").await;
+    let app = super::http::router(fixture.state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/transport")
+                .body(axum::body::Body::empty())
+                .expect("build missing-version request"),
+        )
+        .await
+        .expect("serve missing-version request");
+    assert_eq!(response.status(), axum::http::StatusCode::UPGRADE_REQUIRED);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("read version rejection");
+    let error: serde_json::Value = serde_json::from_slice(&body).expect("decode version error");
+    assert_eq!(error["error"], "incompatible_version");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("version error message")
+            .contains(crate::version::VERSION)
+    );
+
+    let incompatible_version = format!(
+        "{}.0.0",
+        semver::Version::parse(crate::version::VERSION)
+            .expect("package version uses SemVer")
+            .major
+            + 1
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/transport")
+                .header(crate::version::VERSION_HEADER, incompatible_version)
+                .body(axum::body::Body::empty())
+                .expect("build incompatible-version request"),
+        )
+        .await
+        .expect("serve incompatible-version request");
+    assert_eq!(response.status(), axum::http::StatusCode::UPGRADE_REQUIRED);
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/transport")
+                .header(crate::version::VERSION_HEADER, crate::version::VERSION)
+                .body(axum::body::Body::empty())
+                .expect("build compatible-version request"),
+        )
+        .await
+        .expect("serve compatible-version request");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
 
 async fn admin_role_id(state: &ServerState) -> Uuid {
@@ -3065,6 +3127,7 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     assert_eq!(health.status(), reqwest::StatusCode::OK);
     let published_transport: crate::protocol::TransportInfo = http
         .get(format!("{issuer}/v1/transport"))
+        .header(crate::version::VERSION_HEADER, crate::version::VERSION)
         .send()
         .await
         .expect("read private transport settings")
@@ -3081,6 +3144,50 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     let (target_id, agent_token) =
         create_enrolled_target(state, "self-hosted-target", &target_secret).await;
     grant_target(state, target_id).await;
+    let incompatible_version = format!(
+        "{}.0.0",
+        semver::Version::parse(crate::version::VERSION)
+            .expect("package version uses SemVer")
+            .major
+            + 1
+    );
+    let mut rejected_agent = connect_control_ws_with_version(
+        &issuer,
+        "agent/control",
+        &agent_token,
+        &tls,
+        &incompatible_version,
+    )
+    .await;
+    assert!(matches!(
+        receive_control(&mut rejected_agent).await,
+        ControlMessage::Error { session_id: None, code, message }
+            if code == "incompatible_version" && message.contains(&incompatible_version)
+    ));
+    assert!(
+        !state
+            .inner
+            .online_agents
+            .read()
+            .await
+            .contains_key(&target_id),
+        "version-rejected agent remains offline"
+    );
+    let login = login_api_token(state, &fixture.admin_token).await;
+    let mut rejected_client = connect_control_ws_with_version(
+        &issuer,
+        "connect",
+        &login.access_token,
+        &tls,
+        &incompatible_version,
+    )
+    .await;
+    assert!(matches!(
+        receive_control(&mut rejected_client).await,
+        ControlMessage::Error { session_id: None, code, message }
+            if code == "incompatible_version" && message.contains(&incompatible_version)
+    ));
+
     let relay_url: RelayUrl = reqwest::Url::parse(&issuer)
         .expect("parse private relay URL")
         .into();
@@ -3095,7 +3202,6 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     };
     let mut agent_control = connect_control_ws(&issuer, "agent/control", &agent_token, &tls).await;
 
-    let login = login_api_token(state, &fixture.admin_token).await;
     let mut client_control =
         connect_control_ws(&issuer, "connect", &login.access_token, &tls).await;
     let client_secret = SecretKey::generate();
@@ -3501,6 +3607,16 @@ async fn connect_control_ws(
     token: &str,
     tls: &TlsConfig,
 ) -> crate::transport::WsStream {
+    connect_control_ws_with_version(issuer, path, token, tls, crate::version::VERSION).await
+}
+
+async fn connect_control_ws_with_version(
+    issuer: &str,
+    path: &str,
+    token: &str,
+    tls: &TlsConfig,
+    version: &str,
+) -> crate::transport::WsStream {
     let mut url =
         reqwest::Url::parse(&format!("{issuer}/v1/{path}")).expect("build local control URL");
     url.set_scheme("wss").expect("switch control URL to WSS");
@@ -3511,6 +3627,10 @@ async fn connect_control_ws(
     request.headers_mut().insert(
         AUTHORIZATION,
         WsHeaderValue::from_str(&format!("Bearer {token}")).expect("build WSS bearer header"),
+    );
+    request.headers_mut().insert(
+        crate::version::VERSION_HEADER,
+        WsHeaderValue::from_str(version).expect("build WSS version header"),
     );
     crate::transport::connect_wss(request, tls)
         .await

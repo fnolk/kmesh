@@ -2,7 +2,10 @@
 
 pub mod config;
 pub mod identity;
+shadow_rs::shadow!(build);
+
 pub mod protocol;
+pub mod version;
 
 // Owned by the server, transport, and client implementation workstreams.
 pub mod client;

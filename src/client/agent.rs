@@ -57,6 +57,10 @@ pub(super) struct AgentAuthenticationFailure(pub(super) String);
 #[error("server selected an authentication failure: {0}")]
 pub(super) struct ServerAuthenticationFailure(pub(super) String);
 
+#[derive(Debug, thiserror::Error)]
+#[error("kmesh agent/server version incompatibility: {0}")]
+pub(super) struct AgentVersionIncompatibility(pub(super) String);
+
 pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &str) -> Result<()> {
     let credential_path = profile::agent_credentials_path(&context.config.data_dir, target_id);
     let pending_path = credential_path.with_extension("pending.json");
@@ -120,8 +124,13 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
     loop {
         match control::control_session(context, &credentials, &mut runtime).await {
             Ok(()) => bail!("agent control connection closed"),
-            Err(error) if is_authentication_error(&error) => {
-                tracing::error!(target = %target_id, error = %error, "agent credential was rejected; active SSH sessions will finish");
+            Err(error) if is_terminal_connection_error(&error) => {
+                let reason = if is_authentication_error(&error) {
+                    "agent credential was rejected"
+                } else {
+                    "agent and server kmesh versions are incompatible"
+                };
+                tracing::error!(target = %target_id, error = %error, "{reason}; active SSH sessions will finish");
                 while let Some(result) = runtime.active_sessions.join_next().await {
                     if let Err(error) = result {
                         tracing::warn!(target = %target_id, error = %error, "active SSH session ended");
@@ -150,6 +159,13 @@ pub(super) fn is_authentication_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<AgentAuthenticationFailure>().is_some()
         || error
             .downcast_ref::<ServerAuthenticationFailure>()
+            .is_some()
+}
+
+pub(super) fn is_terminal_connection_error(error: &anyhow::Error) -> bool {
+    is_authentication_error(error)
+        || error
+            .downcast_ref::<AgentVersionIncompatibility>()
             .is_some()
 }
 

@@ -10,6 +10,7 @@ use crate::protocol::TargetPermission;
 #[command(
     name = "kmesh",
     version,
+    long_version = crate::version::CLI_LONG_VERSION,
     about = "SSH access over direct QUIC or relay"
 )]
 pub struct Cli {

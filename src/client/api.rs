@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::{Method, Response, Url, header::AUTHORIZATION};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
 
 use crate::{
@@ -25,6 +25,8 @@ pub enum ApiFailure {
     Network(String),
     #[error("server returned HTTP {status}: {message}")]
     Server { status: u16, message: String },
+    #[error("{0}")]
+    IncompatibleVersion(String),
     #[error("invalid server response: {0}")]
     Protocol(String),
 }
@@ -179,7 +181,10 @@ impl Api {
         bearer: Option<&str>,
     ) -> Result<Response> {
         let url = self.api_url(path)?;
-        let mut request = self.http.request(method, url);
+        let mut request = self
+            .http
+            .request(method, url)
+            .header(crate::version::VERSION_HEADER, crate::version::VERSION);
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -202,6 +207,10 @@ impl Api {
             let value = HeaderValue::from_str(&format!("Bearer {token}"))?;
             request.headers_mut().insert(AUTHORIZATION, value);
         }
+        request.headers_mut().insert(
+            crate::version::VERSION_HEADER,
+            HeaderValue::from_static(crate::version::VERSION),
+        );
         tokio::time::timeout(Duration::from_secs(15), connect_wss(request, &self.tls))
             .await
             .map_err(|_| {
@@ -253,6 +262,12 @@ async fn response_failure(response: Response) -> ApiFailure {
         .text()
         .await
         .unwrap_or_else(|error| format!("read error body: {error}"));
+    if status == reqwest::StatusCode::UPGRADE_REQUIRED
+        && let Ok(error) = serde_json::from_str::<ErrorBody>(&message)
+        && error.error == "incompatible_version"
+    {
+        return ApiFailure::IncompatibleVersion(error.message);
+    }
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         ApiFailure::Authentication(message)
     } else {
@@ -261,4 +276,10 @@ async fn response_failure(response: Response) -> ApiFailure {
             message,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    error: String,
+    message: String,
 }

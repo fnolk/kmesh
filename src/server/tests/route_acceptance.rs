@@ -990,6 +990,7 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
         let http = crate::transport::http_client(&server.tls)?;
         let tokens: LoginTokens = http
             .post(format!("{}/v1/auth/token", server.issuer))
+            .header(crate::version::VERSION_HEADER, crate::version::VERSION)
             .json(&TokenLoginRequest {
                 token: server.fixture.admin_token.clone(),
             })
