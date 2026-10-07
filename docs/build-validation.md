@@ -13,6 +13,8 @@ export PATH=/path/to/cargo-zigbuild-directory:$PATH
 scripts/build-release.sh
 ```
 
+All local builds also require the five mTLS PEM inputs documented in [README.md](../README.md#build-time-mtls-certificates). Generate a local CA, server identity, and client identity with `scripts/generate-mtls-certs.sh`, then export `KMESH_CA_CERT_PATH`, `KMESH_SERVER_CERT_PATH`, `KMESH_SERVER_KEY_PATH`, `KMESH_CLIENT_CERT_PATH`, and `KMESH_CLIENT_KEY_PATH` to their PEM paths before running either `cargo build` or the release script. The CA private key is not a build input. Pull request CI explicitly creates temporary test identities, including for forks.
+
 The output files are:
 
 ```text
@@ -45,7 +47,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
 
-`--all-targets` includes library and binary tests, integration tests, and examples. Current tests cover protocol and identity boundaries, same-socket QAD discovery, signed UDP handoff, direct-only and private-relay endpoint policy, SSH-shaped QUIC streams, direct HTTPS/WSS connections with custom CA certificates, and failure classification. These tests do not establish that two deployed NATs select a direct path.
+`--all-targets` includes library and binary tests, integration tests, and examples. Tests cover protocol and identity boundaries, same-socket QAD discovery, signed UDP handoff, direct-only and private-relay endpoint policy, SSH-shaped QUIC streams, direct HTTPS/WSS connections with mTLS test identities, and failure classification. These tests do not establish that two deployed NATs select a direct path.
 
 ## Live acceptance gates
 

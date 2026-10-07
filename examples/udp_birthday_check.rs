@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
-    fs::{self, File},
-    io::BufReader,
+    fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket as StdUdpSocket},
     path::PathBuf,
     process::ExitCode,
@@ -23,7 +22,10 @@ use iroh::{
     },
 };
 use iroh_relay::{RelayQuicConfig, tls::CaTlsConfig};
-use kmesh::transport::{QadReflector, observe_ipv4_mappings};
+use kmesh::transport::{
+    QadReflector, observe_ipv4_mappings,
+    tls::{private_ca_tls_config, private_client_config, public_client_config},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -76,7 +78,6 @@ impl Role {
 
 struct Args {
     role: Role,
-    ca_file: PathBuf,
     local_ip: Ipv4Addr,
     endpoint_secret_key_file: PathBuf,
 }
@@ -283,16 +284,8 @@ async fn run() -> Result<()> {
         .map_err(|_| anyhow!("Endpoint secret key must contain 32 bytes"))?;
     let secret_key = SecretKey::from_bytes(&secret_bytes);
     let local_endpoint_id = secret_key.public();
-    let mut ca_reader = BufReader::new(File::open(&args.ca_file).context("open B CA PEM file")?);
-    let ca_certs = rustls_pemfile::certs(&mut ca_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("parse B CA PEM certificates")?;
-    ensure!(!ca_certs.is_empty(), "B CA file contains no certificates");
-    let ca_tls = CaTlsConfig::default().with_extra_roots(ca_certs);
-    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
-    let qad_tls = ca_tls
-        .client_config(crypto_provider)
-        .context("build QAD TLS client config with B CA and ring")?;
+    let ca_tls = private_ca_tls_config()?;
+    let qad_tls = vec![private_client_config()?, public_client_config()];
     let official_relay = RelayMode::Default
         .relay_map()
         .relays::<Vec<_>>()
@@ -691,7 +684,6 @@ async fn run() -> Result<()> {
 
 fn parse_args() -> Result<Args> {
     let mut role = None;
-    let mut ca_file = None;
     let mut local_ip = None;
     let mut endpoint_secret_key_file = None;
     let mut args = std::env::args().skip(1);
@@ -704,7 +696,6 @@ fn parse_args() -> Result<Args> {
                     _ => bail!("--role must be target or client"),
                 })
             }
-            "--ca-file" => ca_file = args.next().map(PathBuf::from),
             "--local-ip" => {
                 local_ip = Some(
                     args.next()
@@ -717,13 +708,12 @@ fn parse_args() -> Result<Args> {
                 endpoint_secret_key_file = args.next().map(PathBuf::from)
             }
             _ => bail!(
-                "usage: udp_birthday_check --role target|client --ca-file <PEM> --local-ip <IPv4> --endpoint-secret-key-file <FILE>"
+                "usage: udp_birthday_check --role target|client --local-ip <IPv4> --endpoint-secret-key-file <FILE>"
             ),
         }
     }
     Ok(Args {
         role: role.context("--role is required")?,
-        ca_file: ca_file.context("--ca-file is required")?,
         local_ip: local_ip.context("--local-ip is required")?,
         endpoint_secret_key_file: endpoint_secret_key_file
             .context("--endpoint-secret-key-file is required")?,

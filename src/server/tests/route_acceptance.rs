@@ -17,7 +17,6 @@ use futures_util::{SinkExt, StreamExt};
 use iroh::endpoint::VarInt;
 use iroh::{EndpointAddr, SecretKey};
 use iroh_relay::server::{Access, AccessControl, ClientRequest, DynAccessControl};
-use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -32,7 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     client::{self, Cli, Command as ClientCommand},
-    config::{Config, TlsConfig},
+    config::Config,
     identity,
     protocol::{
         ControlMessage, DiscoveryResult, LoginTokens, NativePlan, RouteMode, SelectedPath,
@@ -92,7 +91,6 @@ impl std::fmt::Debug for RelayAccessPolicy {
 struct LocalServer {
     fixture: Fixture,
     issuer: String,
-    tls: TlsConfig,
     access: RelayAccessPolicy,
     stop_server: Option<oneshot::Sender<()>>,
     server_task: JoinHandle<Result<()>>,
@@ -109,16 +107,7 @@ impl LocalServer {
         drop(port_probe);
         let issuer = format!("https://localhost:{https_port}");
         let fixture = fixture(&issuer).await;
-        let cert = generate_simple_self_signed(vec!["localhost".to_owned()])?;
-        let cert_path = fixture.data_dir.join("route-relay-cert.pem");
-        let key_path = fixture.data_dir.join("route-relay-key.pem");
-        fs::write(&cert_path, cert.cert.pem())?;
-        fs::write(&key_path, cert.signing_key.serialize_pem())?;
-        let tls = TlsConfig {
-            ca_certificates: vec![cert_path.clone()],
-            ..TlsConfig::default()
-        };
-        let _http_client = crate::transport::http_client(&tls)?;
+        let _http_client = crate::transport::http_client()?;
         let access = RelayAccessPolicy {
             state: fixture.state.clone(),
             denied_client_ids: Arc::new(Mutex::new(HashSet::new())),
@@ -130,8 +119,6 @@ impl LocalServer {
             Some(relay_access),
             SocketAddr::from(([127, 0, 0, 1], https_port)),
             qad_bind,
-            &cert_path,
-            &key_path,
         )
         .await
         .context("start loopback HTTPS, private relay and QAD fixture")?;
@@ -144,7 +131,6 @@ impl LocalServer {
         Ok(Self {
             fixture,
             issuer,
-            tls,
             access,
             stop_server: Some(stop_server),
             server_task,
@@ -170,7 +156,6 @@ impl LocalServer {
                 .port_or_known_default()
                 .context("issuer has no port")?,
             data_dir,
-            tls: self.tls.clone(),
             auth: crate::config::AuthConfig {
                 method: Some(crate::config::LoginMethod::Token),
                 token: Some(self.fixture.admin_token.clone()),
@@ -299,7 +284,7 @@ async fn probe_qad_blackhole() -> Result<(String, DropStats)> {
         server_name: "localhost".to_owned(),
     }];
     let deadline = Instant::now() + Duration::from_millis(400);
-    let probe = observe_ipv4_mappings(source, tls, &reflector, deadline, deadline).await;
+    let probe = observe_ipv4_mappings(source, vec![tls], &reflector, deadline, deadline).await;
     let error = match probe {
         Ok(_) => bail!("controlled UDP dropper unexpectedly completed a QAD handshake"),
         Err(error) => error,
@@ -368,8 +353,7 @@ async fn drive_target(
     deny_private_relay: bool,
     ssh_addr: Option<SocketAddr>,
 ) -> Result<TargetEvidence> {
-    let mut agent_control =
-        connect_control_ws(&server.issuer, "agent/control", &agent_token, &server.tls).await;
+    let mut agent_control = connect_control_ws(&server.issuer, "agent/control", &agent_token).await;
     wait_target_online(server.state(), target_id).await?;
 
     let mut evidence = TargetEvidence::default();
@@ -455,7 +439,6 @@ async fn drive_target(
                     false,
                     IrohEndpointOptions {
                         relay_choice: relay_choice.clone(),
-                        tls: server.tls.clone(),
                         handoff: None,
                     },
                 )
@@ -581,7 +564,6 @@ async fn drive_target(
                     false,
                     IrohEndpointOptions {
                         relay_choice: relay_choice.clone(),
-                        tls: server.tls.clone(),
                         handoff: None,
                     },
                 )
@@ -987,7 +969,7 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
             }
         }
-        let http = crate::transport::http_client(&server.tls)?;
+        let http = crate::transport::http_client()?;
         let tokens: LoginTokens = http
             .post(format!("{}/v1/auth/token", server.issuer))
             .header(crate::version::VERSION_HEADER, crate::version::VERSION)
@@ -1022,7 +1004,7 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
         }
 
         let _agent_control =
-            connect_control_ws(&server.issuer, "agent/control", &agent_token, &server.tls).await;
+            connect_control_ws(&server.issuer, "agent/control", &agent_token).await;
         wait_target_online(server.state(), target_id).await?;
         let has_grant: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM target_permissions WHERE target_id = ?1 \

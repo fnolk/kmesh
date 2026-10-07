@@ -31,8 +31,6 @@ pub struct ServerOptions {
     pub data_dir: PathBuf,
     pub issuer: String,
     pub bind: SocketAddr,
-    pub tls_cert: PathBuf,
-    pub tls_key: PathBuf,
     pub qad_bind: SocketAddr,
     pub disable_private_relay: bool,
 }
@@ -152,8 +150,6 @@ pub async fn run(options: ServerOptions) -> Result<()> {
         relay_access,
         options.bind,
         options.qad_bind,
-        &options.tls_cert,
-        &options.tls_key,
     )
     .await?;
     state.inner.transport_info.write().await.qad_port = server.qad_addr().port();

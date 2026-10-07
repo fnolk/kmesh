@@ -1,9 +1,9 @@
 use std::{
-    convert::Infallible, error::Error as StdError, fmt, future::Future, io::BufReader,
-    net::SocketAddr, path::Path, pin::Pin, sync::Arc,
+    convert::Infallible, error::Error as StdError, fmt, future::Future, net::SocketAddr, pin::Pin,
+    sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use axum::Router;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
@@ -19,7 +19,6 @@ use iroh_relay::{
         streams::MaybeTlsStream,
     },
 };
-use rustls::{ServerConfig, pki_types::PrivateKeyDer};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Notify, watch},
@@ -117,10 +116,10 @@ pub async fn listen_and_serve(
     relay_access: Option<Arc<dyn DynAccessControl>>,
     https_bind: SocketAddr,
     qad_bind: SocketAddr,
-    tls_cert: impl AsRef<Path>,
-    tls_key: impl AsRef<Path>,
 ) -> Result<IrohServer> {
-    let server_tls = load_server_tls(tls_cert, tls_key)?;
+    let mut server_tls = (*crate::transport::tls::server_config()?).clone();
+    server_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_tls = Arc::new(server_tls);
     let listener = TcpListener::bind(https_bind)
         .await
         .with_context(|| format!("bind kmesh HTTPS listener at {https_bind}"))?;
@@ -429,29 +428,4 @@ fn relay_handlers() -> Handlers {
         }),
     );
     handlers
-}
-
-fn load_server_tls(
-    cert_path: impl AsRef<Path>,
-    key_path: impl AsRef<Path>,
-) -> Result<Arc<ServerConfig>> {
-    let cert_file = std::fs::File::open(cert_path.as_ref())
-        .with_context(|| format!("open TLS certificate {}", cert_path.as_ref().display()))?;
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("parse HTTPS certificate chain")?;
-    if certs.is_empty() {
-        bail!("HTTPS certificate chain is empty");
-    }
-    let key_file = std::fs::File::open(key_path.as_ref())
-        .with_context(|| format!("open TLS private key {}", key_path.as_ref().display()))?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .context("parse HTTPS private key")?
-        .context("HTTPS private key is empty")?;
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("build HTTPS and Iroh QAD TLS configuration")?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
 }

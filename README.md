@@ -8,7 +8,7 @@ Each new SSH transport follows a bounded route plan. With a private relay config
 
 ## Build and install
 
-Rust 1.94 or newer and OpenSSH are required. The public server needs a TLS certificate and private key supplied by the deployment. Each target agent creates and persists a stable Iroh endpoint identity during enrollment. Build the binary with:
+Rust 1.94 or newer, OpenSSL, and OpenSSH are required. Each build embeds the kmesh mTLS trust certificate plus server and client identities; prepare those materials as described in [Build-time mTLS certificates](#build-time-mtls-certificates). Each target agent creates and persists a stable Iroh endpoint identity during enrollment. Build the binary with:
 
 ```sh
 cargo build --locked --release
@@ -18,13 +18,13 @@ install -m 0755 target/release/kmesh ~/.local/bin/kmesh
 
 Add `~/.local/bin` to `PATH` for an ordinary user install. Service deployments may place the binary in a system-owned path for their service units.
 
-The CI workflow builds Linux x86_64/aarch64 musl and macOS Intel/Apple Silicon binaries and runs formatting, Clippy, and test checks. Publishing a GitHub release tagged `v<version>` builds and attaches one archive per platform; the tag must match the version in `Cargo.toml`. kmesh uses Rust TLS libraries; its Linux dependency graph includes `openssl-probe` for certificate discovery and contains no OpenSSL TLS or `native-tls` package.
+The CI workflow builds Linux x86_64/aarch64 musl and macOS Intel/Apple Silicon binaries and runs formatting, Clippy, and test checks. Pull request checks, including fork pull requests, generate temporary test identities. Trusted release builds embed the configured mTLS identities in each binary. Publishing a GitHub release tagged `v<version>` builds and attaches one archive per platform; the tag must match the version in `Cargo.toml`. kmesh uses Rust TLS libraries; its Linux dependency graph includes `openssl-probe` for certificate discovery and contains no OpenSSL TLS or `native-tls` package.
 
 `kmesh --version` prints the package version, build branch, commit ID, build time, and Rust toolchain metadata. The server checks this version on every `/v1` API request and both client and agent control connections. Stable releases interoperate within the same major version; `0.x` releases also require the same minor version. Prerelease builds require matching major, minor, patch, and prerelease identifiers.
 
 ## Start the public server
 
-Set `server_addr` to the public IP address or hostname covered by the TLS certificate. kmesh builds the HTTPS origin internally from `server_addr` and `server_port`; configuration and command-line arguments take the address without `https://` or a path. The default ports are TCP 9443 for HTTPS and UDP 3478 for QAD.
+Set `server_addr` to the public IP address or hostname clients use to reach the server. The mTLS server identity is always `DNS:kmesh.internal`, so the network address can change independently. kmesh builds the HTTPS origin internally from `server_addr` and `server_port`; configuration and command-line arguments take the address without `https://` or a path. The default ports are TCP 9443 for HTTPS and UDP 3478 for QAD.
 
 Copy [`config.example.toml`](config.example.toml) to `~/.kmesh/config.toml` and edit it for this host. When that file exists, kmesh uses it for defaults. Explicit command-line options override TOML values, and built-in values apply when neither supplies a setting. Paths in TOML may start with `~/`; other relative paths resolve from the config file's directory. The default data directory is `~/.cache/kmesh`.
 
@@ -32,13 +32,13 @@ Copy [`config.example.toml`](config.example.toml) to `~/.kmesh/config.toml` and 
 kmesh server init --admin admin
 ```
 
-The first initialization prints the initial administrator API token once. Store it in `KMESH_TOKEN` or in the local `[auth] token` setting. Start the service with a certificate whose SAN covers the public server name:
+The first initialization prints the initial administrator API token once. Store it in `KMESH_TOKEN` or in the local `[auth] token` setting. Start the service; its mTLS server identity is embedded in the binary:
 
 ```sh
 kmesh server run
 ```
 
-For a server deployment, set `data_dir` to its persistent state location and set `server.tls_cert` and `server.tls_key` in the config. `server.bind_addr` controls both listener IPs. `server_port` controls HTTPS and `server.udp_port` controls QAD; the server publishes the actual QAD UDP port through `/v1/transport` for clients and agents. The UDP setting applies on the server. Clients and agents use the port advertised by the server.
+For a server deployment, set `data_dir` to its persistent state location. `server.bind_addr` controls both listener IPs. `server_port` controls HTTPS and `server.udp_port` controls QAD; the server publishes the actual QAD UDP port through `/v1/transport` for clients and agents. The UDP setting applies on the server. Clients and agents use the port advertised by the server.
 
 The deployment used for the current acceptance work listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for QAD. Direct peer paths also need outbound UDP between client and target. When UDP direct paths fail, the last route uses the private relay over the same HTTPS origin; HTTPS control remains required in every route. Official relay services provide QAD for `PublicDirect` and never carry its SSH stream. In public-direct-only mode, set `server.disable_private_relay = true` or pass `--disable-private-relay`; the server then omits its private relay URL from `GET /v1/transport`.
 
@@ -112,7 +112,7 @@ The enrolled device key signs each session's freshly generated target data-plane
 
 `profile` selects a separate local credential namespace. For example, `kmesh --profile work login ...` saves tokens separately from the `default` profile, so the same server and username can have independent sign-ins. Saved credentials are scoped by server, profile, and normalized username; the profile does not affect routing or server-side access permissions.
 
-The client and agent config contains the server address plus local SSH/TLS settings. There are no client-side STUN server or UDP bind overrides. The proxy and agent discover the private relay URL and QAD port from the server's authenticated `/v1/transport` response. `PrivateDirect` observes B's QAD at the configured server UDP port and an official reflector; `PublicDirect` observes official Iroh QAD reflectors only.
+The client and agent config contains the server address plus local SSH settings. There are no client-side STUN server or UDP bind overrides. The proxy and agent discover the private relay URL and QAD port from the server's authenticated `/v1/transport` response. `PrivateDirect` observes B's QAD at the configured server UDP port and an official reflector; `PublicDirect` observes official Iroh QAD reflectors only.
 
 ## Connect with OpenSSH
 
@@ -128,35 +128,42 @@ The generated block sets `ProxyCommand`, a stable `HostKeyAlias`, and OpenSSH `C
 
 The kmesh client state is separated by server origin, profile, and normalized username. Token and agent identity files use mode `0600`, their directories use mode `0700`, and refresh tokens rotate under a cross-process file lock. A refresh with an uncertain network result clears the local login and asks the user to sign in again.
 
-## Private CA certificates
+## Build-time mTLS certificates
 
-If the server uses a private TLS certificate authority, add its certificate to the client config:
+Every build needs a CA certificate, a server certificate and key, and a client certificate and key. The CA certificate is the public trust anchor each side uses to verify its peer's certificate; its separate private key signs certificates and stays outside the build inputs. The server certificate must identify `DNS:kmesh.internal`; `server_addr` remains a separately configurable network address. The server validates the peer's client certificate against the embedded CA and `clientAuth` usage. Clients and agents validate the peer's server certificate against the embedded CA, `serverAuth` usage, and fixed `DNS:kmesh.internal` identity.
 
-```toml
-server_addr = "kmesh.example.com"
-server_port = 9443
+Open-source users can create a local CA and both identities with the included OpenSSL script. It writes a private output directory with mode `0700`, protects PEM files with mode `0600`, and issues server/client certificates with the required EKUs and validity through `2099-12-31 23:59:59 UTC`:
 
-[tls]
-ca_certificates = ["/etc/ssl/certs/company-root.pem"]
+```sh
+cert_dir="$HOME/.local/share/kmesh/build-certs"
+scripts/generate-mtls-certs.sh "$cert_dir"
+
+export KMESH_CA_CERT_PATH="$cert_dir/ca-cert.pem"
+export KMESH_SERVER_CERT_PATH="$cert_dir/server-cert.pem"
+export KMESH_SERVER_KEY_PATH="$cert_dir/server-key.pem"
+export KMESH_CLIENT_CERT_PATH="$cert_dir/client-cert.pem"
+export KMESH_CLIENT_KEY_PATH="$cert_dir/client-key.pem"
+
+cargo build --locked --release
 ```
 
-The configured certificate authority verifies the HTTPS control connection and private Iroh relay. `PrivateRelay` needs outbound HTTPS to the server origin; `PrivateDirect` and `PublicDirect` still depend on UDP being allowed between peers. OpenSSH verifies the target SSH host key independently of TLS and Iroh endpoint identity.
+The CA private key is saved as `ca-key.pem` for certificate issuance and is never passed to Cargo. The five environment variables point to PEM files used by the build; missing or invalid material makes the build fail. The resulting binary contains the CA certificate and both private identities, so distribute it only to trusted server, client, and agent hosts. User login, tokens, and server-side access control continue to authenticate kmesh users.
+
+To rotate these identities, create a fresh certificate set, export its five paths, rebuild the release binaries, and deploy the rebuilt binary to the server, clients, and agents as one coordinated update. Restart kmesh processes after deployment so they use the new embedded material. OpenSSH verifies target SSH host keys independently of mTLS and Iroh endpoint identity.
 
 ## Service files
 
-Example systemd units for a server and one target agent are in [`deploy/systemd`](deploy/systemd). A per-user macOS LaunchAgent template is in [`deploy/launchd`](deploy/launchd). Review paths, user IDs, origins, and certificate locations before enabling them.
+Example systemd units for a server and one target agent are in [`deploy/systemd`](deploy/systemd). A per-user macOS LaunchAgent template is in [`deploy/launchd`](deploy/launchd). Review paths, user IDs, and origins before enabling them.
 
-For systemd, create the service account and protect its state/config files before enabling the units. Ensure `kmesh` can read the server TLS key and the agent config; keep each directory at `0700` and each secret file at `0600`.
+For systemd, create the service account and protect its state/config files before enabling the units. Keep each directory at `0700` and each secret file at `0600`.
 
 ```sh
 sudo useradd --system --home-dir /var/lib/kmesh --shell /usr/sbin/nologin kmesh
 sudo install -d -o kmesh -g kmesh -m 0700 /var/lib/kmesh /etc/kmesh
 sudo install -o root -g kmesh -m 0640 config.example.toml /etc/kmesh/config.toml
-sudo install -o root -g kmesh -m 0640 tls.key /etc/kmesh/tls.key
-sudo install -o root -g kmesh -m 0644 tls.crt /etc/kmesh/tls.crt
 ```
 
-Edit `/etc/kmesh/config.toml` for the deployment: set `server_addr`, `data_dir = "/var/lib/kmesh"`, `server.tls_cert = "/etc/kmesh/tls.crt"`, and `server.tls_key = "/etc/kmesh/tls.key"`. Initialize and start the server with this same config:
+Edit `/etc/kmesh/config.toml` for the deployment and set `server_addr` and `data_dir = "/var/lib/kmesh"`. Initialize and start the server with this same config:
 
 ```sh
 sudo -u kmesh /usr/local/bin/kmesh --config /etc/kmesh/config.toml server init --admin admin

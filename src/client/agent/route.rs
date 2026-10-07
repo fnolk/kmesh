@@ -18,7 +18,6 @@ pub(super) fn endpoint_options(
         .context("build agent route transport plan")?;
     Ok(IrohEndpointOptions {
         relay_choice: plan.relay_choice,
-        tls: context.config.tls.clone(),
         handoff,
     })
 }

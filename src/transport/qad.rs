@@ -107,7 +107,7 @@ async fn join_noq_tasks(owner: &TaskOwner) -> Result<()> {
 /// I/O and is returned in that mode.
 pub async fn observe_ipv4_mappings(
     socket: UdpSocket,
-    tls: rustls::ClientConfig,
+    tls_configs: Vec<rustls::ClientConfig>,
     targets: &[QadReflector],
     probe_deadline: TokioInstant,
     cleanup_deadline: TokioInstant,
@@ -121,6 +121,7 @@ pub async fn observe_ipv4_mappings(
         cleanup_deadline >= probe_deadline,
         "QAD cleanup deadline precedes the probe deadline"
     );
+    assert_eq!(targets.len(), tls_configs.len());
     let probe_started = TokioInstant::now();
     let local_socket = socket
         .local_addr()
@@ -147,10 +148,10 @@ pub async fn observe_ipv4_mappings(
         runtime.clone(),
     )
     .context("create QAD Noq endpoint on the owned UDP socket")?;
-    let client = QuicClient::new(endpoint.clone(), tls);
     let mut observations = Vec::with_capacity(targets.len());
 
-    for reflector in targets {
+    for (reflector, tls) in targets.iter().zip(tls_configs) {
+        let client = QuicClient::new(endpoint.clone(), tls);
         let connection = timeout_at(
             probe_deadline,
             client.create_conn(reflector.addr.into(), &reflector.server_name),
@@ -208,7 +209,6 @@ pub async fn observe_ipv4_mappings(
 
     let probe_elapsed_ms = probe_started.elapsed().as_millis();
     let cleanup_started = TokioInstant::now();
-    drop(client);
     endpoint.close(0u16.into(), b"QAD observation complete");
     if let Err(error) = timeout_at(cleanup_deadline, endpoint.wait_idle()).await {
         tracing::warn!(

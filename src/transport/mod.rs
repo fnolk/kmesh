@@ -6,6 +6,7 @@ compile_error!("kmesh transport supports Linux and macOS only");
 mod http;
 mod iroh;
 mod qad;
+pub mod tls;
 mod udp_handoff;
 
 use std::{error::Error as StdError, io};

@@ -19,8 +19,6 @@ CLIENT_IP = "10.0.0.6"
 PRIVATE_RELAY_URL = "https://192.0.2.11:9443/"
 B_QAD_ADDR = "192.0.2.11:3478"
 OFFICIAL_QAD_PORT = 7842
-TARGET_CA = "/opt/kmesh-iroh-verification/ca.pem"
-CLIENT_CA = "/Users/example/.cache/kmesh-live/server/ca.pem"
 TARGET_SOCKET_COUNT = 257
 TIMEOUT_SECONDS = 75
 CAPTURE_SECONDS = 55
@@ -689,7 +687,7 @@ async def run(args):
     sid = str(uuid.uuid4())
     pid_file = f"/tmp/kmesh-udp-birthday-{run_id}.pid"
     target_args = [
-        args.target_bin, "--role", "target", "--ca-file", TARGET_CA,
+        args.target_bin, "--role", "target",
         "--local-ip", TARGET_IP, "--endpoint-secret-key-file", args.target_secret_file,
     ]
     remote_command = f"""umask 077
@@ -717,7 +715,7 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
 
     try:
         client_args = [
-            str(client_bin), "--role", "client", "--ca-file", CLIENT_CA,
+            str(client_bin), "--role", "client",
             "--local-ip", CLIENT_IP, "--endpoint-secret-key-file", str(client_secret),
         ]
         client = await asyncio.create_subprocess_exec(

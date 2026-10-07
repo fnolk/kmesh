@@ -14,12 +14,9 @@ use tokio::{
 
 use super::super::{
     TransportError,
-    iroh::build_ca_tls_config,
     qad::{QadObservation, QadReflector, observe_ipv4_mappings},
 };
 use super::{DiscoveredUdpSocket, MappingDiscovery, PunchError, PunchRole, QadPlan};
-use crate::config::TlsConfig;
-
 const MAPPING_DISCOVERY_BUDGET: Duration = Duration::from_secs(2);
 
 /// Discover this node's IPv4 QAD mappings on the same wildcard-bound socket retained for punch.
@@ -28,7 +25,6 @@ const MAPPING_DISCOVERY_BUDGET: Duration = Duration::from_secs(2);
 /// native Iroh path. Certificate, TLS, configuration, and protocol failures remain errors.
 pub async fn discover_ipv4_mappings(
     qad_plan: &QadPlan,
-    tls: &TlsConfig,
     deadline: Instant,
 ) -> Result<MappingDiscovery, TransportError> {
     crate::transport::ensure_rustls_provider();
@@ -57,17 +53,19 @@ pub async fn discover_ipv4_mappings(
         }
         Err(error) => return Err(error),
     };
-    let ca_tls = build_ca_tls_config(tls)?;
-    let crypto_provider = rustls::crypto::CryptoProvider::get_default()
-        .expect("ring crypto provider installed by ensure_rustls_provider")
-        .clone();
-    let tls = ca_tls
-        .client_config(crypto_provider)
-        .map_err(|error| TransportError::Tls(error.to_string()))?;
+    let tls_configs = match qad_plan {
+        QadPlan::PrivateAndOfficial { .. } => vec![
+            crate::transport::tls::private_client_config()?,
+            crate::transport::tls::public_client_config(),
+        ],
+        QadPlan::OfficialDefault => {
+            vec![crate::transport::tls::public_client_config(); reflectors.len()]
+        }
+    };
     let probe_socket = socket.try_clone().map_err(TransportError::Network)?;
     let observations = match observe_ipv4_mappings(
         probe_socket,
-        tls,
+        tls_configs,
         &reflectors,
         probe_deadline,
         cleanup_deadline,

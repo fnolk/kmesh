@@ -15,7 +15,6 @@ pub struct Config {
     pub server_addr: String,
     pub server_port: u16,
     pub data_dir: PathBuf,
-    pub tls: TlsConfig,
     pub ssh: SshConfig,
     pub server: ServerConfig,
 }
@@ -28,7 +27,6 @@ impl Default for Config {
             server_addr: "localhost".to_owned(),
             server_port: 9443,
             data_dir: default_data_dir(),
-            tls: TlsConfig::default(),
             ssh: SshConfig::default(),
             server: ServerConfig::default(),
         }
@@ -127,13 +125,6 @@ pub(crate) fn resolve_path(path: &Path, base_dir: &Path) -> PathBuf {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TlsConfig {
-    pub ca_certificates: Vec<PathBuf>,
-    pub server_name: Option<String>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SshConfig {
@@ -155,8 +146,6 @@ impl Default for SshConfig {
 pub struct ServerConfig {
     pub bind_addr: std::net::IpAddr,
     pub udp_port: u16,
-    pub tls_cert: Option<PathBuf>,
-    pub tls_key: Option<PathBuf>,
     pub disable_private_relay: bool,
 }
 
@@ -165,8 +154,6 @@ impl Default for ServerConfig {
         Self {
             bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             udp_port: 3478,
-            tls_cert: None,
-            tls_key: None,
             disable_private_relay: false,
         }
     }
