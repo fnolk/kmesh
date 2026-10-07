@@ -30,14 +30,6 @@ impl Default for Config {
 pub struct TlsConfig {
     pub ca_certificates: Vec<PathBuf>,
     pub server_name: Option<String>,
-    pub proxy: Option<HttpProxyConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HttpProxyConfig {
-    pub url: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

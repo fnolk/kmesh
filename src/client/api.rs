@@ -108,7 +108,13 @@ impl Api {
         self.websocket("agent/control", Some(agent_token)).await
     }
 
-    pub async fn send_control(ws: &mut WsStream, message: &ControlMessage) -> Result<()> {
+    pub async fn send_control<S>(
+        ws: &mut tokio_tungstenite::WebSocketStream<S>,
+        message: &ControlMessage,
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::Message;
 
