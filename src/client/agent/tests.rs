@@ -114,16 +114,20 @@ async fn closed_mailbox_before_done_keeps_sibling_session_routable() {
 }
 
 async fn context(server_url: &str) -> ClientContext {
+    let origin = reqwest::Url::parse(server_url).expect("valid test server URL");
     let config = crate::config::Config {
-        server_url: server_url.to_owned(),
+        server_addr: origin.host_str().expect("test server host").to_owned(),
+        server_port: origin.port_or_known_default().expect("test server port"),
         ..crate::config::Config::default()
     };
     let api = Api::new(&config).await.expect("build test API client");
-    let profiles =
-        profile::ProfileStore::new(&config.data_dir, &config.server_url, &config.profile);
+    let profiles = profile::ProfileStore::new(
+        &config.data_dir,
+        &config.server_origin().expect("test server origin"),
+        &config.profile,
+    );
     ClientContext {
         config,
-        config_path: None,
         api,
         profiles,
     }

@@ -216,7 +216,7 @@ pub async fn logout(context: &ClientContext) -> Result<()> {
 fn save_login(context: &ClientContext, username: &str, tokens: LoginTokens) -> Result<()> {
     let _lock = context.profiles.lock_refresh()?;
     context.profiles.save(&SavedLogin {
-        server_url: context.config.server_url.clone(),
+        server_url: context.api.issuer().to_owned(),
         profile: context.config.profile.trim().to_lowercase(),
         username: username.to_owned(),
         tokens,

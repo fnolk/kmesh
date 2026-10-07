@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -13,18 +13,36 @@ use crate::protocol::TargetPermission;
     about = "SSH access over direct QUIC or relay"
 )]
 pub struct Cli {
-    #[arg(long, global = true, help = "Path to the configuration file")]
+    #[arg(
+        long,
+        global = true,
+        help = "Path to the configuration file (default ~/.kmesh/config.toml)"
+    )]
     pub config: Option<PathBuf>,
     #[arg(
         long,
         global = true,
-        help = "Directory for configuration and local data"
+        help = "Directory for local or server data (default ~/.cache/kmesh)"
     )]
     pub data_dir: Option<PathBuf>,
-    #[arg(long, global = true, help = "Name of the credential profile to use")]
+    #[arg(
+        long,
+        global = true,
+        help = "Credential profile for saved tokens (default: default)"
+    )]
     pub profile: Option<String>,
-    #[arg(long, global = true, help = "HTTPS URL of the kmesh server")]
-    pub server_url: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        help = "IP address or hostname of the kmesh server (default localhost)"
+    )]
+    pub server_addr: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        help = "HTTPS port of the kmesh server (default 9443)"
+    )]
+    pub server_port: Option<u16>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -78,28 +96,29 @@ pub struct ServerInitArgs {
     pub admin: String,
     #[arg(long, help = "Read the administrator password from standard input")]
     pub password_stdin: bool,
-    #[arg(long, help = "Public HTTPS origin of this server")]
-    pub issuer: String,
 }
 
 #[derive(Debug, Args)]
 pub struct ServerRunArgs {
-    #[arg(long, help = "Public HTTPS origin of this server")]
-    pub issuer: String,
-    #[arg(long, default_value = "0.0.0.0:9443", help = "HTTPS listen address")]
-    pub bind: SocketAddr,
-    #[arg(long, help = "Path to the TLS certificate chain")]
-    pub tls_cert: PathBuf,
-    #[arg(long, help = "Path to the TLS private key")]
-    pub tls_key: PathBuf,
     #[arg(
         long,
-        default_value = "0.0.0.0:3478",
-        help = "UDP listen address for QAD"
+        help = "IP address to bind HTTPS and QAD listeners (default 0.0.0.0)"
     )]
-    pub qad_bind: SocketAddr,
-    #[arg(long, help = "Disable the private Iroh relay")]
-    pub disable_private_relay: bool,
+    pub bind_addr: Option<IpAddr>,
+    #[arg(long, help = "UDP port for the QAD listener (default 3478)")]
+    pub udp_port: Option<u16>,
+    #[arg(long, help = "Path to the TLS certificate chain")]
+    pub tls_cert: Option<PathBuf>,
+    #[arg(long, help = "Path to the TLS private key")]
+    pub tls_key: Option<PathBuf>,
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        help = "Whether to disable the private Iroh relay"
+    )]
+    pub disable_private_relay: Option<bool>,
 }
 
 #[derive(Debug, Subcommand)]

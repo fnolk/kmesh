@@ -54,6 +54,19 @@ impl Drop for TestDirectory {
     }
 }
 
+fn server_address_and_port(origin: &str) -> (String, u16) {
+    let origin = reqwest::Url::parse(origin).expect("valid test server origin");
+    (
+        origin
+            .host_str()
+            .expect("test server hostname")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned(),
+        origin.port_or_known_default().expect("test server port"),
+    )
+}
+
 struct SshAgent {
     socket: String,
     pid: String,
@@ -297,8 +310,10 @@ async fn refresh_process_child() {
     let output = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_OUTPUT").expect("output file"));
     let ready = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_READY").expect("ready file"));
     let go = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_GO").expect("start gate"));
+    let (server_addr, server_port) = server_address_and_port(&server_url);
     let config = Config {
-        server_url,
+        server_addr,
+        server_port,
         data_dir: data_dir.clone(),
         profile: "shared-profile".to_owned(),
         tls: TlsConfig {
@@ -308,10 +323,13 @@ async fn refresh_process_child() {
         ..Config::default()
     };
     let api = Api::new(&config).await.expect("build API client");
-    let profiles = ProfileStore::new(&config.data_dir, &config.server_url, &config.profile);
+    let profiles = ProfileStore::new(
+        &config.data_dir,
+        &config.server_origin().expect("test server origin"),
+        &config.profile,
+    );
     let context = ClientContext {
         config,
-        config_path: None,
         api,
         profiles,
     };
@@ -491,8 +509,10 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
         None,
     ));
 
+    let (server_addr, server_port) = server_address_and_port(&server_url);
     let config = Config {
-        server_url: server_url.clone(),
+        server_addr,
+        server_port,
         data_dir: directory.0.clone(),
         profile: "uncertain-profile".to_owned(),
         tls: TlsConfig {
@@ -503,9 +523,12 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
     };
     let api = Api::new(&config).await.expect("build API client");
     let context = ClientContext {
-        profiles: ProfileStore::new(&config.data_dir, &config.server_url, &config.profile),
+        profiles: ProfileStore::new(
+            &config.data_dir,
+            &config.server_origin().expect("test server origin"),
+            &config.profile,
+        ),
         config,
-        config_path: None,
         api,
     };
     assert!(

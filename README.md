@@ -22,59 +22,54 @@ The CI workflow is configured to build Linux x86_64/aarch64 musl and macOS Intel
 
 ## Start the public server
 
-Choose a stable HTTPS origin. The examples use `https://kmesh.example.com:9443`; use the same canonical origin for `--issuer` and client `server_url`, and issue a TLS certificate for its host.
+Set `server_addr` to the public IP address or hostname covered by the TLS certificate. kmesh builds the HTTPS origin internally from `server_addr` and `server_port`; configuration and command-line arguments take the address without `https://` or a path. The default ports are TCP 9443 for HTTPS and UDP 3478 for QAD.
+
+Copy [`config.example.toml`](config.example.toml) to `~/.kmesh/config.toml` and edit it for this host. When that file exists, kmesh uses it for defaults. Explicit command-line options override TOML values, and built-in values apply when neither supplies a setting. Paths in TOML may start with `~/`; other relative paths resolve from the config file's directory. The default data directory is `~/.cache/kmesh`.
 
 ```sh
-kmesh server init \
-  --data-dir /var/lib/kmesh \
-  --admin admin \
-  --issuer https://kmesh.example.com:9443
+kmesh server init --admin admin
 ```
 
 The command prompts for the initial admin password. Start the service with a certificate whose SAN covers the public server name:
 
 ```sh
-kmesh server run \
-  --data-dir /var/lib/kmesh \
-  --issuer https://kmesh.example.com:9443 \
-  --bind 0.0.0.0:9443 \
-  --tls-cert /etc/kmesh/tls.crt \
-  --tls-key /etc/kmesh/tls.key \
-  --qad-bind 0.0.0.0:3478
+kmesh server run
 ```
+
+For a server deployment, set `data_dir` to its persistent state location and set `server.tls_cert` and `server.tls_key` in the config. `server.bind_addr` controls both listener IPs. `server_port` controls HTTPS and `server.udp_port` controls QAD; the server publishes the actual QAD UDP port through `/v1/transport` for clients and agents. The UDP setting applies on the server. Clients and agents use the port advertised by the server.
 
 For automation, `--password-stdin` reads a password from piped stdin without echoing it or placing it in process arguments. The same option is available for password login and admin user creation/password reset; user creation and reset read two matching lines.
 
-The deployment used for the current acceptance work listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for QAD. Direct peer paths also need outbound UDP between client and target. When UDP direct paths fail, the last route uses the private relay over the same HTTPS origin; HTTPS control remains required in every route. Official relay services provide QAD for `PublicDirect` and never carry its SSH stream. In public-direct-only mode, pass `--disable-private-relay`; the server then omits its private relay URL from `GET /v1/transport`.
+The deployment used for the current acceptance work listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for QAD. Direct peer paths also need outbound UDP between client and target. When UDP direct paths fail, the last route uses the private relay over the same HTTPS origin; HTTPS control remains required in every route. Official relay services provide QAD for `PublicDirect` and never carry its SSH stream. In public-direct-only mode, set `server.disable_private_relay = true` or pass `--disable-private-relay`; the server then omits its private relay URL from `GET /v1/transport`.
 
-The current schema expects a fresh kmesh database. It does not migrate databases from the earlier STUN/Quinn/WSS-data implementation. Keep the old data directory as a backup and initialize the Iroh version with a separate, empty `--data-dir`.
+The current schema expects a fresh kmesh database. It does not migrate databases from the earlier STUN/Quinn/WSS-data implementation. Keep the old data directory as a backup and initialize the Iroh version with a separate, empty `data_dir`.
 
 ## Configure a target and access
 
 On an administrator workstation, log in and create the target, user, role, and grant. The target ID is stable; its name becomes the OpenSSH alias.
 
 ```sh
-kmesh --server-url https://kmesh.example.com:9443 login --method password --username admin
-kmesh --server-url https://kmesh.example.com:9443 admin targets create build-machine
-kmesh --server-url https://kmesh.example.com:9443 admin users create alice
-kmesh --server-url https://kmesh.example.com:9443 admin roles create engineers
-kmesh --server-url https://kmesh.example.com:9443 admin users roles <alice-user-id> <engineers-role-id>
-kmesh --server-url https://kmesh.example.com:9443 admin grants add <engineers-role-id> <target-id>
+kmesh login --method password --username admin
+kmesh admin targets create build-machine
+kmesh admin users create alice
+kmesh admin roles create engineers
+kmesh admin users roles <alice-user-id> <engineers-role-id>
+kmesh admin grants add <engineers-role-id> <target-id>
 ```
 
 Commands that create or reset a password read it through a hidden prompt. Start the interactive shell with the same server origin:
 
 ```sh
-kmesh --server-url https://kmesh.example.com:9443 admin
+kmesh admin
 ```
 
-Inside the shell, `help` and Tab completion are available. One-shot admin commands accept `--json` for machine-readable output. The examples pass `--server-url` on each client command; setting `server_url` in the default config file removes that option from future commands.
+Inside the shell, `help` and Tab completion are available. One-shot admin commands accept `--json` for machine-readable output. Use `--server-addr` and `--server-port` to override the configured server for one command.
 
 For public-key kmesh login, register the user's SSH public key and use `ssh-keygen` for the SSHSIG challenge:
 
 ```sh
-kmesh --server-url https://kmesh.example.com:9443 admin keys add <alice-user-id> ~/.ssh/id_ed25519.pub --label laptop
-kmesh --server-url https://kmesh.example.com:9443 login \
+kmesh admin keys add <alice-user-id> ~/.ssh/id_ed25519.pub --label laptop
+kmesh login \
   --method public-key --username alice --key ~/.ssh/id_ed25519
 ```
 
@@ -83,31 +78,24 @@ The challenge signature binds the server-provided payload and uses the `kmesh-lo
 On the target machine, enroll its persistent device identity and start the agent:
 
 ```sh
-kmesh --server-url https://kmesh.example.com:9443 agent enroll \
+kmesh agent enroll \
   --target-id <target-id> --enrollment-code <one-time-code>
-kmesh --server-url https://kmesh.example.com:9443 agent run --target-id <target-id>
+kmesh agent run --target-id <target-id>
 ```
 
-The enrolled device key signs each session's freshly generated target data-plane identity; active SSH sessions use independent Iroh endpoints. The agent uses `ssh.address` from its config, which defaults to `127.0.0.1:22`. A typical Linux config is `~/.local/share/kmesh/config.toml`; macOS stores it under `~/Library/Application Support/kmesh/config.toml`:
+The enrolled device key signs each session's freshly generated target data-plane identity; active SSH sessions use independent Iroh endpoints. The agent reads `ssh.address` from `~/.kmesh/config.toml`, which defaults to `127.0.0.1:22`.
 
-```toml
-server_url = "https://kmesh.example.com:9443"
-profile = "default"
+`profile` selects a separate local credential namespace. For example, `kmesh --profile work login ...` saves tokens separately from the `default` profile, so the same server and username can have independent sign-ins. Saved credentials are scoped by server, profile, and normalized username; the profile does not affect routing or server-side access permissions.
 
-[ssh]
-address = "127.0.0.1:22"
-connect_timeout_secs = 10
-```
-
-The client and agent config only need the kmesh control URL plus their local SSH/TLS settings. There are no client-side STUN server or UDP bind overrides. The proxy and agent discover the private relay URL and QAD port from the server's authenticated `/v1/transport` response. `PrivateDirect` observes B's QAD at UDP 3478 and an official reflector; `PublicDirect` observes official Iroh QAD reflectors only.
+The client and agent config contains the server address plus local SSH/TLS settings. There are no client-side STUN server or UDP bind overrides. The proxy and agent discover the private relay URL and QAD port from the server's authenticated `/v1/transport` response. `PrivateDirect` observes B's QAD at the configured server UDP port and an official reflector; `PublicDirect` observes official Iroh QAD reflectors only.
 
 ## Connect with OpenSSH
 
 On the client, log in and write an OpenSSH host block:
 
 ```sh
-kmesh --server-url https://kmesh.example.com:9443 login --method password --username alice
-kmesh --server-url https://kmesh.example.com:9443 ssh-config build-machine >> ~/.ssh/config
+kmesh login --method password --username alice
+kmesh ssh-config build-machine >> ~/.ssh/config
 ssh build-machine
 ```
 
@@ -120,7 +108,8 @@ The kmesh client state is separated by server origin, profile, and normalized us
 If the server uses a private TLS certificate authority, add its certificate to the client config:
 
 ```toml
-server_url = "https://kmesh.example.com:9443"
+server_addr = "kmesh.example.com"
+server_port = 9443
 
 [tls]
 ca_certificates = ["/etc/ssl/certs/company-root.pem"]
@@ -137,10 +126,19 @@ For systemd, create the service account and protect its state/config files befor
 ```sh
 sudo useradd --system --home-dir /var/lib/kmesh --shell /usr/sbin/nologin kmesh
 sudo install -d -o kmesh -g kmesh -m 0700 /var/lib/kmesh /etc/kmesh
+sudo install -o root -g kmesh -m 0640 config.example.toml /etc/kmesh/config.toml
 sudo install -o root -g kmesh -m 0640 tls.key /etc/kmesh/tls.key
 sudo install -o root -g kmesh -m 0644 tls.crt /etc/kmesh/tls.crt
+```
+
+Edit `/etc/kmesh/config.toml` for the deployment: set `server_addr`, `data_dir = "/var/lib/kmesh"`, `server.tls_cert = "/etc/kmesh/tls.crt"`, and `server.tls_key = "/etc/kmesh/tls.key"`. Initialize and start the server with this same config:
+
+```sh
+sudo -u kmesh /usr/local/bin/kmesh --config /etc/kmesh/config.toml server init --admin admin
 sudo systemctl enable --now kmesh-server.service
 ```
+
+For a target agent, provide `/etc/kmesh/agent.toml` with the server address and `data_dir = "/var/lib/kmesh"` before starting its unit. The LaunchAgent uses the default `~/.kmesh/config.toml`.
 
 After enrolling a target into `/var/lib/kmesh`, set its UUID and start the instance:
 
