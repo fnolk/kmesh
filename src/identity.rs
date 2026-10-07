@@ -1,10 +1,11 @@
-use crate::protocol::{AccessTokenClaims, RouteMode, TunnelTicketClaims};
+use crate::protocol::{AccessTokenClaims, ApiTokenClaims, RouteMode, TunnelTicketClaims};
 use anyhow::{Context, Result};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rcgen::{KeyPair, PKCS_ED25519};
 use serde::de::DeserializeOwned;
 
 pub const USER_TOKEN_AUDIENCE: &str = "kmesh-user";
+pub const API_TOKEN_AUDIENCE: &str = "kmesh-api-token";
 pub const TUNNEL_TICKET_AUDIENCE: &str = "kmesh-tunnel";
 
 #[derive(Clone, Debug)]
@@ -63,6 +64,35 @@ pub fn decode_user_access_token(
     )
 }
 
+pub fn encode_api_token(claims: &ApiTokenClaims, private_key_pem: &str) -> Result<String> {
+    anyhow::ensure!(
+        claims.aud == API_TOKEN_AUDIENCE,
+        "incorrect API token audience"
+    );
+    let key = EncodingKey::from_ed_pem(private_key_pem.as_bytes())
+        .context("load API token signing key")?;
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.typ = Some("JWT".to_owned());
+    encode(&header, claims, &key).context("encode API JWT")
+}
+
+pub fn decode_api_token(
+    token: &str,
+    public_key_pem: &str,
+    expected_issuer: &str,
+) -> Result<ApiTokenClaims> {
+    let key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
+        .context("load Ed25519 JWT verification key")?;
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_audience(&[API_TOKEN_AUDIENCE]);
+    validation.set_issuer(&[expected_issuer]);
+    validation.set_required_spec_claims(&["iat", "aud", "iss"]);
+    validation.leeway = 0;
+    decode::<ApiTokenClaims>(token, &key, &validation)
+        .map(|data| data.claims)
+        .context("verify Ed25519 API JWT")
+}
+
 pub fn encode_tunnel_ticket(claims: &TunnelTicketClaims, private_key_pem: &str) -> Result<String> {
     anyhow::ensure!(
         claims.aud == TUNNEL_TICKET_AUDIENCE,
@@ -94,15 +124,16 @@ pub fn decode_tunnel_ticket(
 /// the data endpoint key remains session-scoped.
 pub fn agent_session_identity_payload(
     session_id: uuid::Uuid,
-    target_id: uuid::Uuid,
+    target_id: &str,
     route_mode: RouteMode,
     target_data_endpoint_id: &iroh::EndpointId,
     expires_at: i64,
 ) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"kmesh/agent-session-identity/1\0";
-    let mut payload = Vec::with_capacity(DOMAIN.len() + 16 + 16 + 1 + 32 + 8);
+    const DOMAIN: &[u8] = b"kmesh/agent-session-identity/2\0";
+    let mut payload = Vec::with_capacity(DOMAIN.len() + 16 + 4 + target_id.len() + 1 + 32 + 8);
     payload.extend_from_slice(DOMAIN);
     payload.extend_from_slice(session_id.as_bytes());
+    payload.extend_from_slice(&(target_id.len() as u32).to_be_bytes());
     payload.extend_from_slice(target_id.as_bytes());
     payload.push(match route_mode {
         RouteMode::PrivateDirect => 1,
@@ -117,7 +148,7 @@ pub fn agent_session_identity_payload(
 pub fn verify_agent_session_identity(
     stable_device_endpoint_id: &str,
     session_id: uuid::Uuid,
-    target_id: uuid::Uuid,
+    target_id: &str,
     route_mode: RouteMode,
     target_data_endpoint_id: &str,
     expires_at: i64,
@@ -170,9 +201,9 @@ mod tests {
         let device_key = iroh::SecretKey::generate();
         let data_key = iroh::SecretKey::generate();
         let session_id = uuid::Uuid::new_v4();
-        let target_id = uuid::Uuid::new_v4();
+        let target_id = "target-1";
         let expires_at = 1_800_000_000;
-        let mode_offset = b"kmesh/agent-session-identity/1\0".len() + 32;
+        let mode_offset = b"kmesh/agent-session-identity/2\0".len() + 16 + 4 + target_id.len();
         for (mode, tag) in [
             (RouteMode::PrivateDirect, 1),
             (RouteMode::PublicDirect, 2),
@@ -209,6 +240,18 @@ mod tests {
             &signature,
         )
         .expect("valid per-session identity signature");
+        assert!(
+            verify_agent_session_identity(
+                &device_key.public().to_string(),
+                session_id,
+                "target-2",
+                RouteMode::PrivateDirect,
+                &data_key.public().to_string(),
+                expires_at,
+                &signature,
+            )
+            .is_err()
+        );
         assert!(
             verify_agent_session_identity(
                 &device_key.public().to_string(),

@@ -872,6 +872,9 @@ impl Inner {
 
         let request =
             ClientRequest::new(authentication.client_key, protocol_version, request_parts);
+        let registration = self
+            .clients
+            .reserve_registration(request.endpoint_id(), request.connection_id());
 
         // Authorize the request against the configured `AccessControl`.
         let guard = authentication
@@ -894,7 +897,7 @@ impl Inner {
         // build and register client, starting up read & write loops for the client
         // connection
         self.clients
-            .register(client_conn_builder, self.metrics.clone());
+            .register_reserved(client_conn_builder, self.metrics.clone(), registration);
         Ok(())
     }
 }

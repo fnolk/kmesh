@@ -32,7 +32,7 @@ Copy [`config.example.toml`](config.example.toml) to `~/.kmesh/config.toml` and 
 kmesh server init --admin admin
 ```
 
-The first initialization prints the initial administrator API token once. Store it in `KMESH_TOKEN` or in the local `[auth] token` setting. Start the service; its mTLS server identity is embedded in the binary:
+The first initialization prints the initial administrator API JWT once. Store it in `KMESH_TOKEN` or in the local `[auth] token` setting. Start the service; its mTLS server identity is embedded in the binary:
 
 ```sh
 kmesh server run
@@ -42,28 +42,31 @@ For a server deployment, set `data_dir` to its persistent state location. `serve
 
 The deployment used for the current acceptance work listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for QAD. Direct peer paths also need outbound UDP between client and target. When UDP direct paths fail, the last route uses the private relay over the same HTTPS origin; HTTPS control remains required in every route. Official relay services provide QAD for `PublicDirect` and never carry its SSH stream. In public-direct-only mode, set `server.disable_private_relay = true` or pass `--disable-private-relay`; the server then omits its private relay URL from `GET /v1/transport`.
 
-Schema v4 stores API-token credentials and requires a fresh data directory. It does not migrate schema v3 or earlier databases, including the previous STUN/Quinn/WSS-data implementation. Keep existing data as a backup and initialize v4 with a separate, empty `data_dir`.
+Schema v5 stores API JWT registration and direct tunnel credential references. It requires a fresh data directory and does not migrate earlier databases. Keep existing data as a backup and initialize v5 with a separate, empty `data_dir`.
 
 ## Configure a target and access
 
-On an administrator workstation, log in and create the target, user, role, and grant. The target ID is stable; its name becomes the OpenSSH alias.
+On an administrator workstation, log in and create the target, user, role, and grant. Usernames are trimmed and lowercased for their unique user IDs. Role IDs are the trimmed role names with ASCII letters lowercased. Target names at creation and rename use a 1–64 character ASCII slug (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`; the first character is alphanumeric). On creation, the lowercase name becomes the fixed target ID while its casing remains the display name. Rename changes the name and OpenSSH alias while preserving the ID. Admin commands and SSH selection refer to users, roles, and targets by ID.
+
+`ssh-config` scopes `HostKeyAlias` by the canonical server origin and target ID. Agent credentials use the same server-origin scope, so equal target IDs on different servers keep separate known-host entries and credentials.
 
 ```sh
 kmesh login --method token
 kmesh admin targets create build-machine
 kmesh admin users create alice
-kmesh admin tokens create <alice-user-id> --label laptop
+kmesh admin tokens create alice --label laptop
+kmesh admin tokens create alice --label automation --expires-in 604800
 kmesh admin roles create engineers
-kmesh admin users roles <alice-user-id> <engineers-role-id>
-kmesh admin grants add <engineers-role-id> <target-id>
+kmesh admin users roles alice engineers
+kmesh admin grants add engineers build-machine
 ```
 
-API tokens created by `server init` and `admin tokens create` are shown once. With `KMESH_TOKEN` set, run `kmesh login --method token`; when `[auth].method = "token"` is in the config, you can run `kmesh login`. A command-line `--token` takes priority over `KMESH_TOKEN`, which takes priority over `[auth].token`. The login exchanges the long-lived API token for the normal locally stored session tokens. Start the interactive shell with the same server origin:
+API JWTs created by `server init` and `admin tokens create` are shown once. They act as Bearer credentials directly. Omitting `--expires-in` creates a long-lived JWT; `--expires-in <seconds>` sets its lifetime. With `KMESH_TOKEN` set, run `kmesh login --method token`; when `[auth].method = "token"` is in the config, you can run `kmesh login`. A command-line `--token` takes priority over `KMESH_TOKEN`, which takes priority over `[auth].token`. Login validates the JWT with the server and saves that same JWT for later API and control requests. An expired JWT requires a replacement token and another `kmesh login`; token authentication does not use refresh tokens. Public-key login keeps its separate access and refresh session. Start the interactive shell with the same server origin:
 
 ```toml
 [auth]
 method = "token"
-token = "kmesh_your_api_token"
+token = "<signed API JWT>"
 ```
 
 ```sh
@@ -98,7 +101,7 @@ username = "alice"
 key = "~/.ssh/id_ed25519"
 ```
 
-Login settings from CLI options override TOML. A login requires an explicit method so kmesh never guesses between token and public-key authentication.
+Login settings from CLI options override TOML. Choose an explicit login method: `token` or `public-key`.
 
 On the target machine, enroll its persistent device identity and start the agent:
 
@@ -126,7 +129,7 @@ ssh build-machine
 
 The generated block sets `ProxyCommand`, a stable `HostKeyAlias`, and OpenSSH `ControlMaster` reuse. The first SSH connection establishes its path; subsequent SSH/SCP/SFTP commands can reuse the OpenSSH control connection. Each underlying transport has one session ID and fresh client/target data EndpointIds. The server checks current RBAC when opening the session and again during activation, after both peers report the selected route and the target reports Iroh readiness. Once activated, the stream runs to completion after permission changes or control-plane disconnection; kmesh does not retry or switch routes mid-SSH. Standard SSH host-key checks remain active. Add the target's verified SSH host key to the client's `known_hosts` before connecting.
 
-The kmesh client state is separated by server origin, profile, and normalized username. Token and agent identity files use mode `0600`, their directories use mode `0700`, and refresh tokens rotate under a cross-process file lock. A refresh with an uncertain network result clears the local login and asks the user to sign in again.
+The kmesh client state is separated by server origin, profile, and normalized username. Credential and agent identity files use mode `0600`, their directories use mode `0700`, and public-key session refresh tokens rotate under a cross-process file lock. A refresh with an uncertain network result clears the local login and asks the user to sign in again.
 
 ## Build-time mTLS certificates
 
@@ -172,17 +175,41 @@ sudo systemctl enable --now kmesh-server.service
 
 For a target agent, provide `/etc/kmesh/agent.toml` with the server address and `data_dir = "/var/lib/kmesh"` before starting its unit. The LaunchAgent uses the default `~/.kmesh/config.toml`.
 
-After enrolling a target into `/var/lib/kmesh`, set its UUID and start the instance:
+After enrolling a target into `/var/lib/kmesh`, set its readable target ID and start the instance:
 
 ```sh
-TARGET_ID=00000000-0000-0000-0000-000000000000
+TARGET_ID=build-machine
 sudo systemctl enable --now "kmesh-agent@${TARGET_ID}.service"
 ```
 
+## Inspect private relay traffic
+
+Administrators can inspect the server's live Iroh relay transports and close a private-relay SSH session:
+
+```sh
+kmesh admin relay list
+kmesh admin --json relay list
+kmesh admin relay close <session-id>
+```
+
+The list takes two relay snapshots about one second apart and reports the measured duration, process-lifetime ingress and egress totals, and byte-per-second rates. Each row represents one actual relay endpoint transport. `relay_connection_count` counts endpoint transports; `ssh_session_count` counts unique mapped SSH sessions, which normally have one client and one target endpoint row. A live endpoint without a current private-relay runtime appears as `unknown` with its EndpointId.
+
+Traffic values count Iroh relay datagram payloads: they include the QUIC packet bytes carried inside each relay datagram, and exclude relay control frames, WebSocket/TLS framing, and network-layer headers. These values describe bytes the relay handled and differ from NIC byte counters. Server totals remain cumulative after a connection closes; a newly observed endpoint starts its rate window from zero. Direct UDP SSH streams do not pass through the relay, so their SSH bytes do not contribute to relay payload totals.
+
+`kmesh admin relay close <session-id>` accepts a PrivateRelay session. The server commits the session as closed, cancels registered and in-flight relay connections for its per-session endpoints, then sends `Close` to the client and target control channels. Closed endpoint identities fail the relay authorization check, which prevents an in-flight handshake from registering after the administrative close. Direct sessions return a conflict. If the server runs with `--disable-private-relay`, the list reports `enabled: false` and an empty connection set.
+
 ## Verification status
+
+### Historical live acceptance
+
+The following live acceptance results belong to source `eb359f76d09ab1d58c3d6ec7cd8f9d42aefcc12e`. They document that earlier deployment and do not verify the current 0.3.0 source.
 
 The final candidate is source `eb359f76d09ab1d58c3d6ec7cd8f9d42aefcc12e`. Formatting and all-target Clippy passed; native all-target tests report 71 passed, 0 failed, and 2 ignored. The two explicit route-acceptance tests passed, and release binaries were built for Linux x86_64/aarch64 musl and macOS x86_64/arm64. The [final build and route evidence](docs/build-validation.md) records the source, checks, and artifact SHA-256 values.
 
-On `target-1`, `PrivateDirect` and `PublicDirect` each passed three fresh SSH commands. Every command selected a direct IPv4 path before SSH, returned `server-1`, and exited with status 23. The full short OpenSSH suite passed SCP/SFTP 1 MiB integrity, forwarding, strict host-key rejection, ControlMaster reuse, idle and concurrent streams, and the RBAC/session boundaries. A separate in-flight SSH command also completed while the private server control connection restarted. See the [current live acceptance report](scripts/verify_iroh_live_report.md).
+On `target-1`, `PrivateDirect` and `PublicDirect` each passed three fresh SSH commands. Every command selected a direct IPv4 path before SSH, returned `server-1`, and exited with status 23. The full short OpenSSH suite passed SCP/SFTP 1 MiB integrity, forwarding, strict host-key rejection, ControlMaster reuse, idle and concurrent streams, and the RBAC/session boundaries. A separate in-flight SSH command also completed while the private server control connection restarted. See the [historical live acceptance report](scripts/verify_iroh_live_report.md).
 
 The kmesh CLI also passed two controlled relay-route tests using a local SSH stub: direct-timeout fallback to the private relay, and private-relay denial with session cleanup. These controlled tests are distinct from a forced private-relay connection to the live `target-1` SSH service. One-hour idle and 1 GiB transfer tests were cancelled and are not part of the acceptance result. The final bounded PrivateDirect sample kept direct path `192.0.2.19:2123` selected while transferring two independent 4 MiB files concurrently in 1.462 seconds, with four interactive echo latencies of 58.943–517.340 ms and 24 proxy RSS samples of 21,568–22,976 KiB. This single run is not an SLO or capacity estimate; see the [sample report](</Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/perf-eb359f7-20261004/report.json>).
+
+### Current 0.3.0 local verification
+
+Local formatting and all-target Clippy with warnings denied pass. `cargo test --locked --all-targets` passes 104 tests with 2 existing QAD route-acceptance tests ignored. The vendored `iroh-relay` library suite passes all 64 tests, including pending-handshake cancellation and a permanently blocked flush cancellation check. Root tests include the real self-hosted relay natural EOF test and the admin relay list/close test; this is local verification, not a live deployment acceptance run.

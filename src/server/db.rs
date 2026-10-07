@@ -12,6 +12,12 @@ pub(crate) struct Database {
     pub pool: SqlitePool,
 }
 
+pub(crate) struct InitialApiToken {
+    pub user_id: String,
+    pub token_id: uuid::Uuid,
+    pub token_hash: String,
+}
+
 impl Database {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let options = SqliteConnectOptions::new()
@@ -42,7 +48,7 @@ impl Database {
                     .await?;
             if let Some(version) = version {
                 anyhow::ensure!(
-                    version == 4,
+                    version == 5,
                     "server database schema version {version} requires a fresh data directory"
                 );
             }
@@ -58,7 +64,7 @@ impl Database {
         &self,
         issuer: &str,
         admin_username: &str,
-        initial_api_token_hash: Option<String>,
+        initial_api_token: Option<InitialApiToken>,
     ) -> Result<()> {
         let mut tx = self
             .pool
@@ -84,46 +90,45 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
         if user_count == 0 {
-            let initial_api_token_hash = initial_api_token_hash
-                .context("initial administrator API token hash is required")?;
-            let user_id = uuid::Uuid::new_v4();
-            let role_id = uuid::Uuid::new_v4();
+            let initial_api_token =
+                initial_api_token.context("initial administrator API token is required")?;
+            let user_id = initial_api_token.user_id;
+            let role_id = "admin";
             let now = unix_time();
             sqlx::query(
                 "INSERT INTO users(id, username, enabled, created_at, updated_at) \
                  VALUES (?1, ?2, 1, ?3, ?3)",
             )
-            .bind(user_id.to_string())
+            .bind(&user_id)
             .bind(admin_username)
             .bind(now)
             .execute(&mut *tx)
             .await
             .context("create initial management user")?;
             sqlx::query(
-                "INSERT INTO roles(id, name, built_in, created_at) VALUES (?1, 'admin', 1, ?2)",
+                "INSERT INTO roles(id, name, built_in, created_at) VALUES ('admin', 'admin', 1, ?1)",
             )
-            .bind(role_id.to_string())
             .bind(now)
             .execute(&mut *tx)
             .await?;
             sqlx::query(
                 "INSERT INTO role_global_permissions(role_id, permission) VALUES (?1, 'admin')",
             )
-            .bind(role_id.to_string())
+            .bind(role_id)
             .execute(&mut *tx)
             .await?;
             sqlx::query("INSERT INTO user_roles(user_id, role_id) VALUES (?1, ?2)")
-                .bind(user_id.to_string())
-                .bind(role_id.to_string())
+                .bind(&user_id)
+                .bind(role_id)
                 .execute(&mut *tx)
                 .await?;
             sqlx::query(
                 "INSERT INTO api_tokens(id, user_id, token_hash, label, created_at) \
                  VALUES (?1, ?2, ?3, 'initial administrator token', ?4)",
             )
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(user_id.to_string())
-            .bind(initial_api_token_hash)
+            .bind(initial_api_token.token_id.to_string())
+            .bind(&user_id)
+            .bind(initial_api_token.token_hash)
             .bind(now)
             .execute(&mut *tx)
             .await
@@ -148,7 +153,7 @@ impl Database {
         )
     }
 
-    pub async fn is_admin(&self, user_id: uuid::Uuid) -> Result<bool> {
+    pub async fn is_admin(&self, user_id: &str) -> Result<bool> {
         let found = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(\
                 SELECT 1 FROM user_roles ur \
@@ -159,39 +164,56 @@ impl Database {
                   AND u.enabled = 1 AND r.name = 'admin'\
             )",
         )
-        .bind(user_id.to_string())
+        .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(found != 0)
     }
 
-    pub async fn is_session_active(
-        &self,
-        user_id: uuid::Uuid,
-        session_id: uuid::Uuid,
-    ) -> Result<bool> {
+    pub async fn is_session_active(&self, user_id: &str, session_id: uuid::Uuid) -> Result<bool> {
         let found = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(SELECT 1 FROM auth_sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.id = ?1 AND s.user_id = ?2 AND s.revoked_at IS NULL \
-               AND (s.api_token_id IS NULL OR EXISTS (\
-                 SELECT 1 FROM api_tokens t WHERE t.id = s.api_token_id AND t.revoked_at IS NULL\
-               )) \
                AND s.refresh_expires_at > ?3 AND u.enabled = 1)",
         )
         .bind(session_id.to_string())
-        .bind(user_id.to_string())
+        .bind(user_id)
         .bind(unix_time())
         .fetch_one(&self.pool)
         .await?;
         Ok(found != 0)
     }
 
-    pub async fn target_endpoint_id(&self, target_id: uuid::Uuid) -> Result<Option<String>> {
+    pub async fn is_api_token_active(
+        &self,
+        user_id: &str,
+        token_id: uuid::Uuid,
+        expires_at: Option<i64>,
+        token_hash: &str,
+    ) -> Result<bool> {
+        let now = unix_time();
+        let found = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM api_tokens t JOIN users u ON u.id = t.user_id \
+             WHERE t.id = ?1 AND t.user_id = ?2 AND t.revoked_at IS NULL AND u.enabled = 1 \
+               AND t.expires_at IS ?3 AND t.token_hash = ?4 \
+               AND (t.expires_at IS NULL OR t.expires_at > ?5))",
+        )
+        .bind(token_id.to_string())
+        .bind(user_id)
+        .bind(expires_at)
+        .bind(token_hash)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(found != 0)
+    }
+
+    pub async fn target_endpoint_id(&self, target_id: &str) -> Result<Option<String>> {
         Ok(sqlx::query_scalar(
             "SELECT agent_endpoint_id FROM targets \
              WHERE id = ?1 AND enabled = 1 AND deleted_at IS NULL AND agent_token_hash IS NOT NULL",
         )
-        .bind(target_id.to_string())
+        .bind(target_id)
         .fetch_optional(&self.pool)
         .await?)
     }

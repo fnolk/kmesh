@@ -34,8 +34,7 @@ use crate::{
     config::Config,
     identity,
     protocol::{
-        ControlMessage, DiscoveryResult, LoginTokens, NativePlan, RouteMode, SelectedPath,
-        TokenLoginRequest, TunnelTicketClaims,
+        ControlMessage, DiscoveryResult, NativePlan, RouteMode, SelectedPath, TunnelTicketClaims,
     },
     transport::{
         IrohByteStream, IrohEndpointOptions, IrohPathKind, QadReflector, RelayChoice, connect_peer,
@@ -117,6 +116,7 @@ impl LocalServer {
         let server = super::super::iroh::listen_and_serve(
             super::super::router(fixture.state.clone()),
             Some(relay_access),
+            fixture.state.clone(),
             SocketAddr::from(([127, 0, 0, 1], https_port)),
             qad_bind,
         )
@@ -326,7 +326,7 @@ async fn next_agent_control(
         .context("agent control message deadline elapsed")?
 }
 
-async fn wait_target_online(state: &super::super::ServerState, target_id: Uuid) -> Result<()> {
+async fn wait_target_online(state: &super::super::ServerState, target_id: &str) -> Result<()> {
     timeout(Duration::from_secs(5), async {
         loop {
             if state
@@ -334,7 +334,7 @@ async fn wait_target_online(state: &super::super::ServerState, target_id: Uuid) 
                 .online_agents
                 .read()
                 .await
-                .contains_key(&target_id)
+                .contains_key(target_id)
             {
                 break;
             }
@@ -347,7 +347,7 @@ async fn wait_target_online(state: &super::super::ServerState, target_id: Uuid) 
 
 async fn drive_target(
     server: &LocalServer,
-    target_id: Uuid,
+    target_id: &str,
     agent_token: String,
     device_key: SecretKey,
     deny_private_relay: bool,
@@ -812,7 +812,7 @@ fn client_binary() -> Result<PathBuf> {
 async fn run_client_cli(
     mode: &str,
     config_path: &Path,
-    target_id: Option<Uuid>,
+    target_id: Option<String>,
     stdin: &[u8],
     budget: Duration,
 ) -> Result<Output> {
@@ -829,11 +829,9 @@ async fn run_client_cli(
             command.args(["login", "--method", "token"]);
         }
         "proxy" => {
-            command.arg("proxy").arg(
-                target_id
-                    .context("proxy CLI requires a target ID")?
-                    .to_string(),
-            );
+            command
+                .arg("proxy")
+                .arg(target_id.context("proxy CLI requires a target ID")?);
         }
         other => bail!("unknown route acceptance CLI operation {other}"),
     }
@@ -865,11 +863,11 @@ async fn login_client(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn enroll_and_grant_target(server: &LocalServer) -> Result<(Uuid, String, SecretKey)> {
+async fn enroll_and_grant_target(server: &LocalServer) -> Result<(String, String, SecretKey)> {
     let device_key = SecretKey::generate();
     let (target_id, agent_token) =
         create_enrolled_target(server.state(), "route-acceptance-target", &device_key).await;
-    grant_target(server.state(), target_id).await;
+    grant_target(server.state(), &target_id).await;
     Ok((target_id, agent_token, device_key))
 }
 
@@ -888,11 +886,11 @@ async fn start_ssh_fixture() -> Result<(SocketAddr, JoinHandle<Result<Vec<u8>>>)
     Ok((addr, task))
 }
 
-async fn run_proxy(config_path: &Path, target_id: Uuid, stdin: &[u8]) -> Result<Output> {
+async fn run_proxy(config_path: &Path, target_id: &str, stdin: &[u8]) -> Result<Output> {
     run_client_cli(
         "proxy",
         config_path,
-        Some(target_id),
+        Some(target_id.to_owned()),
         stdin,
         Duration::from_secs(70),
     )
@@ -969,23 +967,17 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
             }
         }
-        let http = crate::transport::http_client()?;
-        let tokens: LoginTokens = http
-            .post(format!("{}/v1/auth/token", server.issuer))
-            .header(crate::version::VERSION_HEADER, crate::version::VERSION)
-            .json(&TokenLoginRequest {
-                token: server.fixture.admin_token.clone(),
-            })
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
         let saved_login = serde_json::json!({
             "server_url": server.issuer.clone(),
             "profile": "route-acceptance",
             "username": ADMIN_USERNAME,
-            "tokens": tokens,
+            "credential": {
+                "kind": "api_token",
+                "credential": {
+                    "token": server.fixture.admin_token.clone(),
+                    "expires_at": null,
+                },
+            },
         });
         let login_path = profile_dir.join(format!("{}.json", hash_component(ADMIN_USERNAME)));
         fs::write(login_path, serde_json::to_vec(&saved_login)?)?;
@@ -1005,7 +997,7 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
 
         let _agent_control =
             connect_control_ws(&server.issuer, "agent/control", &agent_token).await;
-        wait_target_online(server.state(), target_id).await?;
+        wait_target_online(server.state(), &target_id).await?;
         let has_grant: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM target_permissions WHERE target_id = ?1 \
              AND permission = 'ssh_connect')",
@@ -1026,7 +1018,9 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
             profile: None,
             server_addr: None,
             server_port: None,
-            command: ClientCommand::Proxy { target_id },
+            command: ClientCommand::Proxy {
+                target_id: target_id.clone(),
+            },
         })
         .await
         .expect_err("online target without a grant must be denied");
@@ -1071,10 +1065,10 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
 
         let (ssh_addr, ssh_task) = start_ssh_fixture().await?;
         let (output, target_evidence) = tokio::join!(
-            run_proxy(&config_path, target_id, SSH_REQUEST),
+            run_proxy(&config_path, &target_id, SSH_REQUEST),
             drive_target(
                 &server,
-                target_id,
+                &target_id,
                 agent_token,
                 device_key,
                 false,
@@ -1183,8 +1177,8 @@ async fn client_reports_real_private_relay_refusal_after_direct_timeouts() {
         let config_path = server.client_config()?;
         login_client(&config_path).await?;
         let (output, target_evidence) = tokio::join!(
-            run_proxy(&config_path, target_id, &[]),
-            drive_target(&server, target_id, agent_token, device_key, true, None)
+            run_proxy(&config_path, &target_id, &[]),
+            drive_target(&server, &target_id, agent_token, device_key, true, None)
         );
         let output = output?;
         ensure!(

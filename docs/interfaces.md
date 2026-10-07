@@ -15,6 +15,12 @@ flowchart LR
 
 The client proxy is launched for each new SSH transport. It needs no resident kmesh agent. The target runs one resident kmesh agent, but creates an isolated Iroh data endpoint for each prepared SSH session. OpenSSH `ControlMaster`/`ControlPersist` can reuse an already established SSH connection.
 
+## API credentials
+
+API tokens are EdDSA JWTs signed with the server's persistent user-token key. Their audience is `kmesh-api-token`, separate from the public-key access JWT audience `kmesh-user` and the tunnel-ticket audience `kmesh-tunnel`. User IDs and JWT `sub` values are normalized usernames. Role IDs are normalized role names. Target IDs are lowercase ASCII slugs fixed at creation; target names remain editable SSH aliases. A long-lived API JWT omits `exp`; `kmesh admin tokens create <username> --label <label> --expires-in <seconds>` creates a JWT with a positive lifetime. The `jti` identifies its registered `api_tokens` row. Every HTTP request and new control WebSocket checks the signature, issuer, audience, user enabled state, token registration, token hash, revocation, and database expiry. The pending-to-active transaction repeats token and current RBAC checks. Revocation therefore blocks new API requests and prevents pending SSH sessions from activating. An already active SSH stream follows its normal transport lifetime.
+
+`kmesh login --method token` validates the supplied API JWT with `/v1/me` and saves that same JWT. Later API and control requests use it directly; this flow has no token-exchange, access-token, or refresh-token endpoint. The local profile stores API JWT credentials separately from public-key sessions. Public-key login continues to use a short-lived access JWT and rotating refresh token. Those access JWTs require `sid` and `exp` and use the `kmesh-user` audience.
+
 ## Route selection and data paths
 
 `GET /v1/transport` returns `TransportInfo { private_relay_url: Option<String>, qad_port: u16 }` over the authenticated HTTPS control origin. The current deployment uses TCP 9443 for HTTPS control and the private Iroh relay, and UDP 3478 for the server's QAD listener. Clients learn the private relay URL and QAD port from this response; they do not configure another STUN service.
@@ -35,11 +41,11 @@ Network and timeout failures can advance to the next configured route. Ticket, i
 
 ## Device identity, tickets, and RBAC
 
-The enrolled target has one stable device identity. For each `Prepare { session_id, route_mode, client_endpoint_id, expires_at }`, the agent generates a fresh target data `SecretKey`. It signs a canonical payload binding the session ID, target UUID, route mode, target data EndpointId, and expiry with the stable device key. The server verifies that signature against the registered device EndpointId and binds the new data EndpointId to that pending session. The stable device private key stays on the target.
+The enrolled target has one stable device identity. For each `Prepare { session_id, route_mode, client_endpoint_id, expires_at }`, the agent generates a fresh target data `SecretKey`. It signs a canonical payload under the `kmesh/agent-session-identity/2` domain. The payload binds the session UUID, a four-byte big-endian target-ID byte length followed by the readable target-ID bytes, route mode, target data EndpointId, and expiry. The server verifies that signature against the registered device EndpointId and binds the new data EndpointId to that pending session. The stable device private key stays on the target.
 
-After the server accepts `AgentIdentity`, it creates the signed `TunnelTicketClaims`. The ticket binds the user and login session, target UUID, client data EndpointId, per-session target data EndpointId, route mode, issuer, audience, and expiry. The target writes the ticket to the client over the encrypted Iroh stream. The client and target verify the peer EndpointId against this ticket before activation.
+After the server accepts `AgentIdentity`, it creates the signed `TunnelTicketClaims`. The ticket binds the username, actual authentication credential reference (public-key session UUID or API-token UUID), readable target ID, client data EndpointId, per-session target data EndpointId, route mode, issuer, audience, and expiry. API JWT authentication does not create a login session. The target writes the ticket to the client over the encrypted Iroh stream. The client and target verify the peer EndpointId against this ticket before activation.
 
-The client JWT establishes the user identity; it does not cache target permissions. The server reads current user status, login-session status, target status, role bindings, and `ssh_connect` grants when opening a session. It repeats authorization inside the pending-to-active transaction. A later role or permission change affects new sessions; an activated SSH stream continues until its normal EOF, reset, or transport failure.
+The client JWT establishes the user identity; it does not cache target permissions. The server reads current user status, credential status, target status, role bindings, and `ssh_connect` grants when opening a session. It repeats credential and authorization checks inside the pending-to-active transaction. A later role or permission change affects new sessions; an activated SSH stream continues until its normal EOF, reset, or transport failure.
 
 ## Control-plane sequence
 
@@ -62,4 +68,14 @@ One local SSH TCP connection maps to one QUIC bidirectional stream. The adapter 
 
 `kmesh server run` serves HTTPS control and, unless `--disable-private-relay` is set, the embedded Iroh HTTP relay on the same TCP listener (default `0.0.0.0:9443`). The Iroh QAD service defaults to UDP `0.0.0.0:3478`. HTTPS control and relay connections require the CA certificate and server/client identities embedded at build time. Private TLS handshakes omit SNI. The server identity is always `DNS:kmesh.internal`, which clients validate independently of the configured `server_addr`; that address selects the network destination and HTTP host. Public QAD connections keep standard WebPKI hostname validation and SNI. The server also exposes native CLI APIs for login, target selection, and administration.
 
-SQLite WAL stores users, SSH public keys, roles, grants, targets, login sessions, tunnel-session state, and `admin_audit` records. The current schema requires a fresh data directory; earlier STUN/Quinn/WSS-data databases are not migrated. See the root README for login, enrollment, service setup, and OpenSSH examples.
+SQLite WAL stores users, SSH public keys, roles, grants, registered API JWTs, public-key login sessions, tunnel-session state, and `admin_audit` records. Schema version 5 requires a fresh data directory; earlier databases are not migrated. See the root README for login, enrollment, service setup, and OpenSSH examples.
+
+Local agent credentials are stored under hashes of the canonical server origin and target ID. Generated SSH `HostKeyAlias` values include the same origin scope and readable target ID, so two servers with equal target IDs keep separate credentials and known-host entries.
+
+## Admin relay traffic
+
+`AdminOperation::ListRelayTraffic` samples the embedded relay's actual transports twice over a one-second window. Its response reports measured elapsed milliseconds, process-lifetime ingress and egress payload totals, aggregate and per-transport bytes per second, live transport count, unique mapped SSH session count, and one row per relay endpoint transport. A session normally has two rows, one for its client endpoint and one for its per-session target endpoint. Connections without a current private-relay runtime remain visible with `metadata: null`. Totals include disconnected connections; direct UDP SSH streams never contribute.
+
+The counters measure Iroh relay datagram payloads. Ingress includes decoded datagrams even when forwarding later fails; egress includes payloads successfully written to the destination. They exclude relay control frames, WebSocket/TLS framing, and network headers, so they differ from NIC byte counters.
+
+`AdminOperation::CloseRelaySession { session_id }` accepts a live `PrivateRelay` session. The server commits the session as closed, disconnects all relay transports for its client and per-session target endpoints (including pending admissions), then sends `Close` over the control channels and removes runtime state. The database status check rejects subsequent relay handshakes. Direct sessions return a conflict.

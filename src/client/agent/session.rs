@@ -103,7 +103,7 @@ pub(super) async fn run_agent_session(
         mut control_rx,
         outbound,
     } = prepare;
-    let target_id = credentials.target_id;
+    let target_id = credentials.target_id.as_str();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?

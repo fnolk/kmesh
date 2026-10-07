@@ -36,7 +36,7 @@ fn cli_help_and_global_data_directory_parse_after_subcommand() {
 
 #[test]
 fn agent_enrollment_accepts_url_safe_tokens_starting_with_a_dash() {
-    let target_id = Uuid::new_v4().to_string();
+    let target_id = "build-machine".to_owned();
     let args = [
         "kmesh",
         "agent",
@@ -51,7 +51,7 @@ fn agent_enrollment_accepts_url_safe_tokens_starting_with_a_dash() {
 
 #[test]
 fn cli_splits_server_address_and_ports_and_removes_server_url() {
-    let target_id = Uuid::new_v4().to_string();
+    let target_id = "build-machine".to_owned();
     let cli = Cli::try_parse_from([
         "kmesh",
         "--server-addr",
@@ -117,24 +117,41 @@ fn cli_accepts_token_and_public_key_login_inputs() {
         "--method",
         "token",
         "--token",
-        "kmesh_opaque_token",
+        "eyJhbGciOiJFZERTQSJ9.eyJhdWQiOiJrbWVzaC1hcGktdG9rZW4ifQ.signature",
     ])
     .expect("parse token login override");
     let kmesh::client::Command::Login(args) = cli.command else {
         panic!("expected login command");
     };
     assert_eq!(args.method, Some(kmesh::config::LoginMethod::Token));
-    assert_eq!(args.token.as_deref(), Some("kmesh_opaque_token"));
+    assert_eq!(
+        args.token.as_deref(),
+        Some("eyJhbGciOiJFZERTQSJ9.eyJhdWQiOiJrbWVzaC1hcGktdG9rZW4ifQ.signature")
+    );
     assert!(Cli::try_parse_from(["kmesh", "login", "--password-stdin"]).is_err());
 }
 
 #[test]
 fn admin_token_commands_parse_and_password_user_commands_are_gone() {
-    let user_id = Uuid::new_v4().to_string();
+    let user_id = "alice".to_owned();
     let token_id = Uuid::new_v4().to_string();
     assert!(
         Cli::try_parse_from([
             "kmesh", "admin", "tokens", "create", &user_id, "--label", "laptop",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "kmesh",
+            "admin",
+            "tokens",
+            "create",
+            &user_id,
+            "--label",
+            "automation",
+            "--expires-in",
+            "604800",
         ])
         .is_ok()
     );
@@ -146,7 +163,7 @@ fn admin_token_commands_parse_and_password_user_commands_are_gone() {
 
 #[test]
 fn admin_key_registration_takes_a_public_key_file() {
-    let user_id = Uuid::new_v4().to_string();
+    let user_id = "alice".to_owned();
     let args = [
         "kmesh",
         "admin",
@@ -160,32 +177,89 @@ fn admin_key_registration_takes_a_public_key_file() {
 
 #[test]
 fn ssh_config_uses_stable_alias_and_shell_safe_proxy_arguments() {
-    let target_id = Uuid::new_v4();
+    let target_id = "build-machine-id".to_owned();
     let target = TargetView {
-        target_id,
-        name: "-unsafe\nProxyCommand evil".to_owned(),
+        target_id: target_id.clone(),
+        name: "Build-Machine".to_owned(),
         enabled: false,
         online: true,
     };
     let rendered = ssh_config::render(
         &target,
-        &Cli::try_parse_from(["kmesh", "ssh-config", &target_id.to_string()]).unwrap(),
+        &Cli::try_parse_from(["kmesh", "ssh-config", &target_id]).unwrap(),
+        "https://one.example:9443",
     )
     .unwrap();
-    assert!(rendered.starts_with(&format!("Host {target_id}\n")));
-    assert_eq!(rendered.matches("\nHost ").count(), 0);
+    assert!(rendered.starts_with("Host Build-Machine\n"));
     assert!(rendered.contains(&format!("ProxyCommand kmesh proxy {target_id}\n")));
     assert!(!rendered.contains("--config"));
     assert!(!rendered.contains("--data-dir"));
     assert!(!rendered.contains("--profile"));
-    assert!(rendered.contains(&format!("HostKeyAlias kmesh/{target_id}")));
+    let host_key_alias = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix("    HostKeyAlias "))
+        .expect("rendered SSH config has a host-key alias");
+    assert!(host_key_alias.starts_with("kmesh/"));
+    assert!(host_key_alias.ends_with(&format!("/{target_id}")));
+}
+
+#[test]
+fn ssh_config_scopes_host_keys_by_server_origin() {
+    let target = TargetView {
+        target_id: "office-ssh".to_owned(),
+        name: "Office-SSH".to_owned(),
+        enabled: true,
+        online: true,
+    };
+    let cli = Cli::try_parse_from(["kmesh", "ssh-config", "office-ssh"]).unwrap();
+    let alias = |origin| {
+        ssh_config::render(&target, &cli, origin)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("    HostKeyAlias "))
+            .unwrap()
+            .to_owned()
+    };
+    let first = alias("https://one.example:9443");
+    let second = alias("https://two.example:9443");
+    assert_ne!(first, second);
+    assert!(first.ends_with("/office-ssh"));
+    assert!(second.ends_with("/office-ssh"));
+}
+
+#[test]
+fn ssh_config_selects_by_normalized_id_when_a_name_matches_another_id() {
+    let targets = vec![
+        TargetView {
+            target_id: "first".to_owned(),
+            name: "second".to_owned(),
+            enabled: true,
+            online: true,
+        },
+        TargetView {
+            target_id: "second".to_owned(),
+            name: "First".to_owned(),
+            enabled: true,
+            online: true,
+        },
+    ];
+
+    assert_eq!(
+        ssh_config::find_target(&targets, " FIRST ")
+            .unwrap()
+            .target_id,
+        "first"
+    );
+    let selected = ssh_config::find_target(&targets, "second").unwrap();
+    assert_eq!(selected.target_id, "second");
+    assert_eq!(selected.name, "First");
 }
 
 #[test]
 fn ssh_config_replays_only_explicit_overrides_with_absolute_paths() {
-    let target_id = Uuid::new_v4();
+    let target_id = "build-machine".to_owned();
     let target = TargetView {
-        target_id,
+        target_id: target_id.clone(),
         name: "build-machine".to_owned(),
         enabled: true,
         online: true,
@@ -203,11 +277,11 @@ fn ssh_config_replays_only_explicit_overrides_with_absolute_paths() {
         "--server-port",
         "9555",
         "ssh-config",
-        &target_id.to_string(),
+        &target_id,
     ])
     .unwrap();
 
-    let rendered = ssh_config::render(&target, &cli).unwrap();
+    let rendered = ssh_config::render(&target, &cli, "https://example.test:9555").unwrap();
     let current_dir = std::env::current_dir().unwrap();
     let config_path = current_dir.join("config with %tokens.toml");
     let data_dir = current_dir.join("kmesh %home");

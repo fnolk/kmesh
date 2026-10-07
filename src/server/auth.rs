@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::identity::{self, USER_TOKEN_AUDIENCE};
 use crate::protocol::{
-    AccessTokenClaims, LoginTokens, PublicKeyChallenge, PublicKeyChallengeRequest,
-    PublicKeyLoginRequest, RefreshRequest, TokenLoginRequest,
+    AccessTokenClaims, AuthCredential, LoginTokens, PublicKeyChallenge, PublicKeyChallengeRequest,
+    PublicKeyLoginRequest, RefreshRequest,
 };
 use ssh_key::{HashAlg, PublicKey, SshSig};
 
@@ -59,56 +59,11 @@ impl AuthRateLimiter {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AuthenticatedUser {
-    pub user_id: Uuid,
-    pub session_id: Uuid,
-    pub access_expires_at: i64,
-}
-
-pub(crate) async fn token_login(
-    State(state): State<ServerState>,
-    axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    Json(request): Json<TokenLoginRequest>,
-) -> Result<Json<LoginTokens>, ApiError> {
-    state.inner.auth_rate_limiter.check(remote.ip()).await?;
-    if request.token.is_empty() || request.token.len() > 256 {
-        return Err(ApiError::unauthorized());
-    }
-    let token_hash = hash_secret(&request.token);
-    let now = unix_time();
-    let mut tx = state
-        .inner
-        .db
-        .pool
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .map_err(ApiError::from)?;
-    let row = sqlx::query(
-        "SELECT t.id AS token_id, t.user_id FROM api_tokens t \
-         JOIN users u ON u.id = t.user_id \
-         WHERE t.token_hash = ?1 AND t.revoked_at IS NULL AND u.enabled = 1",
-    )
-    .bind(token_hash)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(ApiError::from)?
-    .ok_or_else(ApiError::unauthorized)?;
-    let token_id = row_uuid(&row, "token_id").map_err(ApiError::from)?;
-    let user_id = row_uuid(&row, "user_id").map_err(ApiError::from)?;
-    let issued = tokens_for_new_session(&state, user_id)?;
-    insert_auth_session(
-        &mut tx,
-        user_id,
-        "api_token",
-        Some(token_id),
-        issued.session_id,
-        &issued.tokens,
-        now,
-    )
-    .await?;
-    tx.commit().await.map_err(ApiError::from)?;
-    Ok(Json(issued.tokens))
+    pub user_id: String,
+    pub credential: AuthCredential,
+    pub expires_at: Option<i64>,
 }
 
 pub(crate) async fn public_key_challenge(
@@ -129,9 +84,9 @@ pub(crate) async fn public_key_challenge(
     .bind(fingerprint)
     .fetch_optional(&state.inner.db.pool)
     .await?;
-    let (user_id, key_id) = match row {
+    let (user_id, key_id): (Option<String>, Option<String>) = match row {
         Some(row) => (
-            Some(row_uuid(&row, "user_id")?.to_string()),
+            Some(row.try_get("user_id")?),
             Some(row_uuid(&row, "key_id")?.to_string()),
         ),
         None => (None, None),
@@ -238,8 +193,7 @@ pub(crate) async fn public_key_login(
     if registered == 0 {
         return Err(ApiError::unauthorized());
     }
-    let user_id = Uuid::parse_str(&user_id).map_err(ApiError::internal)?;
-    let issued = tokens_for_new_session(&state, user_id)?;
+    let issued = tokens_for_new_session(&state, user_id.clone())?;
     let consumed = sqlx::query(
         "UPDATE ssh_login_challenges SET consumed_at = ?1 \
          WHERE id = ?2 AND consumed_at IS NULL AND expires_at >= ?1",
@@ -255,8 +209,6 @@ pub(crate) async fn public_key_login(
     insert_auth_session(
         &mut tx,
         user_id,
-        "ssh_key",
-        None,
         issued.session_id,
         &issued.tokens,
         unix_time(),
@@ -299,7 +251,7 @@ pub(crate) async fn refresh(
     .map_err(ApiError::from)?
     .ok_or_else(ApiError::unauthorized)?;
     let session_id = row_uuid(&row, "session_id").map_err(ApiError::from)?;
-    let user_id = row_uuid(&row, "user_id").map_err(ApiError::from)?;
+    let user_id = row.try_get("user_id").map_err(ApiError::from)?;
     let expires_at: i64 = row.try_get("expires_at").map_err(ApiError::from)?;
     let consumed_at: Option<i64> = row.try_get("consumed_at").map_err(ApiError::from)?;
     let refresh_revoked_at: Option<i64> = row.try_get("revoked_at").map_err(ApiError::from)?;
@@ -392,19 +344,24 @@ pub(crate) async fn logout(
     headers: HeaderMap,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let user = authenticate(&state, &headers).await?;
+    let AuthCredential::Session(session_id) = user.credential else {
+        return Err(ApiError::bad_request(
+            "API tokens are revoked through admin tokens revoke",
+        ));
+    };
     let now = unix_time();
     let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, ?1) WHERE id = ?2 AND user_id = ?3")
         .bind(now)
-        .bind(user.session_id.to_string())
-        .bind(user.user_id.to_string())
+        .bind(session_id.to_string())
+    .bind(&user.user_id)
         .execute(&mut *tx)
         .await?;
     sqlx::query(
         "UPDATE refresh_tokens SET revoked_at = COALESCE(revoked_at, ?1) WHERE session_id = ?2",
     )
     .bind(now)
-    .bind(user.session_id.to_string())
+    .bind(session_id.to_string())
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -416,16 +373,39 @@ pub(crate) async fn authenticate(
     headers: &HeaderMap,
 ) -> Result<AuthenticatedUser, ApiError> {
     let token = bearer_token(headers)?;
-    let claims = identity::decode_user_access_token(
+    if let Ok(claims) = identity::decode_user_access_token(
+        token,
+        &state.inner.keys.user_access.public_key_pem,
+        &state.inner.issuer,
+    ) {
+        let active = state
+            .inner
+            .db
+            .is_session_active(&claims.sub, claims.sid)
+            .await
+            .map_err(ApiError::from)?;
+        if !active {
+            return Err(ApiError::unauthorized());
+        }
+        return Ok(AuthenticatedUser {
+            user_id: claims.sub,
+            credential: AuthCredential::Session(claims.sid),
+            expires_at: Some(claims.exp as i64),
+        });
+    }
+
+    let claims = identity::decode_api_token(
         token,
         &state.inner.keys.user_access.public_key_pem,
         &state.inner.issuer,
     )
     .map_err(|_| ApiError::unauthorized())?;
+    let token_hash = hash_secret(token);
+    let expires_at = claims.exp.map(|expires_at| expires_at as i64);
     let active = state
         .inner
         .db
-        .is_session_active(claims.sub, claims.sid)
+        .is_api_token_active(&claims.sub, claims.jti, expires_at, &token_hash)
         .await
         .map_err(ApiError::from)?;
     if !active {
@@ -433,8 +413,8 @@ pub(crate) async fn authenticate(
     }
     Ok(AuthenticatedUser {
         user_id: claims.sub,
-        session_id: claims.sid,
-        access_expires_at: claims.exp as i64,
+        credential: AuthCredential::ApiToken(claims.jti),
+        expires_at,
     })
 }
 
@@ -453,14 +433,14 @@ struct IssuedTokens {
     tokens: LoginTokens,
 }
 
-fn tokens_for_new_session(state: &ServerState, user_id: Uuid) -> Result<IssuedTokens, ApiError> {
+fn tokens_for_new_session(state: &ServerState, user_id: String) -> Result<IssuedTokens, ApiError> {
     let now = unix_time();
     let session_id = Uuid::new_v4();
     let refresh_token = new_secret();
     let access_expires_at = now + ACCESS_TOKEN_TTL_SECS;
     let refresh_expires_at = now + REFRESH_TOKEN_TTL_SECS;
     let claims = AccessTokenClaims {
-        sub: user_id,
+        sub: user_id.clone(),
         sid: session_id,
         iss: state.inner.issuer.clone(),
         aud: USER_TOKEN_AUDIENCE.to_owned(),
@@ -483,22 +463,18 @@ fn tokens_for_new_session(state: &ServerState, user_id: Uuid) -> Result<IssuedTo
 
 async fn insert_auth_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    user_id: Uuid,
-    auth_method: &str,
-    api_token_id: Option<Uuid>,
+    user_id: String,
     session_id: Uuid,
     tokens: &LoginTokens,
     now: i64,
 ) -> Result<(), ApiError> {
     let refresh_hash = hash_secret(&tokens.refresh_token);
     sqlx::query(
-        "INSERT INTO auth_sessions(id, user_id, api_token_id, auth_method, created_at, access_expires_at, refresh_expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO auth_sessions(id, user_id, created_at, access_expires_at, refresh_expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )
     .bind(session_id.to_string())
-    .bind(user_id.to_string())
-    .bind(api_token_id.map(|id| id.to_string()))
-    .bind(auth_method)
+    .bind(user_id)
     .bind(now)
     .bind(tokens.access_expires_at as i64)
     .bind(tokens.refresh_expires_at as i64)

@@ -24,7 +24,7 @@ pub(super) struct TunnelOffer {
 pub(super) async fn next_offer(
     control: &mut WsStream,
     session_id: Uuid,
-    target_id: Uuid,
+    target_id: &str,
     client_endpoint_id: &str,
     issuer: &str,
     expected_mode: RouteMode,
@@ -105,7 +105,7 @@ pub(super) async fn next_offer(
 fn validate_offer(
     claims: &TunnelTicketClaims,
     session_id: Uuid,
-    target_id: Uuid,
+    target_id: &str,
     client_endpoint_id: &str,
     target_endpoint_id: &str,
     expected_mode: RouteMode,
@@ -185,7 +185,7 @@ mod tests {
     use super::super::{RouteNetworkFailure, attempt::classify_anyhow_network_error};
     use super::*;
     use crate::{
-        protocol::RouteMode,
+        protocol::{AuthCredential, RouteMode},
         transport::{RelayChoice, accept_peer, connect_peer},
     };
     use iroh::{Endpoint, SecretKey, endpoint::presets};
@@ -248,14 +248,14 @@ mod tests {
     #[test]
     fn expired_session_ticket_is_authentication_not_route_retry() {
         let session_id = Uuid::new_v4();
-        let target_id = Uuid::new_v4();
+        let target_id = "target-1".to_owned();
         let client_endpoint_id = SecretKey::generate().public().to_string();
         let target_endpoint_id = SecretKey::generate().public().to_string();
         let claims = TunnelTicketClaims {
             session_id,
-            user_id: Uuid::new_v4(),
-            login_session_id: Uuid::new_v4(),
-            target_id,
+            user_id: "alice".to_owned(),
+            auth_credential: AuthCredential::Session(Uuid::new_v4()),
+            target_id: target_id.clone(),
             client_endpoint_id: client_endpoint_id.clone(),
             target_endpoint_id: target_endpoint_id.clone(),
             route_mode: RouteMode::PrivateDirect,
@@ -267,7 +267,7 @@ mod tests {
         let error = validate_offer(
             &claims,
             session_id,
-            target_id,
+            &target_id,
             &client_endpoint_id,
             &target_endpoint_id,
             RouteMode::PrivateDirect,

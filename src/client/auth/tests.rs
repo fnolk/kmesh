@@ -25,7 +25,7 @@ use crate::{
     client::{
         Cli, ClientContext, Command as ClientCommand,
         api::Api,
-        profile::{ProfileStore, SavedLogin},
+        profile::{ProfileStore, SavedCredential, SavedLogin},
     },
     config::{AuthConfig, Config, LoginMethod},
     protocol::{LoginTokens, MeView, UserView},
@@ -101,7 +101,7 @@ async fn login_reports_missing_method_token_username_and_key_before_network() {
     let error = super::login(&context, &LoginArgs::default())
         .await
         .expect_err("token login requires a token");
-    assert!(format!("{error:#}").contains("API token is required"));
+    assert!(format!("{error:#}").contains("API JWT is required"));
 
     let context = auth_context(Config {
         auth: AuthConfig {
@@ -193,7 +193,7 @@ async fn token_env_precedence_child() {
     let error = super::login(&context, &args)
         .await
         .expect_err("empty CLI/environment token overrides TOML");
-    assert!(format!("{error:#}").contains("API token is empty"));
+    assert!(format!("{error:#}").contains("API JWT is empty"));
 }
 
 #[tokio::test]
@@ -331,62 +331,52 @@ async fn one_refresh_request(
     }
 }
 
-async fn one_token_login_and_me(
+async fn one_api_jwt_me_request(
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    expected_token: &'static str,
-    tokens: LoginTokens,
+    expected_token: String,
     me: MeView,
 ) {
-    for (expected_path, response, expected_auth) in [
-        (
-            "POST /v1/auth/token ",
-            serde_json::to_vec(&tokens).expect("encode login tokens"),
-            None,
-        ),
-        (
-            "GET /v1/me ",
-            serde_json::to_vec(&me).expect("encode current user"),
-            Some("authorization: bearer access-token"),
-        ),
-    ] {
-        let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .expect("token login request arrives")
-            .expect("accept token login request");
-        let mut stream = timeout(Duration::from_secs(5), acceptor.accept(socket))
-            .await
-            .expect("HTTPS handshake completes")
-            .expect("accept HTTPS login request");
-        let request = timeout(Duration::from_secs(5), read_http_request(&mut stream))
-            .await
-            .expect("login HTTP request completes");
-        let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
-        assert!(request_text.starts_with(&expected_path.to_ascii_lowercase()));
-        if expected_path.starts_with("POST") {
-            assert!(request_text.contains(expected_token));
-        }
-        if let Some(expected_auth) = expected_auth {
-            assert!(request_text.contains(expected_auth));
-        }
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            response.len()
-        );
-        stream
-            .write_all(headers.as_bytes())
-            .await
-            .expect("write login response headers");
-        stream
-            .write_all(&response)
-            .await
-            .expect("write login response body");
-        stream.shutdown().await.expect("close login response");
-    }
+    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("API JWT validation request arrives")
+        .expect("accept API JWT validation request");
+    let mut stream = timeout(Duration::from_secs(5), acceptor.accept(socket))
+        .await
+        .expect("HTTPS handshake completes")
+        .expect("accept HTTPS validation request");
+    let request = timeout(Duration::from_secs(5), read_http_request(&mut stream))
+        .await
+        .expect("validation HTTP request completes");
+    let request_text = String::from_utf8_lossy(&request);
+    assert!(request_text.to_ascii_lowercase().starts_with("get /v1/me "));
+    let authorization = request_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_owned())
+        })
+        .expect("API JWT validation request includes Authorization");
+    assert_eq!(authorization, format!("Bearer {expected_token}"));
+    let response = serde_json::to_vec(&me).expect("encode current user");
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .await
+        .expect("write validation response headers");
+    stream
+        .write_all(&response)
+        .await
+        .expect("write validation response body");
+    stream.shutdown().await.expect("close validation response");
 }
 
 #[tokio::test]
-async fn token_login_uses_toml_token_fetches_actual_username_and_saves_session() {
+async fn api_jwt_login_uses_the_token_directly_and_saves_that_credential() {
     let directory = TestDirectory::new("token-login-test");
     let acceptor = test_tls_acceptor();
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -394,26 +384,28 @@ async fn token_login_uses_toml_token_fetches_actual_username_and_saves_session()
         .expect("bind local token login server");
     let server_port = listener.local_addr().unwrap().port();
     let now = unix_now().unwrap();
-    let tokens = LoginTokens {
-        access_token: "access-token".to_owned(),
-        refresh_token: "refresh-token".to_owned(),
-        access_expires_at: now + 900,
-        refresh_expires_at: now + 3600,
-    };
     let me = MeView {
         user: UserView {
-            user_id: Uuid::new_v4(),
+            user_id: "alice".to_owned(),
             username: "Alice".to_owned(),
             enabled: true,
         },
         roles: Vec::new(),
     };
-    let expected_token = "kmesh_test_api_token";
-    let server = tokio::spawn(one_token_login_and_me(
+    let claims = crate::protocol::ApiTokenClaims {
+        sub: "alice".to_owned(),
+        jti: Uuid::new_v4(),
+        iss: "https://test.invalid".to_owned(),
+        aud: crate::identity::API_TOKEN_AUDIENCE.to_owned(),
+        iat: now,
+        exp: Some(now + 3600),
+    };
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+    let expected_token = format!("e30.{payload}.signature");
+    let server = tokio::spawn(one_api_jwt_me_request(
         listener,
         acceptor,
-        expected_token,
-        tokens.clone(),
+        expected_token.clone(),
         me,
     ));
     let config = Config {
@@ -422,7 +414,7 @@ async fn token_login_uses_toml_token_fetches_actual_username_and_saves_session()
         data_dir: directory.0.clone(),
         auth: AuthConfig {
             method: Some(LoginMethod::Token),
-            token: Some(expected_token.to_owned()),
+            token: Some(expected_token.clone()),
             ..AuthConfig::default()
         },
         ..Config::default()
@@ -431,14 +423,46 @@ async fn token_login_uses_toml_token_fetches_actual_username_and_saves_session()
 
     super::login(&context, &LoginArgs::default())
         .await
-        .expect("login with configured API token");
+        .expect("login with configured API JWT");
     server.await.expect("token login server completes");
 
     assert_eq!(context.profiles.active_user().unwrap(), "alice");
     let saved = context.profiles.load("alice").unwrap().unwrap();
     assert_eq!(saved.username, "alice");
-    assert_eq!(saved.tokens.access_token, tokens.access_token);
-    assert_eq!(saved.tokens.refresh_token, tokens.refresh_token);
+    assert!(matches!(saved.credential,
+        SavedCredential::ApiToken { token, expires_at: Some(exp) }
+            if token == expected_token && exp == now + 3600));
+}
+
+#[tokio::test]
+async fn expired_api_jwt_requires_a_replacement_without_refreshing() {
+    let directory = TestDirectory::new("expired-api-jwt-test");
+    let config = Config {
+        data_dir: directory.0.clone(),
+        ..Config::default()
+    };
+    let context = auth_context(config).await;
+    context
+        .profiles
+        .save(&SavedLogin {
+            server_url: context.api.issuer().to_owned(),
+            profile: context.config.profile.clone(),
+            username: "alice".to_owned(),
+            credential: SavedCredential::ApiToken {
+                token: "expired.jwt.signature".to_owned(),
+                expires_at: Some(unix_now().unwrap() - 1),
+            },
+        })
+        .expect("save expired API JWT");
+    context
+        .profiles
+        .set_active_user("alice")
+        .expect("select expired API JWT");
+
+    let error = super::valid_access_token(&context).await.unwrap_err();
+    assert!(error.to_string().contains("配置新 token"));
+    assert!(context.profiles.load("alice").unwrap().is_none());
+    assert!(context.profiles.active_user().is_err());
 }
 
 #[test]
@@ -599,11 +623,13 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
             server_url: server_url.clone(),
             profile: "shared-profile".to_owned(),
             username: "alice".to_owned(),
-            tokens: LoginTokens {
-                access_token: "expired-access-token".to_owned(),
-                refresh_token: "old-refresh-token".to_owned(),
-                access_expires_at: now - 1,
-                refresh_expires_at: now + 3600,
+            credential: SavedCredential::PublicKeySession {
+                tokens: LoginTokens {
+                    access_token: "expired-access-token".to_owned(),
+                    refresh_token: "old-refresh-token".to_owned(),
+                    access_expires_at: now - 1,
+                    refresh_expires_at: now + 3600,
+                },
             },
         })
         .expect("save expired test login");
@@ -698,7 +724,9 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
         "rotated-access-token"
     );
     let saved = profiles.load("alice").unwrap().unwrap();
-    assert_eq!(saved.tokens.refresh_token, "rotated-refresh-token");
+    assert!(matches!(saved.credential,
+        SavedCredential::PublicKeySession { tokens }
+            if tokens.refresh_token == "rotated-refresh-token"));
 }
 
 #[tokio::test]
@@ -719,11 +747,13 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
             server_url: server_url.clone(),
             profile: "uncertain-profile".to_owned(),
             username: "alice".to_owned(),
-            tokens: LoginTokens {
-                access_token: "expired-access-token".to_owned(),
-                refresh_token: "unknown-result-refresh-token".to_owned(),
-                access_expires_at: now - 1,
-                refresh_expires_at: now + 3600,
+            credential: SavedCredential::PublicKeySession {
+                tokens: LoginTokens {
+                    access_token: "expired-access-token".to_owned(),
+                    refresh_token: "unknown-result-refresh-token".to_owned(),
+                    access_expires_at: now - 1,
+                    refresh_expires_at: now + 3600,
+                },
             },
         })
         .expect("save login before uncertain refresh");

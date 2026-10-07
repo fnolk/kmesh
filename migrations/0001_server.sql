@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     token_hash TEXT NOT NULL UNIQUE,
     label TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    expires_at INTEGER,
     revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS api_tokens_user_id_idx ON api_tokens(user_id, revoked_at);
@@ -82,16 +83,10 @@ CREATE INDEX IF NOT EXISTS target_permissions_target_idx ON target_permissions(t
 CREATE TABLE IF NOT EXISTS auth_sessions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    api_token_id TEXT REFERENCES api_tokens(id) ON DELETE CASCADE,
-    auth_method TEXT NOT NULL CHECK (auth_method IN ('api_token', 'ssh_key')),
     created_at INTEGER NOT NULL,
     access_expires_at INTEGER NOT NULL,
     refresh_expires_at INTEGER NOT NULL,
-    revoked_at INTEGER,
-    CHECK (
-        (auth_method = 'api_token' AND api_token_id IS NOT NULL) OR
-        (auth_method = 'ssh_key' AND api_token_id IS NULL)
-    )
+    revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx ON auth_sessions(user_id, revoked_at);
 
@@ -121,7 +116,8 @@ CREATE INDEX IF NOT EXISTS ssh_login_challenges_expiry_idx ON ssh_login_challeng
 CREATE TABLE IF NOT EXISTS tunnel_sessions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id),
-    auth_session_id TEXT NOT NULL REFERENCES auth_sessions(id),
+    auth_session_id TEXT REFERENCES auth_sessions(id),
+    api_token_id TEXT REFERENCES api_tokens(id),
     target_id TEXT NOT NULL REFERENCES targets(id),
     client_endpoint_id TEXT NOT NULL,
     target_endpoint_id TEXT NOT NULL,
@@ -129,7 +125,11 @@ CREATE TABLE IF NOT EXISTS tunnel_sessions (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     activated_at INTEGER,
-    closed_at INTEGER
+    closed_at INTEGER,
+    CHECK (
+        (auth_session_id IS NOT NULL AND api_token_id IS NULL) OR
+        (auth_session_id IS NULL AND api_token_id IS NOT NULL)
+    )
 );
 CREATE INDEX IF NOT EXISTS tunnel_sessions_target_status_idx ON tunnel_sessions(target_id, status);
 CREATE INDEX IF NOT EXISTS tunnel_sessions_client_endpoint_idx ON tunnel_sessions(client_endpoint_id, status, expires_at);
@@ -148,4 +148,4 @@ CREATE TABLE IF NOT EXISTS admin_audit (
 CREATE INDEX IF NOT EXISTS admin_audit_actor_time_idx ON admin_audit(actor_user_id, occurred_at);
 CREATE INDEX IF NOT EXISTS admin_audit_object_idx ON admin_audit(object_type, object_id, occurred_at);
 
-INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, unixepoch());
+INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, unixepoch());

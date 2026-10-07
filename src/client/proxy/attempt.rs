@@ -39,7 +39,7 @@ pub(super) async fn close_endpoint(endpoint: &Endpoint) {
 pub(super) struct SshAttempt<'a> {
     pub(super) client: &'a ClientContext,
     pub(super) transport_info: &'a TransportInfo,
-    pub(super) target_id: Uuid,
+    pub(super) target_id: String,
     pub(super) session_id: Uuid,
     pub(super) secret_key: SecretKey,
     pub(super) route_mode: RouteMode,
@@ -75,7 +75,7 @@ pub(super) async fn open_ssh_session(
         control,
         &ControlMessage::Open {
             session_id,
-            target_id,
+            target_id: target_id.clone(),
             client_endpoint_id: client_endpoint_id.clone(),
             route_mode,
         },
@@ -88,7 +88,7 @@ pub(super) async fn open_ssh_session(
         ticket::next_offer(
             control,
             session_id,
-            target_id,
+            &target_id,
             &client_endpoint_id,
             context.api.issuer(),
             route_mode,

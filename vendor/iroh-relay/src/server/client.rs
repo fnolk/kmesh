@@ -1,6 +1,10 @@
 //! The server-side representation of an ongoing client relaying connection.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use iroh_base::EndpointId;
 use n0_error::{e, stack_error};
@@ -30,7 +34,7 @@ use crate::{
     },
     server::{
         ConnectionId, OnDisconnectGuard,
-        clients::Clients,
+        clients::{Clients, RelayConnectionStats, TrafficCounters},
         metrics::Metrics,
         streams::{RecvError as RelayRecvError, RelayedStream, SendError as RelaySendError},
     },
@@ -101,6 +105,8 @@ pub(super) struct Client {
     endpoint_id: EndpointId,
     /// Connection identifier.
     connection_id: ConnectionId,
+    connected_at: SystemTime,
+    traffic: Arc<TrafficCounters>,
     /// Used to close the connection loop.
     done: CancellationToken,
     /// Actor handle.
@@ -121,7 +127,12 @@ impl Client {
     /// control once the connection ends.
     ///
     /// Call [`Client::shutdown`] to close the read and write loops before dropping the [`Client`]
-    pub(super) fn new<S>(config: Config<S>, clients: &Clients, metrics: Arc<Metrics>) -> Client
+    pub(super) fn new<S>(
+        config: Config<S>,
+        clients: &Clients,
+        metrics: Arc<Metrics>,
+        done: CancellationToken,
+    ) -> Client
     where
         S: BytesStreamSink + Send + 'static,
     {
@@ -135,11 +146,11 @@ impl Client {
         } = config;
         let endpoint_id = guard.endpoint_id;
         let connection_id = guard.connection_id;
+        let connected_at = SystemTime::now();
+        let traffic = Arc::new(TrafficCounters::default());
 
         let (packet_send_queue_s, packet_send_queue_r) = mpsc::channel(channel_capacity);
         let (message_send_queue_s, message_send_queue_r) = mpsc::channel(channel_capacity);
-        let done = CancellationToken::new();
-
         let actor = Actor {
             stream,
             timeout: write_timeout,
@@ -152,6 +163,7 @@ impl Client {
             protocol_version,
             rate_limited,
             metrics,
+            traffic: traffic.clone(),
         };
 
         // start io loop
@@ -165,6 +177,8 @@ impl Client {
         Client {
             endpoint_id,
             connection_id,
+            connected_at,
+            traffic,
             handle: AbortOnDropHandle::new(handle),
             done,
             packet_queue: packet_send_queue_s,
@@ -177,9 +191,22 @@ impl Client {
         self.connection_id
     }
 
+    pub(super) fn stats(&self, active: bool) -> RelayConnectionStats {
+        let (bytes_received, bytes_sent) = self.traffic.snapshot();
+        RelayConnectionStats {
+            endpoint_id: self.endpoint_id,
+            connection_id: self.connection_id,
+            connected_at: self.connected_at,
+            active,
+            bytes_received,
+            bytes_sent,
+        }
+    }
+
     /// Shutdown the reader and writer loops and closes the connection.
     ///
-    /// Any shutdown errors will be logged as warnings.
+    /// Cancels in-flight stream I/O and drops queued outbound frames. Any shutdown errors will be
+    /// logged as warnings.
     pub(super) async fn shutdown(self) {
         self.start_shutdown();
         if let Err(e) = self.handle.await {
@@ -191,6 +218,8 @@ impl Client {
     }
 
     /// Starts the process of shutdown.
+    ///
+    /// Cancels the actor immediately. Pending outbound frames are dropped with the connection.
     pub(super) fn start_shutdown(&self) {
         self.done.cancel();
     }
@@ -279,8 +308,6 @@ pub enum RunError {
         #[error(from)]
         source: ForwardPacketError,
     },
-    #[error("Flush")]
-    Flush {},
     #[error(transparent)]
     HandleFrame {
         #[error(from)]
@@ -337,6 +364,7 @@ struct Actor<S> {
     /// Optional signal counting how often the connection has been rate-limited.
     rate_limited: Option<watch::Receiver<u64>>,
     metrics: Arc<Metrics>,
+    traffic: Arc<TrafficCounters>,
 }
 
 impl<S> Actor<S>
@@ -351,7 +379,15 @@ where
         if self.client_counter.update(self.guard.endpoint_id()) {
             self.metrics.unique_client_keys.inc();
         }
-        match self.run_inner(done).await {
+        let result = tokio::select! {
+            biased;
+            _ = done.cancelled() => {
+                trace!("actor loop cancelled, dropping the relay stream");
+                Ok(())
+            }
+            result = self.run_inner() => result,
+        };
+        match result {
             Err(e) => {
                 warn!("actor errored {e:#}, exiting");
             }
@@ -364,7 +400,7 @@ where
         self.metrics.disconnects.inc();
     }
 
-    async fn run_inner(&mut self, done: CancellationToken) -> Result<(), RunError> {
+    async fn run_inner(&mut self) -> Result<(), RunError> {
         // Add some jitter to ping pong interactions, to avoid all pings being sent at the same time
         let next_interval = || {
             let random_secs = rand::rng().random_range(1..=5);
@@ -382,12 +418,6 @@ where
             tokio::select! {
                 biased;
 
-                _ = done.cancelled() => {
-                    trace!("actor loop cancelled, exiting");
-                    // final flush
-                    self.stream.flush().await.map_err(|_| e!(RunError::Flush))?;
-                    break;
-                }
                 limited = rate_limited_signal(&mut self.rate_limited), if !rate_limit_notified => {
                     // Notify the client once per connection.
                     // V1 clients are not notified.
@@ -455,19 +485,18 @@ where
     /// Writes contents to the client in a `RECV_PACKET` frame.
     ///
     /// Errors if the send does not happen within the `timeout` duration
-    /// Does not flush.
     async fn send_raw(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
         let remote_endpoint_id = packet.src;
         let datagrams = packet.data;
-
-        if let Ok(len) = datagrams.contents.len().try_into() {
-            self.metrics.bytes_sent.inc_by(len);
-        }
+        let len = datagrams.contents.len() as u64;
         self.write_frame(RelayToClientMsg::Datagrams {
             remote_endpoint_id,
             datagrams,
         })
-        .await
+        .await?;
+        self.metrics.bytes_sent.inc_by(len);
+        self.clients.record_sent(&self.traffic, len);
+        Ok(())
     }
 
     async fn send_packet(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
@@ -507,6 +536,8 @@ where
                     warn!("failed to handle send packet frame: {err:#}");
                 }
                 self.metrics.bytes_recv.inc_by(packet_len as u64);
+                self.clients
+                    .record_received(&self.traffic, packet_len as u64);
             }
             ClientToRelayMsg::Ping(data) => {
                 self.metrics.got_ping.inc();
@@ -650,6 +681,7 @@ mod tests {
             protocol_version: ProtocolVersion::V2,
             rate_limited: None,
             metrics,
+            traffic: Arc::new(TrafficCounters::default()),
         };
 
         let done = CancellationToken::new();

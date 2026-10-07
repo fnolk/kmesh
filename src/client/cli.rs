@@ -71,15 +71,15 @@ pub enum Command {
     },
     #[command(about = "Print an OpenSSH configuration entry for a target")]
     SshConfig {
-        #[arg(help = "Target name or ID")]
+        #[arg(help = "Target ID")]
         target: String,
     },
     #[command(about = "Open an SSH stream to a target")]
     Proxy {
-        #[arg(help = "ID of the target to connect to")]
-        target_id: Uuid,
+        #[arg(help = "Target ID to connect to")]
+        target_id: String,
     },
-    #[command(about = "Manage users, SSH keys, roles, grants, and targets")]
+    #[command(about = "Manage users, SSH keys, roles, grants, targets, and relay traffic")]
     Admin(AdminArgs),
 }
 
@@ -126,16 +126,16 @@ pub enum AgentCommand {
 
 #[derive(Debug, Args)]
 pub struct AgentEnrollArgs {
-    #[arg(long, help = "ID of the target to enroll")]
-    pub target_id: Uuid,
+    #[arg(long, help = "Target ID to enroll")]
+    pub target_id: String,
     #[arg(long, allow_hyphen_values = true, help = "One-time enrollment code")]
     pub enrollment_code: String,
 }
 
 #[derive(Debug, Args)]
 pub struct AgentRunArgs {
-    #[arg(long, help = "ID of the enrolled target")]
-    pub target_id: Uuid,
+    #[arg(long, help = "Target ID of the enrolled agent")]
+    pub target_id: String,
 }
 
 pub use crate::config::LoginMethod;
@@ -152,7 +152,7 @@ pub struct LoginArgs {
         long,
         env = "KMESH_TOKEN",
         hide_env_values = true,
-        help = "API token (also read from KMESH_TOKEN)"
+        help = "API JWT (also read from KMESH_TOKEN)"
     )]
     pub token: Option<String>,
 }
@@ -178,7 +178,7 @@ pub enum AdminCommand {
         #[command(subcommand)]
         action: UserAction,
     },
-    #[command(about = "Manage long-lived API tokens")]
+    #[command(about = "Manage API JWT tokens")]
     Tokens {
         #[command(subcommand)]
         action: ApiTokenAction,
@@ -203,21 +203,39 @@ pub enum AdminCommand {
         #[command(subcommand)]
         action: TargetAction,
     },
+    #[command(about = "Inspect and close SSH sessions that use the server relay")]
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum RelayAction {
+    #[command(about = "List live relay transports and server payload traffic")]
+    List,
+    #[command(about = "Close a private-relay SSH session and its relay transports")]
+    Close {
+        #[arg(help = "SSH session ID shown by `admin relay list`")]
+        session_id: Uuid,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum ApiTokenAction {
-    #[command(about = "Create and display a user's API token once")]
+    #[command(about = "Create and display a user's API JWT once")]
     Create {
-        #[arg(help = "ID of the user who will own the token")]
-        user_id: Uuid,
+        #[arg(help = "Username that owns the token")]
+        user_id: String,
         #[arg(long, help = "Label describing this token")]
         label: String,
+        #[arg(long, help = "Token lifetime in seconds; omit for a long-lived token")]
+        expires_in: Option<u64>,
     },
     #[command(about = "List a user's API tokens")]
     List {
-        #[arg(help = "ID of the user")]
-        user_id: Uuid,
+        #[arg(help = "Username (user ID)")]
+        user_id: String,
     },
     #[command(about = "Revoke an API token")]
     Revoke {
@@ -237,25 +255,25 @@ pub enum UserAction {
     },
     #[command(about = "Disable a user account")]
     Disable {
-        #[arg(help = "ID of the user to disable")]
-        user_id: Uuid,
+        #[arg(help = "Username (user ID) to disable")]
+        user_id: String,
     },
     #[command(about = "Enable a user account")]
     Enable {
-        #[arg(help = "ID of the user to enable")]
-        user_id: Uuid,
+        #[arg(help = "Username (user ID) to enable")]
+        user_id: String,
     },
     #[command(about = "Replace a user's role assignments")]
     Roles {
-        #[arg(help = "ID of the user to update")]
-        user_id: Uuid,
-        #[arg(help = "IDs of the roles to assign")]
-        role_ids: Vec<Uuid>,
+        #[arg(help = "Username (user ID) to update")]
+        user_id: String,
+        #[arg(help = "Role names (role IDs) to assign")]
+        role_ids: Vec<String>,
     },
     #[command(about = "List roles assigned to a user")]
     ShowRoles {
-        #[arg(help = "ID of the user")]
-        user_id: Uuid,
+        #[arg(help = "Username (user ID)")]
+        user_id: String,
     },
 }
 
@@ -263,13 +281,13 @@ pub enum UserAction {
 pub enum KeyAction {
     #[command(about = "List a user's SSH public keys")]
     List {
-        #[arg(help = "ID of the user")]
-        user_id: Uuid,
+        #[arg(help = "Username (user ID)")]
+        user_id: String,
     },
     #[command(about = "Add an SSH public key to a user")]
     Add {
-        #[arg(help = "ID of the user")]
-        user_id: Uuid,
+        #[arg(help = "Username (user ID)")]
+        user_id: String,
         #[arg(help = "Path to the SSH public key file")]
         public_key_file: PathBuf,
         #[arg(long, default_value = "", help = "Label for the public key")]
@@ -293,8 +311,8 @@ pub enum RoleAction {
     },
     #[command(about = "Delete an authorization role")]
     Delete {
-        #[arg(help = "ID of the role to delete")]
-        role_id: Uuid,
+        #[arg(help = "Role ID to delete")]
+        role_id: String,
     },
 }
 
@@ -302,24 +320,24 @@ pub enum RoleAction {
 pub enum GrantAction {
     #[command(about = "List permissions granted to a role")]
     List {
-        #[arg(help = "ID of the role")]
-        role_id: Uuid,
+        #[arg(help = "Role ID")]
+        role_id: String,
     },
     #[command(about = "Grant a role permission to access a target")]
     Add {
-        #[arg(help = "ID of the role")]
-        role_id: Uuid,
-        #[arg(help = "ID of the target")]
-        target_id: Uuid,
+        #[arg(help = "Role ID")]
+        role_id: String,
+        #[arg(help = "Target ID")]
+        target_id: String,
         #[arg(long, value_enum, default_value_t = PermissionArg::SshConnect, help = "Permission to grant")]
         permission: PermissionArg,
     },
     #[command(about = "Revoke a role's permission to access a target")]
     Remove {
-        #[arg(help = "ID of the role")]
-        role_id: Uuid,
-        #[arg(help = "ID of the target")]
-        target_id: Uuid,
+        #[arg(help = "Role ID")]
+        role_id: String,
+        #[arg(help = "Target ID")]
+        target_id: String,
         #[arg(long, value_enum, default_value_t = PermissionArg::SshConnect, help = "Permission to revoke")]
         permission: PermissionArg,
     },
@@ -347,29 +365,29 @@ pub enum TargetAction {
     },
     #[command(about = "Rename an SSH target")]
     Rename {
-        #[arg(help = "ID of the target")]
-        target_id: Uuid,
+        #[arg(help = "Target ID")]
+        target_id: String,
         #[arg(help = "New name for the target")]
         name: String,
     },
     #[command(about = "Enable an SSH target")]
     Enable {
-        #[arg(help = "ID of the target to enable")]
-        target_id: Uuid,
+        #[arg(help = "Target ID to enable")]
+        target_id: String,
     },
     #[command(about = "Disable an SSH target")]
     Disable {
-        #[arg(help = "ID of the target to disable")]
-        target_id: Uuid,
+        #[arg(help = "Target ID to disable")]
+        target_id: String,
     },
     #[command(about = "Delete an SSH target")]
     Delete {
-        #[arg(help = "ID of the target to delete")]
-        target_id: Uuid,
+        #[arg(help = "Target ID to delete")]
+        target_id: String,
     },
     #[command(about = "Issue a one-time enrollment code for a target")]
     IssueEnrollment {
-        #[arg(help = "ID of the target")]
-        target_id: Uuid,
+        #[arg(help = "Target ID")]
+        target_id: String,
     },
 }

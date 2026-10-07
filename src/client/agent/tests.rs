@@ -162,7 +162,7 @@ async fn local_endpoints() -> (Endpoint, Endpoint) {
 fn offer(client: &Endpoint) -> TunnelOffer {
     TunnelOffer {
         session_id: Uuid::new_v4(),
-        target_id: Uuid::new_v4(),
+        target_id: "target-1".to_owned(),
         ticket: "signed-test-ticket".to_owned(),
         client_endpoint_id: client.id().to_string(),
         client_endpoint_addr: client.addr(),

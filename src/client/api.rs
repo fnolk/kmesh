@@ -10,7 +10,7 @@ use crate::{
     protocol::{
         AdminRequest, AdminResponse, AgentEnrollmentRequest, AgentEnrollmentResponse,
         ControlMessage, LoginTokens, PublicKeyChallenge, PublicKeyChallengeRequest,
-        PublicKeyLoginRequest, RefreshRequest, TargetView, TokenLoginRequest, TransportInfo,
+        PublicKeyLoginRequest, RefreshRequest, TargetView, TransportInfo,
     },
     transport::{connect_wss, http_client},
 };
@@ -46,10 +46,6 @@ impl Api {
 
     pub fn issuer(&self) -> &str {
         &self.base_url
-    }
-
-    pub async fn token_login(&self, request: &TokenLoginRequest) -> Result<LoginTokens> {
-        self.post("auth/token", request, None).await
     }
 
     pub async fn public_key_challenge(

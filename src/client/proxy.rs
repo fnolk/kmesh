@@ -56,7 +56,8 @@ pub(super) fn server_setup_error(code: String, message: String) -> anyhow::Error
     }
 }
 
-pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
+pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
+    let target_id = target_id.trim().to_ascii_lowercase();
     let setup_deadline = tokio::time::Instant::now() + SSH_SETUP_TIMEOUT;
     let access_token = tokio::time::timeout_at(setup_deadline, auth::valid_access_token(context))
         .await
@@ -98,7 +99,7 @@ pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
             attempt::SshAttempt {
                 client: context,
                 transport_info: &transport_info,
-                target_id,
+                target_id: target_id.clone(),
                 session_id,
                 secret_key,
                 route_mode,

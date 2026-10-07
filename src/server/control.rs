@@ -26,9 +26,11 @@ use punch::{
     PunchSelection, PunchSide, fail_punch_to_native, register_agent_discovery,
     register_client_discovery, register_punch_ready, register_punch_selection, send_native_plans,
 };
+pub(in crate::server) use runtime::TunnelPhase;
 pub(crate) use runtime::TunnelRuntime;
+pub(in crate::server) use runtime::notify_tunnel_closed;
 pub(in crate::server) use runtime::{
-    allow_agent_data_endpoint, close_pending_client_tunnels, unregister_agent,
+    allow_agent_data_endpoint, close_pending_client_tunnels, relay_endpoint_ids, unregister_agent,
 };
 use runtime::{
     close_from_client, close_from_target, close_tunnel, fail_from_client, fail_from_target,
@@ -90,7 +92,7 @@ async fn run_client_control(state: ServerState, user: AuthenticatedUser, socket:
         tokio::select! {
             message = stream.next() => match message {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<ControlMessage>(text.as_str()) {
-                    Ok(message) => handle_client_message(&state, user, &sender, message).await,
+                    Ok(message) => handle_client_message(&state, user.clone(), &sender, message).await,
                     Err(_) => send_error(&sender, None, "invalid_message", "invalid control message").await,
                 },
                 Some(Ok(Message::Pong(_))) => { last_pong.store(unix_time(), Ordering::Relaxed); }
@@ -104,7 +106,7 @@ async fn run_client_control(state: ServerState, user: AuthenticatedUser, socket:
     close_pending_client_tunnels(&state, &sender).await;
 }
 
-async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocket) {
+async fn run_agent_control(state: ServerState, target_id: String, socket: WebSocket) {
     let connection_id = Uuid::new_v4();
     let (sender, mut receiver) = mpsc::channel(64);
     {
@@ -116,7 +118,7 @@ async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocke
             return;
         }
         online.insert(
-            target_id,
+            target_id.clone(),
             OnlineAgent {
                 connection_id,
                 sender,
@@ -150,8 +152,8 @@ async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocke
         tokio::select! {
             message = stream.next() => match message {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<ControlMessage>(text.as_str()) {
-                    Ok(message) => handle_agent_message(&state, target_id, connection_id, message).await,
-                    Err(_) => send_agent_error(&state, target_id, connection_id, None, "invalid_message", "invalid control message").await,
+                    Ok(message) => handle_agent_message(&state, &target_id, connection_id, message).await,
+                    Err(_) => send_agent_error(&state, &target_id, connection_id, None, "invalid_message", "invalid control message").await,
                 },
                 Some(Ok(Message::Pong(_))) => { last_pong.store(unix_time(), Ordering::Relaxed); }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -161,7 +163,7 @@ async fn run_agent_control(state: ServerState, target_id: Uuid, socket: WebSocke
         }
     }
     writer.abort();
-    unregister_agent(&state, target_id, connection_id).await;
+    unregister_agent(&state, &target_id, connection_id).await;
 }
 
 pub(super) async fn handle_client_message(
@@ -177,12 +179,19 @@ pub(super) async fn handle_client_message(
             client_endpoint_id,
             route_mode,
         } => {
+            let target_id = match super::admin::normalize_target_id(&target_id) {
+                Ok(target_id) => target_id,
+                Err(error) => {
+                    send_error(sender, Some(session_id), "open_denied", &error.to_string()).await;
+                    return;
+                }
+            };
             if let Err(error) = open_tunnel(
                 state,
                 user,
                 sender,
                 session_id,
-                target_id,
+                &target_id,
                 client_endpoint_id,
                 route_mode,
             )
@@ -199,9 +208,15 @@ pub(super) async fn handle_client_message(
             route_mode,
             discovery,
         } => {
-            if let Err(error) =
-                register_client_discovery(state, user, sender, session_id, route_mode, discovery)
-                    .await
+            if let Err(error) = register_client_discovery(
+                state,
+                user.clone(),
+                sender,
+                session_id,
+                route_mode,
+                discovery,
+            )
+            .await
             {
                 fail_from_client(
                     state,
@@ -225,7 +240,7 @@ pub(super) async fn handle_client_message(
                 session_id,
                 route_mode,
                 socket_count,
-                Some((user, sender)),
+                Some((user.clone(), sender)),
                 None,
             )
             .await
@@ -258,7 +273,7 @@ pub(super) async fn handle_client_message(
                     local_socket,
                     peer_observed_addr,
                 },
-                Some((user, sender)),
+                Some((user.clone(), sender)),
                 None,
             )
             .await
@@ -294,7 +309,7 @@ pub(super) async fn handle_client_message(
                 PunchSide::Client,
                 session_id,
                 route_mode,
-                Some((user, sender)),
+                Some((user.clone(), sender)),
                 None,
                 &reason,
             )
@@ -333,7 +348,7 @@ pub(super) async fn handle_client_message(
         } => {
             if let Err(error) = register_client_endpoint(
                 state,
-                user,
+                user.clone(),
                 sender,
                 session_id,
                 route_mode,
@@ -376,7 +391,7 @@ pub(super) async fn handle_client_message(
             session_id,
             route_mode,
             path,
-            Some((user, sender)),
+            Some((user.clone(), sender)),
             None,
         )
         .await
@@ -408,7 +423,7 @@ pub(super) async fn handle_client_message(
 
 pub(super) async fn handle_agent_message(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     message: ControlMessage,
 ) {
@@ -728,7 +743,7 @@ pub(super) async fn handle_agent_message(
 
 async fn send_agent_error(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     session_id: Option<Uuid>,
     code: &str,
@@ -739,7 +754,7 @@ async fn send_agent_error(
         .online_agents
         .read()
         .await
-        .get(&target_id)
+        .get(target_id)
         .filter(|agent| agent.connection_id == connection_id)
         .map(|agent| agent.sender.clone());
     if let Some(sender) = sender {

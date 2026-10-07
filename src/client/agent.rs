@@ -41,7 +41,7 @@ pub(super) struct AgentRuntime {
 
 pub(super) struct TunnelOffer {
     pub(super) session_id: Uuid,
-    pub(super) target_id: Uuid,
+    pub(super) target_id: String,
     pub(super) ticket: String,
     pub(super) client_endpoint_id: String,
     pub(super) client_endpoint_addr: EndpointAddr,
@@ -61,11 +61,20 @@ pub(super) struct ServerAuthenticationFailure(pub(super) String);
 #[error("kmesh agent/server version incompatibility: {0}")]
 pub(super) struct AgentVersionIncompatibility(pub(super) String);
 
-pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &str) -> Result<()> {
-    let credential_path = profile::agent_credentials_path(&context.config.data_dir, target_id);
+pub async fn enroll(
+    context: &ClientContext,
+    target_id: String,
+    enrollment_code: &str,
+) -> Result<()> {
+    let target_id = target_id.trim().to_ascii_lowercase();
+    let server_origin = context.api.issuer();
+    profile::ensure_agent_credentials_dir(&context.config.data_dir, server_origin)?;
+    let credential_path =
+        profile::agent_credentials_path(&context.config.data_dir, server_origin, &target_id);
     let pending_path = credential_path.with_extension("pending.json");
     let identity = if credential_path.exists() {
-        let saved = profile::load_agent_credentials(&context.config.data_dir, target_id)?;
+        let saved =
+            profile::load_agent_credentials(&context.config.data_dir, server_origin, &target_id)?;
         PendingAgentIdentity {
             endpoint_secret_key: saved.endpoint_secret_key,
         }
@@ -77,7 +86,6 @@ pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &
                 let identity = PendingAgentIdentity {
                     endpoint_secret_key: identity::encode_secret_key(&SecretKey::generate()),
                 };
-                profile::ensure_private_dir(&context.config.data_dir)?;
                 write_json_atomic(&pending_path, &identity)?;
                 identity
             }
@@ -88,7 +96,7 @@ pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &
     let response = context
         .api
         .agent_enroll(&AgentEnrollmentRequest {
-            target_id,
+            target_id: target_id.clone(),
             enrollment_token: enrollment_code.to_owned(),
             agent_endpoint_id: endpoint_secret_key.public().to_string(),
         })
@@ -99,6 +107,7 @@ pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &
     );
     profile::save_agent_credentials(
         &context.config.data_dir,
+        server_origin,
         &AgentCredentials {
             target_id,
             agent_token: response.agent_token,
@@ -112,8 +121,13 @@ pub async fn enroll(context: &ClientContext, target_id: Uuid, enrollment_code: &
     Ok(())
 }
 
-pub async fn run(context: &ClientContext, target_id: Uuid) -> Result<()> {
-    let credentials = profile::load_agent_credentials(&context.config.data_dir, target_id)?;
+pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
+    let target_id = target_id.trim().to_ascii_lowercase();
+    let credentials = profile::load_agent_credentials(
+        &context.config.data_dir,
+        context.api.issuer(),
+        &target_id,
+    )?;
     let mut runtime = AgentRuntime {
         stable_device_secret_key: identity::decode_secret_key(&credentials.endpoint_secret_key)?,
         transport_info: context.api.transport_info().await?,

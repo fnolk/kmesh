@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use db::Database;
+use db::{Database, InitialApiToken};
 use identity::{Ed25519PemKeypair, TokenKeySet};
+use iroh_relay::server::clients::Clients as RelayClients;
 use rand::random;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -45,12 +46,13 @@ pub(crate) struct ServerInner {
     pub issuer: String,
     pub keys: TokenKeySet,
     pub auth_rate_limiter: auth::AuthRateLimiter,
-    pub online_agents: RwLock<std::collections::HashMap<Uuid, OnlineAgent>>,
+    pub online_agents: RwLock<std::collections::HashMap<String, OnlineAgent>>,
     pub tunnels: RwLock<std::collections::HashMap<Uuid, Arc<control::TunnelRuntime>>>,
+    pub relay_clients: RwLock<Option<RelayClients>>,
     pub transport_info: RwLock<crate::protocol::TransportInfo>,
 }
 
-/// Create the database, token keys, initial management account, and initial API token once.
+/// Create the database, token keys, initial management account, and initial API JWT once.
 pub async fn initialize(
     data_dir: impl AsRef<Path>,
     admin_username: &str,
@@ -85,17 +87,38 @@ pub async fn initialize(
         let keys = identity::generate_token_key_set().context("generate server token keys")?;
         write_private_atomically(&key_path, &serde_json::to_vec(&PersistedKeys::from(&keys))?)?;
     }
-    let initial_api_token = if user_count == 0 {
-        Some(new_api_token())
+    let key_bytes = std::fs::read(&key_path).context("read persistent server token keys")?;
+    let keys = PersistedKeys::from_slice(&key_bytes)?.into_token_keys();
+    let (initial_api_token, initial_api_token_row) = if user_count == 0 {
+        let user_id = admin_username.clone();
+        let token_id = Uuid::new_v4();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_secs();
+        let claims = crate::protocol::ApiTokenClaims {
+            sub: user_id.clone(),
+            jti: token_id,
+            iss: issuer.to_owned(),
+            aud: identity::API_TOKEN_AUDIENCE.to_owned(),
+            iat: now,
+            exp: None,
+        };
+        let token = identity::encode_api_token(&claims, &keys.user_access.private_key_pem)
+            .context("sign initial administrator API token")?;
+        (
+            Some(token.clone()),
+            Some(InitialApiToken {
+                user_id,
+                token_id,
+                token_hash: hash_secret(&token),
+            }),
+        )
     } else {
-        None
+        (None, None)
     };
-    db.initialize(
-        issuer,
-        &admin_username,
-        initial_api_token.as_deref().map(hash_secret),
-    )
-    .await?;
+    db.initialize(issuer, &admin_username, initial_api_token_row)
+        .await?;
     FileExt::unlock(&lock).context("unlock server initialization")?;
     Ok(initial_api_token)
 }
@@ -139,6 +162,7 @@ pub async fn run(options: ServerOptions) -> Result<()> {
             auth_rate_limiter: auth::AuthRateLimiter::default(),
             online_agents: RwLock::new(std::collections::HashMap::new()),
             tunnels: RwLock::new(std::collections::HashMap::new()),
+            relay_clients: RwLock::new(None),
             transport_info: RwLock::new(crate::protocol::TransportInfo {
                 private_relay_url: (!options.disable_private_relay).then(|| options.issuer.clone()),
                 qad_port: options.qad_bind.port(),
@@ -150,6 +174,7 @@ pub async fn run(options: ServerOptions) -> Result<()> {
     let server = iroh::listen_and_serve(
         router(state.clone()),
         relay_access,
+        state.clone(),
         options.bind,
         options.qad_bind,
     )
@@ -203,7 +228,7 @@ fn validate_token_keys(keys: &TokenKeySet, issuer: &str) -> Result<()> {
         .context("system clock is before Unix epoch")?
         .as_secs();
     let claims = crate::protocol::AccessTokenClaims {
-        sub: Uuid::new_v4(),
+        sub: "validate-user".to_owned(),
         sid: Uuid::new_v4(),
         iss: issuer.to_owned(),
         aud: identity::USER_TOKEN_AUDIENCE.to_owned(),
@@ -214,11 +239,24 @@ fn validate_token_keys(keys: &TokenKeySet, issuer: &str) -> Result<()> {
         .context("validate user token signing key")?;
     identity::decode_user_access_token(&token, &keys.user_access.public_key_pem, issuer)
         .context("validate user token key pair")?;
+    let api_token_claims = crate::protocol::ApiTokenClaims {
+        sub: claims.sub.clone(),
+        jti: Uuid::new_v4(),
+        iss: issuer.to_owned(),
+        aud: identity::API_TOKEN_AUDIENCE.to_owned(),
+        iat: now,
+        exp: None,
+    };
+    let api_token =
+        identity::encode_api_token(&api_token_claims, &keys.user_access.private_key_pem)
+            .context("validate API token signing key")?;
+    identity::decode_api_token(&api_token, &keys.user_access.public_key_pem, issuer)
+        .context("validate API token key pair")?;
     let ticket_claims = crate::protocol::TunnelTicketClaims {
         session_id: Uuid::new_v4(),
-        user_id: claims.sub,
-        login_session_id: claims.sid,
-        target_id: Uuid::new_v4(),
+        user_id: claims.sub.clone(),
+        auth_credential: crate::protocol::AuthCredential::Session(claims.sid),
+        target_id: "validate-target".to_owned(),
         client_endpoint_id: String::new(),
         target_endpoint_id: String::new(),
         route_mode: crate::protocol::RouteMode::PrivateRelay,
@@ -242,10 +280,6 @@ pub(crate) fn hash_secret(value: &str) -> String {
 pub(crate) fn new_secret() -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random::<[u8; 32]>())
-}
-
-pub(crate) fn new_api_token() -> String {
-    format!("kmesh_{}", new_secret())
 }
 
 pub(crate) fn hex_digest(bytes: &[u8]) -> String {

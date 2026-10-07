@@ -60,7 +60,7 @@ pub(super) async fn register_client_discovery(
 
 pub(super) async fn register_agent_discovery(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     session_id: Uuid,
     route_mode: RouteMode,
@@ -85,7 +85,7 @@ async fn register_discovery(
     route_mode: RouteMode,
     discovery: DiscoveryResult,
     client: Option<(AuthenticatedUser, &mpsc::Sender<ControlMessage>)>,
-    target: Option<(Uuid, Uuid)>,
+    target: Option<(&str, Uuid)>,
 ) -> Result<(), ApiError> {
     let ready = validate_discovery(discovery)?;
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
@@ -98,7 +98,11 @@ async fn register_discovery(
             "private relay route does not use QAD discovery",
         ));
     }
-    if runtime.expires_at <= unix_time() || runtime.access_expires_at <= unix_time() {
+    if runtime.expires_at <= unix_time()
+        || runtime
+            .credential_expires_at
+            .is_some_and(|expires_at| expires_at <= unix_time())
+    {
         return Err(ApiError::unauthorized());
     }
     match side {
@@ -108,8 +112,8 @@ async fn register_discovery(
             };
             if !runtime.client_sender.same_channel(sender)
                 || runtime.user_id != user.user_id
-                || runtime.auth_session_id != user.session_id
-                || runtime.access_expires_at != user.access_expires_at
+                || runtime.auth_credential != user.credential
+                || runtime.credential_expires_at != user.expires_at
             {
                 return Err(ApiError::unauthorized());
             }
@@ -276,7 +280,7 @@ pub(super) async fn register_punch_ready(
     route_mode: RouteMode,
     socket_count: u16,
     client: Option<(AuthenticatedUser, &mpsc::Sender<ControlMessage>)>,
-    target: Option<(Uuid, Uuid)>,
+    target: Option<(&str, Uuid)>,
 ) -> Result<(), ApiError> {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
     let runtime = runtime.ok_or_else(ApiError::unauthorized)?;
@@ -295,7 +299,7 @@ pub(super) async fn register_punch_ready(
             };
             if !runtime.client_sender.same_channel(sender)
                 || runtime.user_id != user.user_id
-                || runtime.auth_session_id != user.session_id
+                || runtime.auth_credential != user.credential
             {
                 return Err(ApiError::unauthorized());
             }
@@ -400,7 +404,7 @@ pub(super) async fn register_punch_selection(
     route_mode: RouteMode,
     selection: PunchSelection,
     client: Option<(AuthenticatedUser, &mpsc::Sender<ControlMessage>)>,
-    target: Option<(Uuid, Uuid)>,
+    target: Option<(&str, Uuid)>,
 ) -> Result<(), ApiError> {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
     let runtime = runtime.ok_or_else(ApiError::unauthorized)?;
@@ -419,7 +423,7 @@ pub(super) async fn register_punch_selection(
             };
             if !runtime.client_sender.same_channel(sender)
                 || runtime.user_id != user.user_id
-                || runtime.auth_session_id != user.session_id
+                || runtime.auth_credential != user.credential
             {
                 return Err(ApiError::unauthorized());
             }
@@ -511,7 +515,7 @@ pub(super) async fn fail_punch_to_native(
     session_id: Uuid,
     route_mode: RouteMode,
     client: Option<(AuthenticatedUser, &mpsc::Sender<ControlMessage>)>,
-    target: Option<(Uuid, Uuid)>,
+    target: Option<(&str, Uuid)>,
     reason: &str,
 ) -> Result<(), ApiError> {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
@@ -531,7 +535,7 @@ pub(super) async fn fail_punch_to_native(
             };
             if !runtime.client_sender.same_channel(sender)
                 || runtime.user_id != user.user_id
-                || runtime.auth_session_id != user.session_id
+                || runtime.auth_credential != user.credential
             {
                 return Err(ApiError::unauthorized());
             }

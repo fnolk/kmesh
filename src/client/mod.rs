@@ -108,7 +108,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     server::initialize(&config.data_dir, &args.admin, &issuer).await?;
                 println!("服务端已初始化。issuer={issuer}");
                 if let Some(token) = initial_token {
-                    println!("初始管理员 API token（仅显示一次）：{token}");
+                    println!("初始管理员 API JWT（仅显示一次）：{token}");
                 }
             }
             cli::ServerCommand::Run(args) => {
@@ -133,11 +133,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             let context = ClientContext::new(&config).await?;
             match command {
                 cli::AgentCommand::Enroll(args) => {
-                    agent::enroll(&context, args.target_id, &args.enrollment_code).await?;
-                    println!("目标 {} 已注册。", args.target_id);
+                    let target_id = args.target_id.trim().to_ascii_lowercase();
+                    agent::enroll(&context, target_id.clone(), &args.enrollment_code).await?;
+                    println!("目标 {target_id} 已注册。");
                 }
                 cli::AgentCommand::Run(args) => {
-                    agent::run(&context, args.target_id).await?;
+                    agent::run(&context, args.target_id.trim().to_ascii_lowercase()).await?;
                 }
             }
         }
@@ -183,11 +184,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             let token = auth::valid_access_token(&context).await?;
             let targets = context.api.targets(&token).await?;
             let target = ssh_config::find_target(&targets, target)?;
-            print!("{}", ssh_config::render(&target, &cli)?);
+            print!(
+                "{}",
+                ssh_config::render(&target, &cli, context.api.issuer())?
+            );
         }
         cli::Command::Proxy { target_id } => {
             let context = ClientContext::new(&config).await?;
-            proxy::run(&context, *target_id).await?;
+            proxy::run(&context, target_id.trim().to_ascii_lowercase()).await?;
         }
         cli::Command::Admin(args) => {
             let context = ClientContext::new(&config).await?;

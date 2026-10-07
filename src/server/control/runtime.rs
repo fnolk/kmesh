@@ -4,7 +4,7 @@ use iroh::EndpointAddr;
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-use crate::protocol::{ControlMessage, ReadyDiscovery, RouteMode, SelectedPath};
+use crate::protocol::{AuthCredential, ControlMessage, ReadyDiscovery, RouteMode, SelectedPath};
 
 use super::super::{auth::AuthenticatedUser, db::unix_time, error::ApiError};
 use super::{
@@ -65,10 +65,10 @@ impl Default for PendingTransport {
 
 pub(crate) struct TunnelRuntime {
     pub session_id: Uuid,
-    pub user_id: Uuid,
-    pub auth_session_id: Uuid,
-    pub access_expires_at: i64,
-    pub target_id: Uuid,
+    pub user_id: String,
+    pub auth_credential: AuthCredential,
+    pub credential_expires_at: Option<i64>,
+    pub target_id: String,
     pub target_connection_id: Uuid,
     pub route_mode: RouteMode,
     pub client_endpoint_id: String,
@@ -79,6 +79,13 @@ pub(crate) struct TunnelRuntime {
     pub target_sender: mpsc::Sender<ControlMessage>,
     pub phase: Mutex<TunnelPhase>,
     pub expires_at: i64,
+}
+
+pub(in crate::server) async fn relay_endpoint_ids(
+    runtime: &TunnelRuntime,
+) -> (String, Option<String>) {
+    let target_data_endpoint_id = runtime.setup.lock().await.target_data_endpoint_id.clone();
+    (runtime.client_endpoint_id.clone(), target_data_endpoint_id)
 }
 
 pub(super) async fn fail_from_client(
@@ -93,7 +100,7 @@ pub(super) async fn fail_from_client(
     if let Some(runtime) = runtime
         && runtime.client_sender.same_channel(sender)
         && runtime.user_id == user.user_id
-        && runtime.auth_session_id == user.session_id
+        && runtime.auth_credential == user.credential
         && *runtime.phase.lock().await == TunnelPhase::Pending
     {
         fail_tunnel(state, &runtime, code, message).await;
@@ -137,7 +144,7 @@ pub(in crate::server) async fn allow_agent_data_endpoint(
 
 pub(super) async fn activate_tunnel(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     session_id: Uuid,
     client_endpoint_id: String,
@@ -193,13 +200,15 @@ pub(super) async fn activate_tunnel(
     let activation = async {
         let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
         if runtime.expires_at <= now
-            || runtime.access_expires_at <= now
+            || runtime
+                .credential_expires_at
+                .is_some_and(|expires_at| expires_at <= now)
             || !authorized_for_target(
                 &mut tx,
                 AuthenticatedUser {
-                    user_id: runtime.user_id,
-                    session_id: runtime.auth_session_id,
-                    access_expires_at: runtime.access_expires_at,
+                    user_id: runtime.user_id.clone(),
+                    credential: runtime.auth_credential,
+                    expires_at: runtime.credential_expires_at,
                 },
                 target_id,
                 &runtime.target_endpoint_id,
@@ -277,7 +286,7 @@ pub(super) async fn close_from_client(
     let Some(runtime) = runtime else {
         return;
     };
-    if runtime.user_id == user.user_id && runtime.auth_session_id == user.session_id {
+    if runtime.user_id == user.user_id && runtime.auth_credential == user.credential {
         close_tunnel(state, &runtime, "client closed SSH session").await;
     }
 }
@@ -285,7 +294,7 @@ pub(super) async fn close_from_client(
 pub(super) async fn close_from_target(
     state: &ServerState,
     session_id: Uuid,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
 ) {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
@@ -301,7 +310,7 @@ pub(super) async fn close_from_target(
 pub(super) async fn fail_from_target(
     state: &ServerState,
     session_id: Uuid,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     code: String,
     message: String,
@@ -319,7 +328,7 @@ pub(super) async fn fail_from_target(
 pub(super) async fn fail_pending_from_target(
     state: &ServerState,
     session_id: Uuid,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     code: String,
     message: String,
@@ -363,7 +372,7 @@ pub(in crate::server) async fn close_pending_client_tunnels(
     }
 }
 
-async fn close_pending_target_tunnels(state: &ServerState, target_id: Uuid, connection_id: Uuid) {
+async fn close_pending_target_tunnels(state: &ServerState, target_id: &str, connection_id: Uuid) {
     let runtimes = state
         .inner
         .tunnels
@@ -382,15 +391,15 @@ async fn close_pending_target_tunnels(state: &ServerState, target_id: Uuid, conn
 
 pub(in crate::server) async fn unregister_agent(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
 ) {
     let mut online = state.inner.online_agents.write().await;
     if online
-        .get(&target_id)
+        .get(target_id)
         .is_some_and(|agent| agent.connection_id == connection_id)
     {
-        online.remove(&target_id);
+        online.remove(target_id);
     }
     drop(online);
     close_pending_target_tunnels(state, target_id, connection_id).await;
@@ -438,6 +447,14 @@ async fn finish_tunnel_close(state: &ServerState, runtime: &Arc<TunnelRuntime>, 
     .bind(runtime.session_id.to_string())
     .execute(&state.inner.db.pool)
     .await;
+    notify_tunnel_closed(state, runtime, reason).await;
+}
+
+pub(in crate::server) async fn notify_tunnel_closed(
+    state: &ServerState,
+    runtime: &Arc<TunnelRuntime>,
+    reason: &str,
+) {
     let message = ControlMessage::Close {
         session_id: runtime.session_id,
         reason: reason.to_owned(),

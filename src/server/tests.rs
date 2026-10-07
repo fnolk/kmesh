@@ -36,9 +36,9 @@ use uuid::Uuid;
 use crate::{
     identity,
     protocol::{
-        AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, DiscoveryResult,
-        LoginTokens, NativePlan, PublicKeyChallengeRequest, PublicKeyLoginRequest, ReadyDiscovery,
-        RefreshRequest, RouteMode, SelectedPath, TargetPermission, TokenLoginRequest,
+        AdminOperation, AdminRequest, AdminResponse, AgentEnrollmentRequest, ControlMessage,
+        DiscoveryResult, NativePlan, PublicKeyChallengeRequest, PublicKeyLoginRequest,
+        ReadyDiscovery, RefreshRequest, RouteMode, SelectedPath, TargetPermission,
         TunnelTicketClaims,
     },
     transport::{
@@ -88,6 +88,7 @@ async fn fixture(issuer: &str) -> Fixture {
                 auth_rate_limiter: auth::AuthRateLimiter::default(),
                 online_agents: RwLock::new(std::collections::HashMap::new()),
                 tunnels: RwLock::new(std::collections::HashMap::new()),
+                relay_clients: RwLock::new(None),
                 transport_info: RwLock::new(crate::protocol::TransportInfo {
                     private_relay_url: Some(issuer.to_owned()),
                     qad_port: 3478,
@@ -112,17 +113,26 @@ fn bearer(token: &str) -> HeaderMap {
     headers
 }
 
-async fn login_api_token(state: &ServerState, token: &str) -> LoginTokens {
-    auth::token_login(
+async fn api_jwt(state: &ServerState, token: &str) -> String {
+    auth::authenticate(state, &bearer(token))
+        .await
+        .expect("authenticate API JWT directly");
+    token.to_owned()
+}
+
+async fn admin_request(
+    state: &ServerState,
+    access_token: &str,
+    operation: AdminOperation,
+) -> Result<AdminResponse, axum::http::StatusCode> {
+    super::admin::operation(
         State(state.clone()),
-        remote(),
-        Json(TokenLoginRequest {
-            token: token.to_owned(),
-        }),
+        bearer(access_token),
+        Json(AdminRequest { operation }),
     )
     .await
-    .expect("API token login")
-    .0
+    .map(|response| response.0)
+    .map_err(|error| axum::response::IntoResponse::into_response(error).status())
 }
 
 #[tokio::test]
@@ -186,29 +196,25 @@ async fn api_requires_a_semver_compatible_kmesh_client() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
 
-async fn admin_role_id(state: &ServerState) -> Uuid {
+async fn admin_role_id(state: &ServerState) -> String {
     sqlx::query_scalar::<_, String>("SELECT id FROM roles WHERE name = 'admin'")
         .fetch_one(&state.inner.db.pool)
         .await
         .expect("read admin role")
-        .parse()
-        .expect("parse admin role ID")
 }
 
-async fn admin_user_id(state: &ServerState) -> Uuid {
+async fn admin_user_id(state: &ServerState) -> String {
     sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE username = 'admin'")
         .fetch_one(&state.inner.db.pool)
         .await
         .expect("read initial admin")
-        .parse()
-        .expect("parse admin user ID")
 }
 
 async fn create_enrolled_target(
     state: &ServerState,
     name: &str,
     endpoint_secret_key: &SecretKey,
-) -> (Uuid, String) {
+) -> (String, String) {
     let created = super::admin::apply_operation(
         state,
         admin_user_id(state).await,
@@ -228,7 +234,7 @@ async fn create_enrolled_target(
     let enrolled = control::enroll(
         State(state.clone()),
         Json(AgentEnrollmentRequest {
-            target_id: target.target_id,
+            target_id: target.target_id.clone(),
             enrollment_token: enrollment_token.clone(),
             agent_endpoint_id: endpoint_secret_key.public().to_string(),
         }),
@@ -236,14 +242,14 @@ async fn create_enrolled_target(
     .await
     .expect("enroll target Iroh endpoint")
     .0;
-    assert_eq!(enrolled.target_id, target.target_id);
+    assert_eq!(enrolled.target_id, target.target_id.clone());
     assert_eq!(
         enrolled.ticket_public_key_pem,
         state.inner.keys.tunnel_ticket.public_key_pem
     );
     let stored_hash =
         sqlx::query_scalar::<_, String>("SELECT agent_token_hash FROM targets WHERE id = ?1")
-            .bind(target.target_id.to_string())
+            .bind(target.target_id.clone())
             .fetch_one(&state.inner.db.pool)
             .await
             .expect("read stored agent token hash");
@@ -252,24 +258,24 @@ async fn create_enrolled_target(
     let replay = control::enroll(
         State(state.clone()),
         Json(AgentEnrollmentRequest {
-            target_id: target.target_id,
+            target_id: target.target_id.clone(),
             enrollment_token,
             agent_endpoint_id: endpoint_secret_key.public().to_string(),
         }),
     )
     .await;
     assert!(replay.is_err(), "enrollment token must be one-time");
-    (target.target_id, enrolled.agent_token)
+    (target.target_id.clone(), enrolled.agent_token)
 }
 
-async fn grant_target(state: &ServerState, target_id: Uuid) {
+async fn grant_target(state: &ServerState, target_id: &str) {
     let role_id = admin_role_id(state).await;
     super::admin::apply_operation(
         state,
         admin_user_id(state).await,
         AdminOperation::GrantTarget {
             role_id,
-            target_id,
+            target_id: target_id.to_owned(),
             permission: TargetPermission::SshConnect,
         },
     )
@@ -277,14 +283,14 @@ async fn grant_target(state: &ServerState, target_id: Uuid) {
     .expect("grant target access");
 }
 
-async fn revoke_target(state: &ServerState, target_id: Uuid) {
+async fn revoke_target(state: &ServerState, target_id: &str) {
     let role_id = admin_role_id(state).await;
     super::admin::apply_operation(
         state,
         admin_user_id(state).await,
         AdminOperation::RevokeTarget {
             role_id,
-            target_id,
+            target_id: target_id.to_owned(),
             permission: TargetPermission::SshConnect,
         },
     )
@@ -294,12 +300,12 @@ async fn revoke_target(state: &ServerState, target_id: Uuid) {
 
 async fn online_target(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
 ) -> (Uuid, mpsc::Receiver<ControlMessage>) {
     let connection_id = Uuid::new_v4();
     let (sender, receiver) = mpsc::channel(64);
     state.inner.online_agents.write().await.insert(
-        target_id,
+        target_id.to_owned(),
         OnlineAgent {
             connection_id,
             sender,
@@ -310,7 +316,7 @@ async fn online_target(
 
 async fn send_agent_ready_for_session(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     session_id: Uuid,
     route_mode: RouteMode,
@@ -426,12 +432,12 @@ async fn exchange_test_client_candidates(
         .cloned()
         .expect("session is registered");
     let user = super::auth::AuthenticatedUser {
-        user_id: runtime.user_id,
-        session_id: runtime.auth_session_id,
-        access_expires_at: runtime.access_expires_at,
+        user_id: runtime.user_id.clone(),
+        credential: runtime.auth_credential,
+        expires_at: runtime.credential_expires_at,
     };
     let client_sender = runtime.client_sender.clone();
-    let target_id = runtime.target_id;
+    let target_id = runtime.target_id.clone();
     let client_offer = client_receiver
         .recv()
         .await
@@ -455,7 +461,7 @@ async fn exchange_test_client_candidates(
     let enrolled_endpoint_id = state
         .inner
         .db
-        .target_endpoint_id(target_id)
+        .target_endpoint_id(&target_id)
         .await
         .expect("read enrolled target EndpointId")
         .expect("target is enrolled");
@@ -480,7 +486,7 @@ async fn exchange_test_client_candidates(
     ));
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::ClientReady {
             session_id,
@@ -528,7 +534,7 @@ async fn exchange_test_client_candidates(
     };
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::PathReady {
             session_id,
@@ -540,7 +546,7 @@ async fn exchange_test_client_candidates(
     let target_connection_id = runtime.target_connection_id;
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         ControlMessage::PathReady {
             session_id,
@@ -554,7 +560,7 @@ async fn exchange_test_client_candidates(
 
 async fn send_agent_iroh_ready_for_session(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     session_id: Uuid,
     client_endpoint_id: String,
@@ -614,7 +620,7 @@ fn test_qad_ready(
 }
 
 struct BirthdayPunchControl<'a> {
-    target_id: Uuid,
+    target_id: &'a str,
     connection_id: Uuid,
     device_key: &'a SecretKey,
     target_receiver: &'a mut mpsc::Receiver<ControlMessage>,
@@ -655,7 +661,7 @@ async fn start_test_birthday_punch(
     } = candidates;
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         client_sender,
         session_id,
         target_id,
@@ -713,7 +719,7 @@ async fn start_test_birthday_punch(
     .await;
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         client_sender,
         ControlMessage::CandidatesReady {
             session_id,
@@ -750,7 +756,7 @@ async fn start_test_birthday_punch(
     .await;
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         client_sender,
         ControlMessage::PunchReady {
             session_id,
@@ -834,7 +840,7 @@ async fn admin_audit_commits_with_mutations_and_failed_audit_rolls_back() {
     .expect("install audit failure trigger");
     let result = super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::CreateTarget {
             name: "rolled-back-target".to_owned(),
         },
@@ -858,9 +864,9 @@ async fn admin_audit_commits_with_mutations_and_failed_audit_rolls_back() {
         .expect("remove audit failure trigger");
     let result = super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::RenameTarget {
-            target_id: Uuid::new_v4(),
+            target_id: "test-target".to_owned(),
             name: "missing-target".to_owned(),
         },
     )
@@ -874,7 +880,7 @@ async fn admin_audit_commits_with_mutations_and_failed_audit_rolls_back() {
 
     let created = super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::CreateTarget {
             name: "audited-target".to_owned(),
         },
@@ -902,7 +908,7 @@ async fn admin_audit_commits_with_mutations_and_failed_audit_rolls_back() {
     assert_eq!(row.try_get::<String, _>("object_type").unwrap(), "target");
     assert_eq!(
         row.try_get::<String, _>("object_id").unwrap(),
-        target.target_id.to_string()
+        target.target_id.clone().to_string()
     );
     let context: serde_json::Value =
         serde_json::from_str(&row.try_get::<String, _>("context_json").unwrap())
@@ -917,7 +923,7 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     let actor_id = admin_user_id(state).await;
     let created_user = super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::CreateUser {
             username: "audit-user".to_owned(),
         },
@@ -929,10 +935,11 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     };
     let issued = super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::CreateApiToken {
-            user_id: user.user_id,
+            user_id: user.user_id.clone(),
             label: "audit token secret label".to_owned(),
+            expires_in_secs: None,
         },
     )
     .await
@@ -943,14 +950,14 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     let stored_token_hash: String = sqlx::query_scalar(
         "SELECT token_hash FROM api_tokens WHERE user_id = ?1 AND label = 'audit token secret label'",
     )
-    .bind(user.user_id.to_string())
+    .bind(user.user_id.clone().to_string())
     .fetch_one(&state.inner.db.pool)
     .await
     .expect("read stored API token hash");
 
     let created_target = super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::CreateTarget {
             name: "audit-target".to_owned(),
         },
@@ -976,9 +983,9 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
         .join(" ");
     super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::AddUserKey {
-            user_id: user.user_id,
+            user_id: user.user_id.clone(),
             public_key: public_key.clone(),
             label: "audit-test-key".to_owned(),
         },
@@ -987,7 +994,7 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     .expect("register audited SSH key");
     let created_role = super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::CreateRole {
             name: "audit-role".to_owned(),
         },
@@ -999,20 +1006,20 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     };
     super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::SetUserRoles {
-            user_id: user.user_id,
-            role_ids: vec![role.role_id, role.role_id],
+            user_id: user.user_id.clone(),
+            role_ids: vec![role.role_id.clone(), role.role_id.clone()],
         },
     )
     .await
     .expect("assign audited role");
     super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::GrantTarget {
-            role_id: role.role_id,
-            target_id: target.target_id,
+            role_id: role.role_id.clone(),
+            target_id: target.target_id.clone(),
             permission: TargetPermission::SshConnect,
         },
     )
@@ -1020,9 +1027,9 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     .expect("grant audited target");
     super::admin::apply_operation(
         state,
-        actor_id,
+        actor_id.clone(),
         AdminOperation::DeleteRole {
-            role_id: role.role_id,
+            role_id: role.role_id.clone(),
         },
     )
     .await
@@ -1050,22 +1057,22 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
         .expect("deleted role audit row");
     assert_eq!(
         delete_row.try_get::<String, _>("object_id").unwrap(),
-        role.role_id.to_string()
+        role.role_id.clone().to_string()
     );
     let context: serde_json::Value =
         serde_json::from_str(&delete_row.try_get::<String, _>("context_json").unwrap())
             .expect("decode deleted role context");
     assert_eq!(context["role_name"], "audit-role");
-    assert_eq!(context["user_ids"][0], user.user_id.to_string());
+    assert_eq!(context["user_ids"][0], user.user_id.clone().to_string());
     assert_eq!(
         context["grants"][0]["target_id"],
-        target.target_id.to_string()
+        target.target_id.clone().to_string()
     );
     assert_eq!(context["grants"][0]["permission"], "ssh_connect");
 
     let role_exists =
         sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM roles WHERE id = ?1)")
-            .bind(role.role_id.to_string())
+            .bind(role.role_id.clone().to_string())
             .fetch_one(&state.inner.db.pool)
             .await
             .expect("verify role deletion");
@@ -1079,7 +1086,18 @@ async fn server_initialization_returns_initial_admin_token_only_once() {
         .await
         .expect("initialize server")
         .expect("new server returns initial API token");
-    assert!(token.starts_with("kmesh_"));
+    let key_bytes = std::fs::read(data_dir.join("token-keys.json")).expect("read generated keys");
+    let keys = PersistedKeys::from_slice(&key_bytes)
+        .expect("decode generated keys")
+        .into_token_keys();
+    let claims = identity::decode_api_token(
+        &token,
+        &keys.user_access.public_key_pem,
+        "https://kmesh-init.test",
+    )
+    .expect("verify initial administrator API JWT");
+    assert_eq!(claims.aud, identity::API_TOKEN_AUDIENCE);
+    assert_eq!(claims.exp, None);
     assert_eq!(
         super::initialize(&data_dir, "Admin", "https://kmesh-init.test")
             .await
@@ -1125,21 +1143,21 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
         Access::Deny { .. }
     ));
 
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate relay test user");
-    grant_target(state, target_id).await;
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (target_connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let (client_sender, _client_receiver) = mpsc::channel(16);
     let client_key = SecretKey::generate();
     let session_id = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         session_id,
-        target_id,
+        &target_id,
         client_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -1151,7 +1169,7 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
     ));
     let data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         session_id,
         RouteMode::PrivateRelay,
@@ -1178,24 +1196,24 @@ async fn relay_access_scopes_target_data_identity_to_its_live_session() {
 async fn per_session_target_identity_requires_the_enrolled_device_signature() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate identity test user");
     let device_key = SecretKey::generate();
     let (target_id, _) =
         create_enrolled_target(state, "identity-signature-target", &device_key).await;
-    grant_target(state, target_id).await;
-    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let (client_sender, mut client_receiver) = mpsc::channel(16);
     let client_key = SecretKey::generate();
     let session_id = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         session_id,
-        target_id,
+        &target_id,
         client_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -1215,7 +1233,7 @@ async fn per_session_target_identity_requires_the_enrolled_device_signature() {
     let signature = untrusted_device_key
         .sign(&identity::agent_session_identity_payload(
             session_id,
-            target_id,
+            &target_id,
             RouteMode::PrivateRelay,
             &data_key.public(),
             expires_at,
@@ -1224,7 +1242,7 @@ async fn per_session_target_identity_requires_the_enrolled_device_signature() {
         .to_vec();
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::AgentIdentity {
             session_id,
@@ -1268,15 +1286,15 @@ async fn per_session_target_identity_requires_the_enrolled_device_signature() {
 async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate duplicate endpoint test user");
     let device_key = SecretKey::generate();
     let (target_id, _) =
         create_enrolled_target(state, "duplicate-data-id-target", &device_key).await;
-    grant_target(state, target_id).await;
-    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let (client_a_sender, mut client_a_receiver) = mpsc::channel(16);
     let (client_b_sender, mut client_b_receiver) = mpsc::channel(16);
     let client_a_key = SecretKey::generate();
@@ -1285,10 +1303,10 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
     let session_b = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_a_sender,
         session_a,
-        target_id,
+        &target_id,
         client_a_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -1306,7 +1324,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
     let signature_a = device_key
         .sign(&identity::agent_session_identity_payload(
             session_a,
-            target_id,
+            &target_id,
             RouteMode::PrivateRelay,
             &data_key.public(),
             expiry_a,
@@ -1315,7 +1333,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         .to_vec();
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::AgentIdentity {
             session_id: session_a,
@@ -1354,10 +1372,10 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
     assert!(
         control::open_tunnel(
             state,
-            user,
+            user.clone(),
             &client_b_sender,
             colliding_client_session,
-            target_id,
+            &target_id,
             data_key.public().to_string(),
             RouteMode::PrivateRelay,
         )
@@ -1367,10 +1385,10 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
 
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_b_sender,
         session_b,
-        target_id,
+        &target_id,
         client_b_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -1387,7 +1405,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
     let signature_b = device_key
         .sign(&identity::agent_session_identity_payload(
             session_b,
-            target_id,
+            &target_id,
             RouteMode::PrivateRelay,
             &data_key.public(),
             expiry_b,
@@ -1396,7 +1414,7 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
         .to_vec();
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::AgentIdentity {
             session_id: session_b,
@@ -1442,23 +1460,23 @@ async fn target_data_endpoint_id_is_once_bound_across_live_sessions() {
 async fn measured_candidate_pair_and_matching_punch_selection_reach_native_handoff() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate punch test user");
     let device_key = SecretKey::generate();
     let (target_id, _) = create_enrolled_target(state, "punch-state-target", &device_key).await;
-    grant_target(state, target_id).await;
-    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let (client_sender, mut client_receiver) = mpsc::channel(32);
     let client_key = SecretKey::generate();
     let session_id = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         session_id,
-        target_id,
+        &target_id,
         client_key.public().to_string(),
         RouteMode::PrivateDirect,
     )
@@ -1476,7 +1494,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
     let signature = device_key
         .sign(&identity::agent_session_identity_payload(
             session_id,
-            target_id,
+            &target_id,
             RouteMode::PrivateDirect,
             &data_key.public(),
             expires_at,
@@ -1485,7 +1503,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
         .to_vec();
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::AgentIdentity {
             session_id,
@@ -1569,7 +1587,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
     };
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::CandidatesReady {
             session_id,
@@ -1580,7 +1598,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
     .await;
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::CandidatesReady {
             session_id,
@@ -1620,7 +1638,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
 
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::PunchReady {
             session_id,
@@ -1631,7 +1649,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
     .await;
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::PunchReady {
             session_id,
@@ -1658,7 +1676,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
     let target_peer_observed = client_observed;
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::PunchSelected {
             session_id,
@@ -1671,7 +1689,7 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
     .await;
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::PunchSelected {
             session_id,
@@ -1709,14 +1727,14 @@ async fn measured_candidate_pair_and_matching_punch_selection_reach_native_hando
 async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatched_index() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate punch selection test user");
     let device_key = SecretKey::generate();
     let (target_id, _) = create_enrolled_target(state, "punch-selection-target", &device_key).await;
-    grant_target(state, target_id).await;
-    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let target_local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 41000);
     let target_ip = Ipv4Addr::new(203, 0, 113, 10);
     let target_mappings = [
@@ -1732,9 +1750,9 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     let session_id = Uuid::new_v4();
     start_test_birthday_punch(
         state,
-        user,
+        user.clone(),
         BirthdayPunchControl {
-            target_id,
+            target_id: &target_id,
             connection_id,
             device_key: &device_key,
             target_receiver: &mut target_receiver,
@@ -1753,7 +1771,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     .await;
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::PunchSelected {
             session_id,
@@ -1766,7 +1784,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     .await;
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::PunchSelected {
             session_id,
@@ -1792,9 +1810,9 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     let session_id = Uuid::new_v4();
     start_test_birthday_punch(
         state,
-        user,
+        user.clone(),
         BirthdayPunchControl {
-            target_id,
+            target_id: &target_id,
             connection_id,
             device_key: &device_key,
             target_receiver: &mut target_receiver,
@@ -1813,7 +1831,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     .await;
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::PunchSelected {
             session_id,
@@ -1839,9 +1857,9 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     let session_id = Uuid::new_v4();
     start_test_birthday_punch(
         state,
-        user,
+        user.clone(),
         BirthdayPunchControl {
-            target_id,
+            target_id: &target_id,
             connection_id,
             device_key: &device_key,
             target_receiver: &mut target_receiver,
@@ -1860,7 +1878,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     .await;
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         connection_id,
         ControlMessage::PunchSelected {
             session_id,
@@ -1873,7 +1891,7 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
     .await;
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::PunchSelected {
             session_id,
@@ -1896,28 +1914,28 @@ async fn punch_selection_rejects_changed_client_tuple_out_of_range_and_mismatche
 }
 
 #[tokio::test]
-async fn pending_endpoint_access_is_revoked_before_activation_and_active_session_survives_rbac_change()
+async fn pending_endpoint_access_is_revoked_before_activation_and_active_session_survives_token_revocation()
  {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate admin");
     let target_secret = SecretKey::generate();
     let (target_id, _) = create_enrolled_target(state, "activation-target", &target_secret).await;
-    grant_target(state, target_id).await;
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (target_connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let (client_sender, mut client_receiver) = mpsc::channel(64);
 
     let denied_client_key = SecretKey::generate();
     let denied_session_id = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         denied_session_id,
-        target_id,
+        &target_id,
         denied_client_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -1929,7 +1947,7 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
     ));
     let _denied_data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         denied_session_id,
         RouteMode::PrivateRelay,
@@ -1971,10 +1989,10 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
             .await,
         Access::Allow
     );
-    revoke_target(state, target_id).await;
+    revoke_target(state, &target_id).await;
     send_agent_iroh_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         denied_session_id,
         denied_client_key.public().to_string(),
@@ -2004,15 +2022,15 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
         Access::Deny { .. }
     ));
 
-    grant_target(state, target_id).await;
+    grant_target(state, &target_id).await;
     let active_client_key = SecretKey::generate();
     let active_session_id = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         active_session_id,
-        target_id,
+        &target_id,
         active_client_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2024,7 +2042,7 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
     ));
     let _active_data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         active_session_id,
         RouteMode::PrivateRelay,
@@ -2044,7 +2062,7 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
     .await;
     send_agent_iroh_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         active_session_id,
         active_client_key.public().to_string(),
@@ -2059,10 +2077,22 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
             .await
             .expect("read active session status");
     assert_eq!(active_status, "active");
-    revoke_target(state, target_id).await;
-    auth::logout(State(state.clone()), bearer(&login.access_token))
-        .await
-        .expect("logout");
+    revoke_target(state, &target_id).await;
+    let api_claims = identity::decode_api_token(
+        &login,
+        &state.inner.keys.user_access.public_key_pem,
+        &state.inner.issuer,
+    )
+    .expect("decode administrator API JWT");
+    super::admin::apply_operation(
+        state,
+        api_claims.sub.clone(),
+        AdminOperation::RevokeApiToken {
+            token_id: api_claims.jti,
+        },
+    )
+    .await
+    .expect("revoke API token");
     assert_eq!(
         state
             .on_connect(&endpoint_connect_request(active_client_key.public()))
@@ -2091,15 +2121,15 @@ async fn pending_endpoint_access_is_revoked_before_activation_and_active_session
 async fn closing_client_control_only_closes_its_pending_tunnels() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate admin");
     let target_secret = SecretKey::generate();
     let (target_id, _) =
         create_enrolled_target(state, "control-owner-target", &target_secret).await;
-    grant_target(state, target_id).await;
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (target_connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let private_relay_url: RelayUrl = reqwest::Url::parse(&state.inner.issuer)
         .expect("parse private relay URL")
         .into();
@@ -2110,10 +2140,10 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     let pending_a_key = SecretKey::generate();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &sender_a,
         pending_a,
-        target_id,
+        &target_id,
         pending_a_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2128,10 +2158,10 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     let active_a_key = SecretKey::generate();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &sender_a,
         active_a,
-        target_id,
+        &target_id,
         active_a_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2143,7 +2173,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     ));
     let _active_target_data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         active_a,
         RouteMode::PrivateRelay,
@@ -2167,12 +2197,12 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
         target_data_endpoint_id: active_target_data_endpoint_id.clone(),
         route_mode: RouteMode::PrivateRelay,
     };
-    control::handle_client_message(state, user, &sender_a, iroh_ready.clone()).await;
+    control::handle_client_message(state, user.clone(), &sender_a, iroh_ready.clone()).await;
     assert!(matches!(
         receiver_a.recv().await.expect("client cannot assert device readiness"),
         ControlMessage::Error { session_id: None, code, .. } if code == "invalid_direction"
     ));
-    control::handle_agent_message(state, target_id, Uuid::new_v4(), iroh_ready.clone()).await;
+    control::handle_agent_message(state, &target_id, Uuid::new_v4(), iroh_ready.clone()).await;
     let pending_status: String =
         sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
             .bind(active_a.to_string())
@@ -2182,7 +2212,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     assert_eq!(pending_status, "pending");
     assert!(receiver_a.try_recv().is_err());
     assert!(target_receiver.try_recv().is_err());
-    control::handle_agent_message(state, target_id, target_connection_id, iroh_ready).await;
+    control::handle_agent_message(state, &target_id, target_connection_id, iroh_ready).await;
     assert!(matches!(
         receiver_a.recv().await.expect("sender A activation"),
         ControlMessage::Activated { session_id } if session_id == active_a
@@ -2196,10 +2226,10 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     let pending_b_one_key = SecretKey::generate();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &sender_b,
         pending_b_one,
-        target_id,
+        &target_id,
         pending_b_one_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2211,7 +2241,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     ));
     let _pending_b_one_data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         pending_b_one,
         RouteMode::PrivateRelay,
@@ -2234,10 +2264,10 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     let pending_b_two_key = SecretKey::generate();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &sender_b,
         pending_b_two,
-        target_id,
+        &target_id,
         pending_b_two_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2249,7 +2279,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     ));
     let _pending_b_two_data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         pending_b_two,
         RouteMode::PrivateRelay,
@@ -2333,7 +2363,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
 
     send_agent_iroh_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         pending_b_one,
         pending_b_one_key.public().to_string(),
@@ -2343,7 +2373,7 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
     .await;
     send_agent_iroh_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         pending_b_two,
         pending_b_two_key.public().to_string(),
@@ -2379,14 +2409,14 @@ async fn closing_client_control_only_closes_its_pending_tunnels() {
 async fn target_control_disconnect_only_closes_its_pending_sessions() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate target disconnect test user");
     let device_key = SecretKey::generate();
     let (target_id, _) = create_enrolled_target(state, "target-control-owner", &device_key).await;
-    grant_target(state, target_id).await;
-    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let relay_url: RelayUrl = reqwest::Url::parse(&state.inner.issuer)
         .expect("parse private relay URL")
         .into();
@@ -2396,10 +2426,10 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
     let pending_session = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &pending_sender,
         pending_session,
-        target_id,
+        &target_id,
         pending_client_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2415,10 +2445,10 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
     let active_session = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &active_sender,
         active_session,
-        target_id,
+        &target_id,
         active_client_key.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2430,7 +2460,7 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
     ));
     let _active_data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         connection_id,
         active_session,
         RouteMode::PrivateRelay,
@@ -2450,7 +2480,7 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
     .await;
     send_agent_iroh_ready_for_session(
         state,
-        target_id,
+        &target_id,
         connection_id,
         active_session,
         active_client_key.public().to_string(),
@@ -2467,7 +2497,7 @@ async fn target_control_disconnect_only_closes_its_pending_sessions() {
         ControlMessage::Activated { session_id } if session_id == active_session
     ));
 
-    control::unregister_agent(state, target_id, connection_id).await;
+    control::unregister_agent(state, &target_id, connection_id).await;
     assert!(matches!(
         pending_receiver.recv().await.expect("pending client close"),
         ControlMessage::Close { session_id, .. } if session_id == pending_session
@@ -2527,15 +2557,15 @@ async fn public_default_mode_works_without_a_private_relay() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
     state.inner.transport_info.write().await.private_relay_url = None;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate admin");
     let target_secret = SecretKey::generate();
     let (target_id, _) = create_enrolled_target(state, "public-mode-target", &target_secret).await;
-    grant_target(state, target_id).await;
+    grant_target(state, &target_id).await;
 
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
+    let (target_connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let (client_sender, mut client_receiver) = mpsc::channel(16);
     let client_secret = SecretKey::generate();
     let session_id = Uuid::new_v4();
@@ -2543,10 +2573,10 @@ async fn public_default_mode_works_without_a_private_relay() {
     assert!(
         control::open_tunnel(
             state,
-            user,
+            user.clone(),
             &client_sender,
             Uuid::new_v4(),
-            target_id,
+            &target_id,
             client_secret.public().to_string(),
             RouteMode::PrivateRelay,
         )
@@ -2555,10 +2585,10 @@ async fn public_default_mode_works_without_a_private_relay() {
     );
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         session_id,
-        target_id,
+        &target_id,
         client_secret.public().to_string(),
         RouteMode::PublicDirect,
     )
@@ -2571,7 +2601,7 @@ async fn public_default_mode_works_without_a_private_relay() {
     ));
     let data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         session_id,
         RouteMode::PublicDirect,
@@ -2607,7 +2637,7 @@ async fn public_default_mode_works_without_a_private_relay() {
     ));
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::ClientReady {
             session_id,
@@ -2624,7 +2654,7 @@ async fn public_default_mode_works_without_a_private_relay() {
     ));
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::PathReady {
             session_id,
@@ -2637,7 +2667,7 @@ async fn public_default_mode_works_without_a_private_relay() {
     .await;
     send_agent_iroh_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         session_id,
         client_secret.public().to_string(),
@@ -2653,7 +2683,7 @@ async fn public_default_mode_works_without_a_private_relay() {
     assert_eq!(status, "pending");
     control::handle_agent_message(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         ControlMessage::PathReady {
             session_id,
@@ -2678,23 +2708,23 @@ async fn public_default_mode_works_without_a_private_relay() {
 async fn public_direct_attempt_rejects_a_relay_data_path() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate public direct test user");
     let device_key = SecretKey::generate();
     let (target_id, _) = create_enrolled_target(state, "public-direct-target", &device_key).await;
-    grant_target(state, target_id).await;
-    let (connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let (client_sender, mut client_receiver) = mpsc::channel(16);
     let client_key = SecretKey::generate();
     let session_id = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         session_id,
-        target_id,
+        &target_id,
         client_key.public().to_string(),
         RouteMode::PublicDirect,
     )
@@ -2706,7 +2736,7 @@ async fn public_direct_attempt_rejects_a_relay_data_path() {
     ));
     let target_data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         connection_id,
         session_id,
         RouteMode::PublicDirect,
@@ -2732,7 +2762,7 @@ async fn public_direct_attempt_rejects_a_relay_data_path() {
     ));
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::ClientReady {
             session_id,
@@ -2748,7 +2778,7 @@ async fn public_direct_attempt_rejects_a_relay_data_path() {
     ));
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::PathReady {
             session_id,
@@ -2787,24 +2817,24 @@ async fn public_direct_attempt_rejects_a_relay_data_path() {
 async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let user = auth::authenticate(state, &bearer(&login.access_token))
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&login))
         .await
         .expect("authenticate admin");
     let target_secret = SecretKey::generate();
     let (target_id, _) = create_enrolled_target(state, "client-ready-target", &target_secret).await;
-    grant_target(state, target_id).await;
-    let (target_connection_id, mut target_receiver) = online_target(state, target_id).await;
+    grant_target(state, &target_id).await;
+    let (target_connection_id, mut target_receiver) = online_target(state, &target_id).await;
     let (client_sender, mut client_receiver) = mpsc::channel(32);
     let (other_sender, mut other_receiver) = mpsc::channel(32);
     let client_secret = SecretKey::generate();
     let session_id = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         session_id,
-        target_id,
+        &target_id,
         client_secret.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2816,7 +2846,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     ));
     let _data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         session_id,
         RouteMode::PrivateRelay,
@@ -2846,7 +2876,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     let candidate = EndpointAddr::new(client_secret.public()).with_relay_url(private_relay.clone());
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &other_sender,
         ControlMessage::ClientReady {
             session_id,
@@ -2874,7 +2904,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     let wrong_endpoint = SecretKey::generate();
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::ClientReady {
             session_id,
@@ -2905,10 +2935,10 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     let mode_client_secret = SecretKey::generate();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &client_sender,
         mode_session,
-        target_id,
+        &target_id,
         mode_client_secret.public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -2920,7 +2950,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     ));
     let mode_data_key = send_agent_ready_for_session(
         state,
-        target_id,
+        &target_id,
         target_connection_id,
         mode_session,
         RouteMode::PrivateRelay,
@@ -2942,7 +2972,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     ));
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::IrohReady {
             session_id: mode_session,
@@ -2958,7 +2988,7 @@ async fn client_ready_is_bound_to_its_open_control_and_endpoint_identity() {
     ));
     control::handle_client_message(
         state,
-        user,
+        user.clone(),
         &client_sender,
         ControlMessage::ClientReady {
             session_id: mode_session,
@@ -3009,9 +3039,9 @@ async fn sshsig_comment_canonicalization_and_challenge_replay() {
     let admin_id = admin_user_id(state).await;
     super::admin::apply_operation(
         state,
-        admin_id,
+        admin_id.clone(),
         AdminOperation::AddUserKey {
-            user_id: admin_id,
+            user_id: admin_id.clone(),
             public_key: with_comment.clone(),
             label: "test-key".to_owned(),
         },
@@ -3051,12 +3081,165 @@ async fn sshsig_comment_canonicalization_and_challenge_replay() {
 }
 
 #[tokio::test]
+async fn relay_admin_list_reports_disabled_and_requires_admin() {
+    let fixture = fixture("https://relay-admin.test:9443").await;
+    let state = &fixture.state;
+    let admin_token = api_jwt(state, &fixture.admin_token).await;
+    let disabled = admin_request(state, &admin_token, AdminOperation::ListRelayTraffic)
+        .await
+        .expect("administrator can query relay status");
+    assert!(matches!(
+        disabled,
+        AdminResponse::RelayTraffic(view)
+            if !view.enabled
+                && view.connections.is_empty()
+                && view.sample_duration_ms == 0
+    ));
+
+    let admin_id = admin_user_id(state).await;
+    let created = super::admin::apply_operation(
+        state,
+        admin_id.clone(),
+        AdminOperation::CreateUser {
+            username: "relay-viewer".to_owned(),
+        },
+    )
+    .await
+    .expect("create non-admin user");
+    let AdminResponse::User(user) = created else {
+        panic!("user creation returned an unexpected response");
+    };
+    let issued = super::admin::apply_operation(
+        state,
+        admin_id,
+        AdminOperation::CreateApiToken {
+            user_id: user.user_id,
+            label: "relay-viewer".to_owned(),
+            expires_in_secs: None,
+        },
+    )
+    .await
+    .expect("issue non-admin API JWT");
+    let AdminResponse::ApiTokenIssued { token, .. } = issued else {
+        panic!("token creation returned an unexpected response");
+    };
+    let user_token = api_jwt(state, &token).await;
+    assert_eq!(
+        admin_request(state, &user_token, AdminOperation::ListRelayTraffic)
+            .await
+            .unwrap_err(),
+        axum::http::StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn relay_admin_close_rejects_direct_sessions() {
+    let fixture = fixture("https://relay-admin-direct.test:9443").await;
+    let state = &fixture.state;
+    let admin_token = api_jwt(state, &fixture.admin_token).await;
+    let user = auth::authenticate(state, &bearer(&admin_token))
+        .await
+        .expect("authenticate admin API JWT");
+    let stable_device_key = SecretKey::generate();
+    let (target_id, _) =
+        create_enrolled_target(state, "direct-relay-admin-target", &stable_device_key).await;
+    grant_target(state, &target_id).await;
+    let (target_connection_id, _target_receiver) = online_target(state, &target_id).await;
+    let (client_sender, _client_receiver) = mpsc::channel(16);
+    let session_id = Uuid::new_v4();
+    control::open_tunnel(
+        state,
+        user.clone(),
+        &client_sender,
+        session_id,
+        &target_id,
+        SecretKey::generate().public().to_string(),
+        RouteMode::PrivateDirect,
+    )
+    .await
+    .expect("open a direct SSH session");
+
+    assert_eq!(
+        admin_request(
+            state,
+            &admin_token,
+            AdminOperation::CloseRelaySession { session_id },
+        )
+        .await
+        .unwrap_err(),
+        axum::http::StatusCode::CONFLICT
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+        .bind(session_id.to_string())
+        .fetch_one(&state.inner.db.pool)
+        .await
+        .expect("read direct session status");
+    assert_eq!(status, "pending");
+
+    control::handle_client_message(
+        state,
+        user,
+        &client_sender,
+        ControlMessage::Close {
+            session_id,
+            reason: "test cleanup".to_owned(),
+        },
+    )
+    .await;
+    control::unregister_agent(state, &target_id, target_connection_id).await;
+}
+
+#[tokio::test]
 async fn rotated_refresh_replay_revokes_the_session() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
-    let tokens = login_api_token(state, &fixture.admin_token).await;
+    let admin_id = admin_user_id(state).await;
+    let private = PrivateKey::from_openssh(TEST_PRIVATE_KEY).expect("parse test SSH key");
+    let public_key = private
+        .public_key()
+        .to_openssh()
+        .expect("encode test SSH public key");
+    super::admin::apply_operation(
+        state,
+        admin_id.clone(),
+        AdminOperation::AddUserKey {
+            user_id: admin_id.clone(),
+            public_key: public_key.clone(),
+            label: "refresh-test".to_owned(),
+        },
+    )
+    .await
+    .expect("register refresh-test SSH key");
+    let challenge = auth::public_key_challenge(
+        State(state.clone()),
+        remote(),
+        Json(PublicKeyChallengeRequest {
+            username: "admin".to_owned(),
+            public_key,
+        }),
+    )
+    .await
+    .expect("request refresh-test challenge")
+    .0;
+    let payload = URL_SAFE_NO_PAD
+        .decode(challenge.challenge)
+        .expect("decode refresh-test challenge");
+    let signature = private
+        .sign("kmesh-login", HashAlg::Sha512, &payload)
+        .expect("sign refresh-test challenge");
+    let tokens = auth::public_key_login(
+        State(state.clone()),
+        remote(),
+        Json(PublicKeyLoginRequest {
+            username: "admin".to_owned(),
+            challenge_id: challenge.challenge_id,
+            signature: signature.to_pem(LineEnding::LF).expect("encode SSHSIG"),
+        }),
+    )
+    .await
+    .expect("login with SSH key");
     let request = RefreshRequest {
-        refresh_token: tokens.refresh_token,
+        refresh_token: tokens.0.refresh_token,
     };
     let peer = remote();
     let (first, second) = tokio::join!(
@@ -3077,6 +3260,21 @@ async fn rotated_refresh_replay_revokes_the_session() {
 
 #[tokio::test]
 async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together() {
+    run_self_hosted_https_private_relay_ssh_stream(SelfHostedRelayFinish::Natural).await;
+}
+
+#[tokio::test]
+async fn admin_closes_live_self_hosted_private_relay_session() {
+    run_self_hosted_https_private_relay_ssh_stream(SelfHostedRelayFinish::Administrator).await;
+}
+
+#[derive(Clone, Copy)]
+enum SelfHostedRelayFinish {
+    Natural,
+    Administrator,
+}
+
+async fn run_self_hosted_https_private_relay_ssh_stream(finish: SelfHostedRelayFinish) {
     let port_probe = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("reserve HTTPS test port");
@@ -3089,6 +3287,7 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     let relay_server = super::iroh::listen_and_serve(
         super::router(state.clone()),
         Some(Arc::new(state.clone())),
+        state.clone(),
         SocketAddr::from(([127, 0, 0, 1], https_port)),
         SocketAddr::from(([127, 0, 0, 1], 0)),
     )
@@ -3127,7 +3326,7 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     let target_secret = SecretKey::generate();
     let (target_id, agent_token) =
         create_enrolled_target(state, "self-hosted-target", &target_secret).await;
-    grant_target(state, target_id).await;
+    grant_target(state, &target_id).await;
     let incompatible_version = format!(
         "{}.0.0",
         semver::Version::parse(crate::version::VERSION)
@@ -3156,14 +3355,9 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
             .contains_key(&target_id),
         "version-rejected agent remains offline"
     );
-    let login = login_api_token(state, &fixture.admin_token).await;
-    let mut rejected_client = connect_control_ws_with_version(
-        &issuer,
-        "connect",
-        &login.access_token,
-        &incompatible_version,
-    )
-    .await;
+    let login = api_jwt(state, &fixture.admin_token).await;
+    let mut rejected_client =
+        connect_control_ws_with_version(&issuer, "connect", &login, &incompatible_version).await;
     assert!(matches!(
         receive_control(&mut rejected_client).await,
         ControlMessage::Error { session_id: None, code, message }
@@ -3183,14 +3377,14 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     };
     let mut agent_control = connect_control_ws(&issuer, "agent/control", &agent_token).await;
 
-    let mut client_control = connect_control_ws(&issuer, "connect", &login.access_token).await;
+    let mut client_control = connect_control_ws(&issuer, "connect", &login).await;
     let client_secret = SecretKey::generate();
     let session_id = Uuid::new_v4();
     send_control(
         &mut client_control,
         &ControlMessage::Open {
             session_id,
-            target_id,
+            target_id: target_id.clone(),
             client_endpoint_id: client_secret.public().to_string(),
             route_mode: RouteMode::PrivateRelay,
         },
@@ -3217,7 +3411,7 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     let identity_signature = target_secret
         .sign(&identity::agent_session_identity_payload(
             session_id,
-            target_id,
+            &target_id,
             RouteMode::PrivateRelay,
             &target_data_secret.public(),
             expires_at,
@@ -3311,6 +3505,14 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     timeout(Duration::from_secs(15), client_endpoint.online())
         .await
         .expect("client did not connect to the private relay");
+    let relay_before_stream = state
+        .inner
+        .relay_clients
+        .read()
+        .await
+        .as_ref()
+        .expect("private relay registry is available")
+        .traffic_snapshot();
     let client_endpoint_addr =
         EndpointAddr::new(client_endpoint.id()).with_relay_url(relay_url.clone());
     let client_accept = {
@@ -3495,83 +3697,283 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
         copied
     });
     let payload = b"kmesh ssh bytes through self-hosted iroh relay";
-    client_stream
-        .write_all(payload)
-        .await
-        .expect("write SSH test payload");
-    client_stream
-        .shutdown()
-        .await
-        .expect("half-close client SSH input");
-    let mut echoed = vec![0; payload.len()];
-    timeout(
-        Duration::from_secs(10),
-        client_stream.read_exact(&mut echoed),
-    )
-    .await
-    .expect("SSH echo timed out")
-    .expect("read SSH echo");
-    assert_eq!(echoed, payload);
-    let mut trailing = Vec::new();
-    timeout(
-        Duration::from_secs(10),
-        client_stream.read_to_end(&mut trailing),
-    )
-    .await
-    .expect("SSH close timed out")
-    .expect("read final SSH EOF");
-    assert!(trailing.is_empty());
-    client_stream
-        .finish_send_and_wait()
-        .await
-        .expect("client waits for final SSH bytes acknowledgement");
-    client_stream.connection().close(
-        iroh::endpoint::VarInt::from_u32(0),
-        b"self-hosted test complete",
-    );
-    timeout(Duration::from_secs(10), target_bridge)
-        .await
-        .expect("target bridge timed out")
-        .expect("target bridge panicked");
-    timeout(Duration::from_secs(10), echo_task)
-        .await
-        .expect("mock sshd timed out")
-        .expect("mock sshd panicked");
-
-    send_control(
-        &mut client_control,
-        &ControlMessage::Close {
-            session_id,
-            reason: "self_hosted_test_complete".to_owned(),
-        },
-    )
-    .await;
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let status: String =
-                sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
-                    .bind(session_id.to_string())
-                    .fetch_one(&state.inner.db.pool)
-                    .await
-                    .expect("read completed session status");
-            if status == "closed" {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("server did not close completed session");
-    assert!(
-        state
-            .on_connect(&endpoint_connect_request(
-                claims.client_endpoint_id.parse().unwrap()
-            ))
+    match finish {
+        SelfHostedRelayFinish::Natural => {
+            client_stream
+                .write_all(payload)
+                .await
+                .expect("write SSH test payload");
+            client_stream
+                .shutdown()
+                .await
+                .expect("half-close client SSH input");
+            let mut echoed = vec![0; payload.len()];
+            timeout(
+                Duration::from_secs(10),
+                client_stream.read_exact(&mut echoed),
+            )
             .await
-            .eq(&Access::Deny {
-                reason: Some("EndpointId is not registered for kmesh".to_owned())
+            .expect("SSH echo timed out")
+            .expect("read SSH echo");
+            assert_eq!(echoed, payload);
+            let mut trailing = Vec::new();
+            timeout(
+                Duration::from_secs(10),
+                client_stream.read_to_end(&mut trailing),
+            )
+            .await
+            .expect("SSH close timed out")
+            .expect("read final SSH EOF");
+            assert!(trailing.is_empty());
+            client_stream
+                .finish_send_and_wait()
+                .await
+                .expect("client waits for final SSH bytes acknowledgement");
+            client_stream.connection().close(
+                iroh::endpoint::VarInt::from_u32(0),
+                b"self-hosted test complete",
+            );
+            timeout(Duration::from_secs(10), target_bridge)
+                .await
+                .expect("target bridge timed out")
+                .expect("target bridge panicked");
+            timeout(Duration::from_secs(10), echo_task)
+                .await
+                .expect("mock sshd timed out")
+                .expect("mock sshd panicked");
+
+            send_control(
+                &mut client_control,
+                &ControlMessage::Close {
+                    session_id,
+                    reason: "self_hosted_test_complete".to_owned(),
+                },
+            )
+            .await;
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let status: String =
+                        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+                            .bind(session_id.to_string())
+                            .fetch_one(&state.inner.db.pool)
+                            .await
+                            .expect("read completed session status");
+                    if status == "closed" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             })
-    );
+            .await
+            .expect("server did not close completed session");
+            assert!(matches!(
+                state
+                    .on_connect(&endpoint_connect_request(
+                        claims.client_endpoint_id.parse().unwrap()
+                    ))
+                    .await,
+                Access::Deny { .. }
+            ));
+        }
+        SelfHostedRelayFinish::Administrator => {
+            client_stream
+                .write_all(payload)
+                .await
+                .expect("write SSH test payload");
+            let mut echoed = vec![0; payload.len()];
+            timeout(
+                Duration::from_secs(10),
+                client_stream.read_exact(&mut echoed),
+            )
+            .await
+            .expect("SSH echo timed out")
+            .expect("read SSH echo");
+            assert_eq!(echoed, payload);
+
+            let (reader, writer) = tokio::io::split(client_stream);
+            let (stop_reader_tx, mut stop_reader_rx) = tokio::sync::oneshot::channel();
+            let (stop_writer_tx, mut stop_writer_rx) = tokio::sync::oneshot::channel();
+            let traffic_reader = tokio::spawn(async move {
+                let mut reader = reader;
+                let mut echoed_bytes = 0usize;
+                let mut buffer = [0; 1024];
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_reader_rx => break,
+                        result = reader.read(&mut buffer) => match result {
+                            Ok(0) => break,
+                            Ok(count) => echoed_bytes += count,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                Ok::<_, std::io::Error>((reader, echoed_bytes))
+            });
+            let traffic_writer = tokio::spawn(async move {
+                let mut writer = writer;
+                let mut ticker = tokio::time::interval(Duration::from_millis(20));
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_writer_rx => break,
+                        _ = ticker.tick() => writer.write_all(b"relay-load").await?,
+                    }
+                }
+                Ok::<_, std::io::Error>(writer)
+            });
+
+            let traffic = admin_request(state, &login, AdminOperation::ListRelayTraffic)
+                .await
+                .expect("administrator lists live relay traffic");
+            let AdminResponse::RelayTraffic(traffic) = traffic else {
+                panic!("relay list returned an unexpected response");
+            };
+            assert!(traffic.enabled);
+            assert_eq!(traffic.relay_connection_count, 2);
+            assert_eq!(traffic.ssh_session_count, 1);
+            assert!(traffic.bytes_received > relay_before_stream.bytes_received);
+            assert!(traffic.bytes_sent > relay_before_stream.bytes_sent);
+            assert!(traffic.bytes_received_per_second > 0.0);
+            assert!(traffic.bytes_sent_per_second > 0.0);
+            let client_relay = traffic
+                .connections
+                .iter()
+                .find(|connection| connection.endpoint_id == claims.client_endpoint_id)
+                .expect("relay list includes the SSH client endpoint");
+            let client_metadata = client_relay
+                .metadata
+                .as_ref()
+                .expect("client relay endpoint maps to the SSH session");
+            assert_eq!(client_metadata.session_id, session_id);
+            assert_eq!(
+                client_metadata.endpoint_side,
+                crate::protocol::RelayEndpointSide::Client
+            );
+            assert_eq!(
+                client_metadata.session_phase,
+                crate::protocol::RelaySessionPhase::Active
+            );
+            assert!(client_relay.bytes_received > 0);
+            assert!(client_relay.bytes_sent > 0);
+            assert!(client_relay.bytes_received_per_second > 0.0);
+            assert!(client_relay.bytes_sent_per_second > 0.0);
+            let target_relay = traffic
+                .connections
+                .iter()
+                .find(|connection| connection.endpoint_id == claims.target_endpoint_id)
+                .expect("relay list includes the target endpoint");
+            let target_metadata = target_relay
+                .metadata
+                .as_ref()
+                .expect("target relay endpoint maps to the SSH session");
+            assert_eq!(target_metadata.session_id, session_id);
+            assert_eq!(
+                target_metadata.endpoint_side,
+                crate::protocol::RelayEndpointSide::Target
+            );
+            assert!(target_relay.bytes_received > 0);
+            assert!(target_relay.bytes_sent > 0);
+            assert!(target_relay.bytes_received_per_second > 0.0);
+            assert!(target_relay.bytes_sent_per_second > 0.0);
+
+            stop_writer_tx.send(()).expect("stop relay traffic writer");
+            let writer = traffic_writer
+                .await
+                .expect("relay traffic writer task panicked")
+                .expect("write relay traffic sample");
+            stop_reader_tx.send(()).expect("stop relay traffic reader");
+            let (reader, echoed_bytes) = traffic_reader
+                .await
+                .expect("relay traffic reader task panicked")
+                .expect("read relay traffic echo");
+            assert!(echoed_bytes > 0);
+            let client_stream = reader.unsplit(writer);
+
+            let closed = admin_request(
+                state,
+                &login,
+                AdminOperation::CloseRelaySession { session_id },
+            )
+            .await
+            .expect("administrator closes the private-relay session");
+            assert!(matches!(
+                closed,
+                AdminResponse::RelaySessionClosed {
+                    session_id: closed_session_id,
+                    disconnected_relay_connections: 2,
+                } if closed_session_id == session_id
+            ));
+            let close_audit_operation: String = sqlx::query_scalar(
+                "SELECT operation FROM admin_audit WHERE object_id = ?1 ORDER BY occurred_at DESC LIMIT 1",
+            )
+            .bind(session_id.to_string())
+            .fetch_one(&state.inner.db.pool)
+            .await
+            .expect("admin relay close writes an audit event");
+            assert_eq!(close_audit_operation, "close_relay_session");
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let status: String =
+                        sqlx::query_scalar("SELECT status FROM tunnel_sessions WHERE id = ?1")
+                            .bind(session_id.to_string())
+                            .fetch_one(&state.inner.db.pool)
+                            .await
+                            .expect("read completed session status");
+                    if status == "closed" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("server did not persist the admin session close");
+            assert!(
+                !state.inner.tunnels.read().await.contains_key(&session_id),
+                "admin close removes the runtime session"
+            );
+            assert!(
+                state
+                    .inner
+                    .relay_clients
+                    .read()
+                    .await
+                    .as_ref()
+                    .expect("private relay registry remains available")
+                    .traffic_snapshot()
+                    .connections
+                    .iter()
+                    .all(|connection| {
+                        connection.endpoint_id.to_string() != claims.client_endpoint_id
+                            && connection.endpoint_id.to_string() != claims.target_endpoint_id
+                    }),
+                "admin close removes both relay endpoint transports"
+            );
+            for endpoint_id in [&claims.client_endpoint_id, &claims.target_endpoint_id] {
+                assert!(matches!(
+                    state
+                        .on_connect(&endpoint_connect_request(endpoint_id.parse().unwrap()))
+                        .await,
+                    Access::Deny { .. }
+                ));
+            }
+            assert!(matches!(
+                timeout(Duration::from_secs(10), receive_control(&mut client_control))
+                    .await
+                    .expect("admin close is forwarded to the client"),
+                ControlMessage::Close { session_id: closed_session_id, .. }
+                    if closed_session_id == session_id
+            ));
+            assert!(matches!(
+                timeout(Duration::from_secs(10), receive_control(&mut agent_control))
+                    .await
+                    .expect("admin close is forwarded to the target"),
+                ControlMessage::Close { session_id: closed_session_id, .. }
+                    if closed_session_id == session_id
+            ));
+            target_bridge.abort();
+            echo_task.abort();
+            drop(client_stream);
+        }
+    }
 
     client_endpoint.close().await;
     target_endpoint.close().await;

@@ -10,7 +10,6 @@ use super::ServerState;
 
 pub fn router(state: ServerState) -> Router {
     let versioned_api = Router::new()
-        .route("/v1/auth/token", post(super::auth::token_login))
         .route(
             "/v1/auth/challenge",
             post(super::auth::public_key_challenge),
