@@ -49,9 +49,6 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             install-musl: true
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            install-musl: false
           - os: macos-15
             target: aarch64-apple-darwin
             install-musl: false
@@ -148,7 +145,6 @@ jobs:
           for target in \
             x86_64-unknown-linux-musl \
             aarch64-unknown-linux-musl \
-            x86_64-apple-darwin \
             aarch64-apple-darwin; do
             chmod +x "release-artifacts/kmesh-${target}/kmesh"
             tar -C "release-artifacts/kmesh-${target}" \
