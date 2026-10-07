@@ -10,7 +10,7 @@
 		<string>agent</string>
 		<string>run</string>
 		<string>--target-id</string>
-		<string>REPLACE_WITH_TARGET_UUID</string>
+		<string>REPLACE_WITH_TARGET_ID</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

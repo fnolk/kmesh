@@ -175,6 +175,21 @@ impl RelayConfig {
 pub struct ConnectionId(u64);
 
 impl ConnectionId {
+    /// Creates a connection identifier from its numeric representation.
+    ///
+    /// This is useful for embedders that expose connection ids through an admin API and later
+    /// pass the selected id to [`Clients::disconnect`](crate::server::clients::Clients::disconnect).
+    /// A connection is disconnected only when this id still matches a registered connection for
+    /// the endpoint.
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric representation of this connection id.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
     /// Returns a fresh, process-unique connection id.
     fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);

@@ -11,13 +11,12 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use crate::protocol::{
     LoginTokens, PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest,
-    TokenLoginRequest,
 };
 
 use super::{
     ClientContext,
     cli::{LoginArgs, LoginMethod},
-    profile::{SavedLogin, normalize_username},
+    profile::{SavedCredential, SavedLogin, normalize_username},
 };
 
 pub async fn login(context: &ClientContext, args: &LoginArgs) -> Result<()> {
@@ -31,17 +30,25 @@ pub async fn login(context: &ClientContext, args: &LoginArgs) -> Result<()> {
                 .as_deref()
                 .or(context.config.auth.token.as_deref())
                 .context(
-                    "API token is required; use --token, KMESH_TOKEN, or auth.token in config",
+                    "API JWT is required; use --token, KMESH_TOKEN, or auth.token in config",
                 )?;
-            anyhow::ensure!(!token.trim().is_empty(), "API token is empty");
-            let tokens = context
-                .api
-                .token_login(&TokenLoginRequest {
+            anyhow::ensure!(!token.trim().is_empty(), "API JWT is empty");
+            let username = context.api.me(token).await?.user.username;
+            let payload = token.split('.').nth(1).context("API token is not a JWT")?;
+            let claims: crate::protocol::ApiTokenClaims = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .context("decode API token claims")?,
+            )
+            .context("read API token expiration")?;
+            save_login(
+                context,
+                &normalize_username(&username),
+                SavedCredential::ApiToken {
                     token: token.to_owned(),
-                })
-                .await?;
-            let username = context.api.me(&tokens.access_token).await?.user.username;
-            save_login(context, &normalize_username(&username), tokens)
+                    expires_at: claims.exp,
+                },
+            )
         }
         LoginMethod::PublicKey => {
             let username = args
@@ -59,7 +66,11 @@ pub async fn login(context: &ClientContext, args: &LoginArgs) -> Result<()> {
                 .or(context.config.auth.key.clone())
                 .context("public-key login requires --key or auth.key in config")?;
             let tokens = public_key_login(context, &username, &key_path).await?;
-            save_login(context, &username, tokens)
+            save_login(
+                context,
+                &username,
+                SavedCredential::PublicKeySession { tokens },
+            )
         }
     }
 }
@@ -165,8 +176,21 @@ async fn valid_access_token_for_user(context: &ClientContext, username: &str) ->
         .load(username)?
         .context("请先运行 kmesh login")?;
     let now = unix_now()?;
-    if saved.tokens.access_expires_at > now.saturating_add(30) {
-        return Ok(saved.tokens.access_token);
+    match &saved.credential {
+        SavedCredential::ApiToken { token, expires_at } => {
+            if expires_at.is_some_and(|expires_at| expires_at <= now) {
+                context.profiles.delete(username)?;
+                context.profiles.clear_active_user_if(username)?;
+                bail!("API token 已过期，请配置新 token 后运行 kmesh login");
+            }
+            return Ok(token.clone());
+        }
+        SavedCredential::PublicKeySession { tokens }
+            if tokens.access_expires_at > now.saturating_add(30) =>
+        {
+            return Ok(tokens.access_token.clone());
+        }
+        SavedCredential::PublicKeySession { .. } => {}
     }
     let profiles = context.profiles.clone();
     let _lock = tokio::task::spawn_blocking(move || profiles.lock_refresh())
@@ -177,26 +201,34 @@ async fn valid_access_token_for_user(context: &ClientContext, username: &str) ->
         .load(username)?
         .context("请先运行 kmesh login")?;
     let now = unix_now()?;
-    if saved.tokens.access_expires_at > now.saturating_add(30) {
-        return Ok(saved.tokens.access_token);
-    }
-    if saved.tokens.refresh_expires_at <= now {
-        context.profiles.delete(username)?;
-        context.profiles.clear_active_user_if(username)?;
-        bail!("登录已过期，请运行 kmesh login");
-    }
+    let refresh_token = match &saved.credential {
+        SavedCredential::ApiToken { token, expires_at } => {
+            if expires_at.is_some_and(|expires_at| expires_at <= now) {
+                context.profiles.delete(username)?;
+                context.profiles.clear_active_user_if(username)?;
+                bail!("API token 已过期，请配置新 token 后运行 kmesh login");
+            }
+            return Ok(token.clone());
+        }
+        SavedCredential::PublicKeySession { tokens } => {
+            if tokens.access_expires_at > now.saturating_add(30) {
+                return Ok(tokens.access_token.clone());
+            }
+            if tokens.refresh_expires_at <= now {
+                context.profiles.delete(username)?;
+                context.profiles.clear_active_user_if(username)?;
+                bail!("登录已过期，请运行 kmesh login");
+            }
+            tokens.refresh_token.clone()
+        }
+    };
 
-    match context
-        .api
-        .refresh(&RefreshRequest {
-            refresh_token: saved.tokens.refresh_token.clone(),
-        })
-        .await
-    {
+    match context.api.refresh(&RefreshRequest { refresh_token }).await {
         Ok(tokens) => {
-            saved.tokens = tokens;
+            let access_token = tokens.access_token.clone();
+            saved.credential = SavedCredential::PublicKeySession { tokens };
             context.profiles.save(&saved)?;
-            Ok(saved.tokens.access_token)
+            Ok(access_token)
         }
         Err(error) => {
             context.profiles.delete(username)?;
@@ -208,21 +240,27 @@ async fn valid_access_token_for_user(context: &ClientContext, username: &str) ->
 
 pub async fn logout(context: &ClientContext) -> Result<()> {
     let username = context.profiles.active_user()?;
-    let token = valid_access_token_for_user(context, &username).await?;
-    context.api.logout(&token).await?;
+    let saved = context
+        .profiles
+        .load(&username)?
+        .context("请先运行 kmesh login")?;
+    if matches!(saved.credential, SavedCredential::PublicKeySession { .. }) {
+        let token = valid_access_token_for_user(context, &username).await?;
+        context.api.logout(&token).await?;
+    }
     let _lock = context.profiles.lock_refresh()?;
     context.profiles.delete(&username)?;
     context.profiles.clear_active_user_if(&username)?;
     Ok(())
 }
 
-fn save_login(context: &ClientContext, username: &str, tokens: LoginTokens) -> Result<()> {
+fn save_login(context: &ClientContext, username: &str, credential: SavedCredential) -> Result<()> {
     let _lock = context.profiles.lock_refresh()?;
     context.profiles.save(&SavedLogin {
         server_url: context.api.issuer().to_owned(),
         profile: context.config.profile.trim().to_lowercase(),
         username: username.to_owned(),
-        tokens,
+        credential,
     })?;
     context.profiles.set_active_user(username)
 }

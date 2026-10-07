@@ -12,16 +12,12 @@ pub struct LoginTokens {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TokenLoginRequest {
-    pub token: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiTokenView {
     pub token_id: Uuid,
-    pub user_id: Uuid,
+    pub user_id: String,
     pub label: String,
     pub created_at: i64,
+    pub expires_at: Option<i64>,
     pub revoked_at: Option<i64>,
 }
 
@@ -52,7 +48,7 @@ pub struct RefreshRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetView {
-    pub target_id: Uuid,
+    pub target_id: String,
     pub name: String,
     pub enabled: bool,
     pub online: bool,
@@ -60,7 +56,7 @@ pub struct TargetView {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserView {
-    pub user_id: Uuid,
+    pub user_id: String,
     pub username: String,
     pub enabled: bool,
 }
@@ -73,14 +69,14 @@ pub struct MeView {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoleView {
-    pub role_id: Uuid,
+    pub role_id: String,
     pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserKeyView {
     pub key_id: Uuid,
-    pub user_id: Uuid,
+    pub user_id: String,
     pub public_key: String,
     pub label: String,
 }
@@ -93,8 +89,8 @@ pub enum TargetPermission {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoleGrantView {
-    pub role_id: Uuid,
-    pub target_id: Uuid,
+    pub role_id: String,
+    pub target_id: String,
     pub permission: TargetPermission,
 }
 
@@ -102,25 +98,30 @@ pub struct RoleGrantView {
 #[serde(tag = "operation", content = "data", rename_all = "snake_case")]
 pub enum AdminOperation {
     ListUsers,
+    ListRelayTraffic,
+    CloseRelaySession {
+        session_id: Uuid,
+    },
     CreateUser {
         username: String,
     },
     SetUserEnabled {
-        user_id: Uuid,
+        user_id: String,
         enabled: bool,
     },
     CreateApiToken {
-        user_id: Uuid,
+        user_id: String,
         label: String,
+        expires_in_secs: Option<u64>,
     },
     ListApiTokens {
-        user_id: Uuid,
+        user_id: String,
     },
     RevokeApiToken {
         token_id: Uuid,
     },
     AddUserKey {
-        user_id: Uuid,
+        user_id: String,
         public_key: String,
         label: String,
     },
@@ -128,58 +129,110 @@ pub enum AdminOperation {
         key_id: Uuid,
     },
     ListKeys {
-        user_id: Uuid,
+        user_id: String,
     },
     ListRoles,
     CreateRole {
         name: String,
     },
     DeleteRole {
-        role_id: Uuid,
+        role_id: String,
     },
     SetUserRoles {
-        user_id: Uuid,
-        role_ids: Vec<Uuid>,
+        user_id: String,
+        role_ids: Vec<String>,
     },
     ListUserRoles {
-        user_id: Uuid,
+        user_id: String,
     },
     GrantTarget {
-        role_id: Uuid,
-        target_id: Uuid,
+        role_id: String,
+        target_id: String,
         permission: TargetPermission,
     },
     RevokeTarget {
-        role_id: Uuid,
-        target_id: Uuid,
+        role_id: String,
+        target_id: String,
         permission: TargetPermission,
     },
     ListRoleGrants {
-        role_id: Uuid,
+        role_id: String,
     },
     ListTargets,
     CreateTarget {
         name: String,
     },
     RenameTarget {
-        target_id: Uuid,
+        target_id: String,
         name: String,
     },
     SetTargetEnabled {
-        target_id: Uuid,
+        target_id: String,
         enabled: bool,
     },
     DeleteTarget {
-        target_id: Uuid,
+        target_id: String,
     },
     IssueEnrollment {
-        target_id: Uuid,
+        target_id: String,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdminRequest {
     pub operation: AdminOperation,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayEndpointSide {
+    Client,
+    Target,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelaySessionPhase {
+    Pending,
+    Active,
+    Closed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayConnectionMetadata {
+    pub session_id: Uuid,
+    pub user_id: String,
+    pub username: String,
+    pub target_id: String,
+    pub target_name: String,
+    pub endpoint_side: RelayEndpointSide,
+    pub session_phase: RelaySessionPhase,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayConnectionView {
+    pub endpoint_id: String,
+    pub connection_id: u64,
+    pub connected_at_unix_ms: u64,
+    pub active: bool,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received_per_second: f64,
+    pub bytes_sent_per_second: f64,
+    pub metadata: Option<RelayConnectionMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayTrafficView {
+    pub enabled: bool,
+    pub sample_duration_ms: u64,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received_per_second: f64,
+    pub bytes_sent_per_second: f64,
+    pub relay_connection_count: u64,
+    pub ssh_session_count: u64,
+    pub connections: Vec<RelayConnectionView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,28 +257,33 @@ pub enum AdminResponse {
     },
     Targets(Vec<TargetView>),
     EnrollmentIssued {
-        target_id: Uuid,
+        target_id: String,
         enrollment_token: String,
+    },
+    RelayTraffic(RelayTrafficView),
+    RelaySessionClosed {
+        session_id: Uuid,
+        disconnected_relay_connections: u64,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentEnrollmentRequest {
-    pub target_id: Uuid,
+    pub target_id: String,
     pub enrollment_token: String,
     pub agent_endpoint_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentEnrollmentResponse {
-    pub target_id: Uuid,
+    pub target_id: String,
     pub agent_token: String,
     pub ticket_public_key_pem: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentCredentials {
-    pub target_id: Uuid,
+    pub target_id: String,
     pub agent_token: String,
     pub ticket_public_key_pem: String,
     pub endpoint_secret_key: String,
@@ -247,7 +305,7 @@ pub enum RouteMode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccessTokenClaims {
-    pub sub: Uuid,
+    pub sub: String,
     pub sid: Uuid,
     pub iss: String,
     pub aud: String,
@@ -256,11 +314,29 @@ pub struct AccessTokenClaims {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApiTokenClaims {
+    pub sub: String,
+    pub jti: Uuid,
+    pub iss: String,
+    pub aud: String,
+    pub iat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum AuthCredential {
+    Session(Uuid),
+    ApiToken(Uuid),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TunnelTicketClaims {
     pub session_id: Uuid,
-    pub user_id: Uuid,
-    pub login_session_id: Uuid,
-    pub target_id: Uuid,
+    pub user_id: String,
+    pub auth_credential: AuthCredential,
+    pub target_id: String,
     pub client_endpoint_id: String,
     /// This ticket's target data-plane EndpointId, scoped to `session_id`.
     pub target_endpoint_id: String,
@@ -316,13 +392,13 @@ pub enum SelectedPath {
 pub enum ControlMessage {
     Open {
         session_id: Uuid,
-        target_id: Uuid,
+        target_id: String,
         client_endpoint_id: String,
         route_mode: RouteMode,
     },
     ClientOffer {
         session_id: Uuid,
-        target_id: Uuid,
+        target_id: String,
         ticket: String,
         client_endpoint_id: String,
         target_endpoint_id: String,
@@ -395,7 +471,7 @@ pub enum ControlMessage {
     },
     DialOffer {
         session_id: Uuid,
-        target_id: Uuid,
+        target_id: String,
         ticket: String,
         client_endpoint_id: String,
         client_endpoint_addr: iroh::EndpointAddr,

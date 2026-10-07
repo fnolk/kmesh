@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     identity::{self, TUNNEL_TICKET_AUDIENCE},
-    protocol::{ControlMessage, RouteMode, SelectedPath, TunnelTicketClaims},
+    protocol::{AuthCredential, ControlMessage, RouteMode, SelectedPath, TunnelTicketClaims},
 };
 
 use super::super::{auth::AuthenticatedUser, db::unix_time, error::ApiError};
@@ -23,7 +23,7 @@ pub(in crate::server) async fn open_tunnel(
     user: AuthenticatedUser,
     client_sender: &mpsc::Sender<ControlMessage>,
     session_id: Uuid,
-    target_id: Uuid,
+    target_id: &str,
     client_endpoint_id: String,
     route_mode: RouteMode,
 ) -> Result<(), ApiError> {
@@ -53,12 +53,14 @@ pub(in crate::server) async fn open_tunnel(
         .online_agents
         .read()
         .await
-        .get(&target_id)
+        .get(target_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("target is offline"))?;
 
     let now = unix_time();
-    let expires_at = (now + TICKET_TTL_SECS).min(user.access_expires_at);
+    let expires_at = user.expires_at.map_or(now + TICKET_TTL_SECS, |expires_at| {
+        (now + TICKET_TTL_SECS).min(expires_at)
+    });
     if expires_at <= now {
         return Err(ApiError::unauthorized());
     }
@@ -85,19 +87,24 @@ pub(in crate::server) async fn open_tunnel(
         }
     }
     let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
-    if !authorized_for_target(&mut tx, user, target_id, &target_endpoint_id, now).await? {
+    if !authorized_for_target(&mut tx, user.clone(), target_id, &target_endpoint_id, now).await? {
         return Err(ApiError::forbidden());
     }
+    let (auth_session_id, api_token_id) = match user.credential {
+        AuthCredential::Session(id) => (Some(id), None),
+        AuthCredential::ApiToken(id) => (None, Some(id)),
+    };
     sqlx::query(
         "INSERT INTO tunnel_sessions(\
-             id, user_id, auth_session_id, target_id, client_endpoint_id, target_endpoint_id, \
+             id, user_id, auth_session_id, api_token_id, target_id, client_endpoint_id, target_endpoint_id, \
              status, created_at, expires_at\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9)",
     )
     .bind(session_id.to_string())
-    .bind(user.user_id.to_string())
-    .bind(user.session_id.to_string())
-    .bind(target_id.to_string())
+    .bind(user.user_id.as_str())
+    .bind(auth_session_id.map(|id| id.to_string()))
+    .bind(api_token_id.map(|id| id.to_string()))
+    .bind(target_id)
     .bind(&client_endpoint_id)
     .bind(&target_endpoint_id)
     .bind(now)
@@ -116,9 +123,9 @@ pub(in crate::server) async fn open_tunnel(
     let runtime = Arc::new(TunnelRuntime {
         session_id,
         user_id: user.user_id,
-        auth_session_id: user.session_id,
-        access_expires_at: user.access_expires_at,
-        target_id,
+        auth_credential: user.credential,
+        credential_expires_at: user.expires_at,
+        target_id: target_id.to_owned(),
         target_connection_id: target_agent.connection_id,
         route_mode,
         client_endpoint_id: client_endpoint_id.clone(),
@@ -152,7 +159,7 @@ pub(in crate::server) async fn open_tunnel(
 
 pub(super) async fn register_agent_identity(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     session_id: Uuid,
     route_mode: RouteMode,
@@ -223,14 +230,18 @@ pub(super) async fn register_agent_identity(
         ));
     }
     let now = unix_time();
-    if runtime.expires_at <= now || runtime.access_expires_at <= now {
+    if runtime.expires_at <= now
+        || runtime
+            .credential_expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+    {
         return Err(ApiError::unauthorized());
     }
     let claims = TunnelTicketClaims {
         session_id,
-        user_id: runtime.user_id,
-        login_session_id: runtime.auth_session_id,
-        target_id,
+        user_id: runtime.user_id.clone(),
+        auth_credential: runtime.auth_credential,
+        target_id: target_id.to_owned(),
         client_endpoint_id: runtime.client_endpoint_id.clone(),
         target_endpoint_id: canonical_data_endpoint_id.clone(),
         route_mode,
@@ -255,7 +266,7 @@ pub(super) async fn register_agent_identity(
 
 pub(super) async fn send_client_offer(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     route_mode: RouteMode,
     session_id: Uuid,
@@ -273,7 +284,7 @@ pub(super) async fn send_client_offer(
         return;
     }
     let online = state.inner.online_agents.read().await;
-    if !online.get(&target_id).is_some_and(|agent| {
+    if !online.get(target_id).is_some_and(|agent| {
         agent.connection_id == connection_id && agent.sender.same_channel(&runtime.target_sender)
     }) {
         return;
@@ -293,7 +304,7 @@ pub(super) async fn send_client_offer(
         setup.client_offer_sent = true;
         ControlMessage::ClientOffer {
             session_id,
-            target_id,
+            target_id: target_id.to_owned(),
             ticket,
             client_endpoint_id: runtime.client_endpoint_id.clone(),
             target_endpoint_id,
@@ -323,15 +334,17 @@ pub(super) async fn register_client_endpoint(
     let runtime = runtime.ok_or_else(ApiError::unauthorized)?;
     if !runtime.client_sender.same_channel(client_sender)
         || runtime.user_id != user.user_id
-        || runtime.auth_session_id != user.session_id
-        || runtime.access_expires_at != user.access_expires_at
+        || runtime.auth_credential != user.credential
+        || runtime.credential_expires_at != user.expires_at
     {
         return Err(ApiError::unauthorized());
     }
     if runtime.route_mode != route_mode
         || *runtime.phase.lock().await != TunnelPhase::Pending
         || runtime.expires_at <= unix_time()
-        || runtime.access_expires_at <= unix_time()
+        || runtime
+            .credential_expires_at
+            .is_some_and(|expires_at| expires_at <= unix_time())
     {
         return Err(ApiError::conflict("SSH session is not pending"));
     }
@@ -352,7 +365,7 @@ pub(super) async fn register_client_endpoint(
 
 pub(super) async fn register_agent_data_endpoint(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     session_id: Uuid,
     route_mode: RouteMode,
@@ -370,7 +383,7 @@ pub(super) async fn register_agent_data_endpoint(
     }
     let online = state.inner.online_agents.read().await;
     if online
-        .get(&target_id)
+        .get(target_id)
         .is_none_or(|agent| agent.connection_id != connection_id)
     {
         return Err(ApiError::unauthorized());
@@ -418,7 +431,7 @@ pub(super) async fn maybe_send_dial_offer(
         setup.dial_offer_sent = true;
         ControlMessage::DialOffer {
             session_id: runtime.session_id,
-            target_id: runtime.target_id,
+            target_id: runtime.target_id.clone(),
             ticket,
             client_endpoint_id: runtime.client_endpoint_id.clone(),
             client_endpoint_addr,
@@ -453,7 +466,7 @@ pub(super) async fn register_path_ready(
     route_mode: RouteMode,
     path: SelectedPath,
     client: Option<(AuthenticatedUser, &mpsc::Sender<ControlMessage>)>,
-    target: Option<(Uuid, Uuid)>,
+    target: Option<(&str, Uuid)>,
 ) -> Result<Arc<TunnelRuntime>, ApiError> {
     let runtime = state.inner.tunnels.read().await.get(&session_id).cloned();
     let runtime = runtime.ok_or_else(ApiError::unauthorized)?;
@@ -468,8 +481,8 @@ pub(super) async fn register_path_ready(
         (Some((user, sender)), None) => {
             if !runtime.client_sender.same_channel(sender)
                 || runtime.user_id != user.user_id
-                || runtime.auth_session_id != user.session_id
-                || runtime.access_expires_at != user.access_expires_at
+                || runtime.auth_credential != user.credential
+                || runtime.credential_expires_at != user.expires_at
             {
                 return Err(ApiError::unauthorized());
             }
@@ -479,7 +492,7 @@ pub(super) async fn register_path_ready(
                 return Err(ApiError::unauthorized());
             }
             let online = state.inner.online_agents.read().await;
-            if !online.get(&target_id).is_some_and(|agent| {
+            if !online.get(target_id).is_some_and(|agent| {
                 agent.connection_id == connection_id
                     && agent.sender.same_channel(&runtime.target_sender)
             }) {
@@ -546,7 +559,7 @@ async fn validate_selected_path(
 
 pub(super) async fn register_agent_iroh_ready(
     state: &ServerState,
-    target_id: Uuid,
+    target_id: &str,
     connection_id: Uuid,
     session_id: Uuid,
     client_endpoint_id: String,
@@ -564,7 +577,7 @@ pub(super) async fn register_agent_iroh_ready(
         return Err(ApiError::unauthorized());
     }
     let online = state.inner.online_agents.read().await;
-    if !online.get(&target_id).is_some_and(|agent| {
+    if !online.get(target_id).is_some_and(|agent| {
         agent.connection_id == connection_id && agent.sender.same_channel(&runtime.target_sender)
     }) {
         return Err(ApiError::unauthorized());
@@ -597,7 +610,7 @@ pub(super) async fn maybe_activate_tunnel(state: &ServerState, runtime: &Arc<Tun
     };
     super::runtime::activate_tunnel(
         state,
-        runtime.target_id,
+        &runtime.target_id,
         runtime.target_connection_id,
         runtime.session_id,
         runtime.client_endpoint_id.clone(),
@@ -610,31 +623,55 @@ pub(super) async fn maybe_activate_tunnel(state: &ServerState, runtime: &Arc<Tun
 pub(super) async fn authorized_for_target(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     user: AuthenticatedUser,
-    target_id: Uuid,
+    target_id: &str,
     target_endpoint_id: &str,
     now: i64,
 ) -> Result<bool, ApiError> {
-    if user.access_expires_at <= now {
+    if user.expires_at.is_some_and(|expires_at| expires_at <= now) {
         return Ok(false);
     }
-    let allowed = sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS(SELECT 1 FROM users u \
-         JOIN auth_sessions s ON s.user_id = u.id \
-         JOIN user_roles ur ON ur.user_id = u.id \
-         JOIN target_permissions tp ON tp.role_id = ur.role_id \
-         JOIN targets t ON t.id = tp.target_id \
-         WHERE u.id = ?1 AND u.enabled = 1 AND s.id = ?2 AND s.revoked_at IS NULL \
-           AND s.refresh_expires_at > ?3 AND t.id = ?4 AND t.enabled = 1 \
-           AND t.deleted_at IS NULL AND t.agent_endpoint_id = ?5 \
-           AND tp.permission = 'ssh_connect')",
-    )
-    .bind(user.user_id.to_string())
-    .bind(user.session_id.to_string())
-    .bind(now)
-    .bind(target_id.to_string())
-    .bind(target_endpoint_id)
-    .fetch_one(&mut **tx)
-    .await?;
+    let allowed = match user.credential {
+        AuthCredential::Session(session_id) => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM users u \
+                 JOIN auth_sessions s ON s.user_id = u.id \
+                 JOIN user_roles ur ON ur.user_id = u.id \
+                 JOIN target_permissions tp ON tp.role_id = ur.role_id \
+                 JOIN targets t ON t.id = tp.target_id \
+                 WHERE u.id = ?1 AND u.enabled = 1 AND s.id = ?2 AND s.revoked_at IS NULL \
+                   AND s.refresh_expires_at > ?3 AND t.id = ?4 AND t.enabled = 1 \
+                   AND t.deleted_at IS NULL AND t.agent_endpoint_id = ?5 \
+                   AND tp.permission = 'ssh_connect')",
+            )
+            .bind(user.user_id.as_str())
+            .bind(session_id.to_string())
+            .bind(now)
+            .bind(target_id)
+            .bind(target_endpoint_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        AuthCredential::ApiToken(token_id) => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM users u \
+                 JOIN api_tokens token ON token.user_id = u.id \
+                 JOIN user_roles ur ON ur.user_id = u.id \
+                 JOIN target_permissions tp ON tp.role_id = ur.role_id \
+                 JOIN targets t ON t.id = tp.target_id \
+                 WHERE u.id = ?1 AND u.enabled = 1 AND token.id = ?2 \
+                   AND token.revoked_at IS NULL AND (token.expires_at IS NULL OR token.expires_at > ?3) \
+                   AND t.id = ?4 AND t.enabled = 1 AND t.deleted_at IS NULL \
+                   AND t.agent_endpoint_id = ?5 AND tp.permission = 'ssh_connect')",
+            )
+            .bind(user.user_id.as_str())
+            .bind(token_id.to_string())
+            .bind(now)
+            .bind(target_id)
+            .bind(target_endpoint_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+    };
     Ok(allowed != 0)
 }
 

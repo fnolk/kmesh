@@ -114,6 +114,7 @@ impl IrohServer {
 pub async fn listen_and_serve(
     router: Router,
     relay_access: Option<Arc<dyn DynAccessControl>>,
+    server_state: ServerState,
     https_bind: SocketAddr,
     qad_bind: SocketAddr,
 ) -> Result<IrohServer> {
@@ -151,6 +152,9 @@ pub async fn listen_and_serve(
     let qad_addr = qad_server
         .quic_addr()
         .context("Iroh QAD listener did not report its bound address")?;
+    *server_state.inner.relay_clients.write().await = relay_service
+        .as_ref()
+        .map(|relay_service| relay_service.clients().clone());
 
     let tls_acceptor = TlsAcceptor::from(server_tls);
     let (shutdown, shutdown_rx) = watch::channel(false);

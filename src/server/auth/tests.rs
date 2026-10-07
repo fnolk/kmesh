@@ -21,13 +21,15 @@ use uuid::Uuid;
 use crate::{
     identity,
     protocol::{
-        AdminOperation, AdminRequest, AdminResponse, AgentEnrollmentRequest, LoginTokens,
-        PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest, RouteMode,
-        TargetPermission, TokenLoginRequest,
+        AdminOperation, AdminRequest, AdminResponse, AgentEnrollmentRequest, ApiTokenClaims,
+        PublicKeyChallengeRequest, PublicKeyLoginRequest, RouteMode, TargetPermission,
     },
 };
 
-use super::super::{ServerInner, ServerState, admin, control, db::Database};
+use super::super::{
+    ServerInner, ServerState, admin, control,
+    db::{Database, InitialApiToken},
+};
 use super::*;
 
 const TEST_ISSUER: &str = "https://kmesh-auth-contract.test";
@@ -51,11 +53,29 @@ async fn fixture() -> Fixture {
         .expect("open test database");
     db.apply_schema().await.expect("apply test schema");
     let keys = identity::generate_token_key_set().expect("generate test token keys");
-    let admin_token = super::super::new_api_token();
+    let user_id = "admin".to_owned();
+    let token_id = Uuid::new_v4();
+    let now = unix_time() as u64;
+    let admin_token = identity::encode_api_token(
+        &ApiTokenClaims {
+            sub: user_id.clone(),
+            jti: token_id,
+            iss: TEST_ISSUER.to_owned(),
+            aud: identity::API_TOKEN_AUDIENCE.to_owned(),
+            iat: now,
+            exp: None,
+        },
+        &keys.user_access.private_key_pem,
+    )
+    .expect("sign initial API token");
     db.initialize(
         TEST_ISSUER,
         "admin",
-        Some(super::super::hash_secret(&admin_token)),
+        Some(InitialApiToken {
+            user_id,
+            token_id,
+            token_hash: super::super::hash_secret(&admin_token),
+        }),
     )
     .await
     .expect("initialize test admin");
@@ -68,6 +88,7 @@ async fn fixture() -> Fixture {
                 auth_rate_limiter: AuthRateLimiter::default(),
                 online_agents: RwLock::new(HashMap::new()),
                 tunnels: RwLock::new(HashMap::new()),
+                relay_clients: RwLock::new(None),
                 transport_info: RwLock::new(crate::protocol::TransportInfo {
                     private_relay_url: Some(TEST_ISSUER.to_owned()),
                     qad_port: 3478,
@@ -93,16 +114,9 @@ fn bearer(token: &str) -> HeaderMap {
     headers
 }
 
-async fn login(state: &ServerState, token: &str) -> Result<LoginTokens, ApiError> {
-    token_login(
-        State(state.clone()),
-        remote(),
-        Json(TokenLoginRequest {
-            token: token.to_owned(),
-        }),
-    )
-    .await
-    .map(|tokens| tokens.0)
+async fn login(state: &ServerState, token: &str) -> Result<String, ApiError> {
+    authenticate(state, &bearer(token)).await?;
+    Ok(token.to_owned())
 }
 
 async fn admin_request(
@@ -121,25 +135,26 @@ async fn admin_request(
 }
 
 #[tokio::test]
-async fn api_token_issue_list_revoke_and_derived_sessions_contract() {
+async fn api_jwt_issue_list_and_revoke_contract() {
     let fixture = fixture().await;
     let state = &fixture.state;
-    let admin_tokens = login(state, &fixture.admin_token)
+    let admin_token = login(state, &fixture.admin_token)
         .await
-        .expect("login initial administrator");
-    let admin_id = identity::decode_user_access_token(
-        &admin_tokens.access_token,
+        .expect("authenticate initial administrator");
+    let admin_id = identity::decode_api_token(
+        &admin_token,
         &state.inner.keys.user_access.public_key_pem,
         TEST_ISSUER,
     )
-    .expect("decode administrator access token")
+    .expect("decode administrator API JWT")
     .sub;
     let issued = admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_token,
         AdminOperation::CreateApiToken {
-            user_id: admin_id,
+            user_id: admin_id.clone(),
             label: "automation".to_owned(),
+            expires_in_secs: None,
         },
     )
     .await
@@ -147,7 +162,17 @@ async fn api_token_issue_list_revoke_and_derived_sessions_contract() {
     let AdminResponse::ApiTokenIssued { api_token, token } = issued else {
         panic!("token issue returned an unexpected response");
     };
-    assert!(token.starts_with("kmesh_"));
+    let claims = identity::decode_api_token(
+        &token,
+        &state.inner.keys.user_access.public_key_pem,
+        TEST_ISSUER,
+    )
+    .expect("verify issued API JWT");
+    assert_eq!(claims.sub.clone(), admin_id);
+    assert_eq!(claims.jti, api_token.token_id);
+    assert_eq!(claims.exp, None);
+    assert_eq!(api_token.expires_at, None);
+    assert_eq!(decode_header(&token).unwrap().alg, Algorithm::EdDSA);
     let stored_hash: String = sqlx::query_scalar("SELECT token_hash FROM api_tokens WHERE id = ?1")
         .bind(api_token.token_id.to_string())
         .fetch_one(&state.inner.db.pool)
@@ -156,12 +181,101 @@ async fn api_token_issue_list_revoke_and_derived_sessions_contract() {
     assert_eq!(stored_hash, super::super::hash_secret(&token));
     assert_ne!(stored_hash, token);
 
-    let user_tokens = login(state, &token)
+    assert_eq!(
+        admin_request(
+            state,
+            &admin_token,
+            AdminOperation::CreateApiToken {
+                user_id: admin_id.clone(),
+                label: "zero lifetime".to_owned(),
+                expires_in_secs: Some(0),
+            },
+        )
         .await
-        .expect("login with issued API token");
+        .unwrap_err(),
+        StatusCode::BAD_REQUEST
+    );
+
+    login(state, &token)
+        .await
+        .expect("authenticate issued API JWT directly");
+    let limited = admin_request(
+        state,
+        &admin_token,
+        AdminOperation::CreateApiToken {
+            user_id: admin_id.clone(),
+            label: "temporary".to_owned(),
+            expires_in_secs: Some(120),
+        },
+    )
+    .await
+    .expect("issue limited API JWT");
+    let AdminResponse::ApiTokenIssued {
+        api_token: limited_view,
+        token: limited_token,
+    } = limited
+    else {
+        panic!("limited token issue returned an unexpected response");
+    };
+    let limited_claims = identity::decode_api_token(
+        &limited_token,
+        &state.inner.keys.user_access.public_key_pem,
+        TEST_ISSUER,
+    )
+    .expect("verify limited API JWT");
+    assert_eq!(
+        limited_claims.exp,
+        limited_view.expires_at.map(|expires_at| expires_at as u64)
+    );
+    login(state, &limited_token)
+        .await
+        .expect("authenticate limited API JWT before expiration");
+    let expired_at = unix_time() - 1;
+    let expired_id = Uuid::new_v4();
+    let expired_token = identity::encode_api_token(
+        &ApiTokenClaims {
+            sub: admin_id.clone(),
+            jti: expired_id,
+            iss: TEST_ISSUER.to_owned(),
+            aud: identity::API_TOKEN_AUDIENCE.to_owned(),
+            iat: (expired_at - 60) as u64,
+            exp: Some(expired_at as u64),
+        },
+        &state.inner.keys.user_access.private_key_pem,
+    )
+    .expect("sign expired API JWT");
+    sqlx::query(
+        "INSERT INTO api_tokens(id, user_id, token_hash, label, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, 'expired', ?4, ?5)",
+    )
+    .bind(expired_id.to_string())
+    .bind(admin_id.to_string())
+    .bind(super::super::hash_secret(&expired_token))
+    .bind(expired_at - 120)
+    .bind(expired_at)
+    .execute(&state.inner.db.pool)
+    .await
+    .expect("register expired API JWT");
+    assert!(
+        identity::decode_api_token(
+            &expired_token,
+            &state.inner.keys.user_access.public_key_pem,
+            TEST_ISSUER,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        authenticate(state, &bearer(&expired_token))
+            .await
+            .unwrap_err()
+            .into_response()
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "an expired JWT is rejected without leeway"
+    );
     let listed = admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_token,
         AdminOperation::ListApiTokens { user_id: admin_id },
     )
     .await
@@ -171,35 +285,20 @@ async fn api_token_issue_list_revoke_and_derived_sessions_contract() {
         AdminResponse::ApiTokens(tokens)
             if tokens.iter().any(|listed| listed.token_id == api_token.token_id
                 && listed.label == "automation"
+                && listed.expires_at.is_none()
                 && listed.revoked_at.is_none())
     ));
 
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_token,
         AdminOperation::RevokeApiToken {
             token_id: api_token.token_id,
         },
     )
     .await
     .expect("revoke API token");
-    assert!(
-        authenticate(state, &bearer(&user_tokens.access_token))
-            .await
-            .is_err()
-    );
-    let refresh_result = refresh(
-        State(state.clone()),
-        remote(),
-        Json(RefreshRequest {
-            refresh_token: user_tokens.refresh_token.clone(),
-        }),
-    )
-    .await;
-    assert_eq!(
-        refresh_result.unwrap_err().into_response().status(),
-        StatusCode::UNAUTHORIZED
-    );
+    assert!(authenticate(state, &bearer(&token)).await.is_err());
     assert_eq!(
         login(state, &token)
             .await
@@ -269,52 +368,62 @@ async fn key_challenge(
 async fn api_token_and_ssh_sig_contracts_cover_algorithms_expiry_action_and_replay() {
     let fixture = fixture().await;
     let state = &fixture.state;
-    let api_tokens = login(state, &fixture.admin_token)
+    let api_token = login(state, &fixture.admin_token)
         .await
-        .expect("API token login");
-    let header = decode_header(&api_tokens.access_token).expect("decode JWT header");
+        .expect("authenticate API JWT");
+    let header = decode_header(&api_token).expect("decode JWT header");
     assert_eq!(header.alg, Algorithm::EdDSA);
-    let claims = identity::decode_user_access_token(
-        &api_tokens.access_token,
+    let claims = identity::decode_api_token(
+        &api_token,
         &state.inner.keys.user_access.public_key_pem,
         TEST_ISSUER,
     )
-    .expect("verify Ed25519 access token");
-    assert_eq!(claims.exp - claims.iat, 15 * 60);
-    assert_eq!(api_tokens.access_expires_at, claims.exp);
-    assert_eq!(
-        api_tokens.refresh_expires_at - claims.iat,
-        30 * 24 * 60 * 60
+    .expect("verify Ed25519 API JWT");
+    assert_eq!(claims.aud, identity::API_TOKEN_AUDIENCE);
+    assert_eq!(claims.exp, None);
+    assert!(
+        identity::decode_user_access_token(
+            &api_token,
+            &state.inner.keys.user_access.public_key_pem,
+            TEST_ISSUER,
+        )
+        .is_err()
+    );
+    let access_token = identity::encode_user_access_token(
+        &crate::protocol::AccessTokenClaims {
+            sub: claims.sub.clone(),
+            sid: Uuid::new_v4(),
+            iss: TEST_ISSUER.to_owned(),
+            aud: identity::USER_TOKEN_AUDIENCE.to_owned(),
+            iat: unix_time() as u64,
+            exp: (unix_time() + 60) as u64,
+        },
+        &state.inner.keys.user_access.private_key_pem,
+    )
+    .expect("sign public-key session access JWT");
+    assert!(
+        identity::decode_api_token(
+            &access_token,
+            &state.inner.keys.user_access.public_key_pem,
+            TEST_ISSUER,
+        )
+        .is_err()
     );
     let stored_api_token_hash: String =
         sqlx::query_scalar("SELECT token_hash FROM api_tokens WHERE user_id = ?1")
-            .bind(claims.sub.to_string())
+            .bind(claims.sub.clone().to_string())
             .fetch_one(&state.inner.db.pool)
             .await
             .expect("read stored API token hash");
-    assert_eq!(
-        stored_api_token_hash,
-        super::super::hash_secret(&fixture.admin_token)
-    );
+    assert_eq!(stored_api_token_hash, super::super::hash_secret(&api_token));
     assert_ne!(stored_api_token_hash, fixture.admin_token);
-    let stored_refresh_hash: String =
-        sqlx::query_scalar("SELECT token_hash FROM refresh_tokens WHERE session_id = ?1")
-            .bind(claims.sid.to_string())
-            .fetch_one(&state.inner.db.pool)
-            .await
-            .expect("read stored refresh-token hash");
-    assert_eq!(
-        stored_refresh_hash,
-        super::super::hash_secret(&api_tokens.refresh_token)
-    );
-    assert_ne!(stored_refresh_hash, api_tokens.refresh_token);
     let wrong_token = login(state, "invalid-api-token").await;
     assert_eq!(
         wrong_token.unwrap_err().into_response().status(),
         StatusCode::UNAUTHORIZED
     );
 
-    let admin_id = claims.sub;
+    let admin_id = claims.sub.clone();
     for algorithm in ["ed25519", "rsa", "ecdsa"] {
         let private_key =
             generate_ssh_key(&fixture.data_dir, &format!("id_{algorithm}"), algorithm);
@@ -322,9 +431,9 @@ async fn api_token_and_ssh_sig_contracts_cover_algorithms_expiry_action_and_repl
             .expect("read generated SSH public key");
         admin::apply_operation(
             state,
-            admin_id,
+            admin_id.clone(),
             AdminOperation::AddUserKey {
-                user_id: admin_id,
+                user_id: admin_id.clone(),
                 public_key: public_key.clone(),
                 label: format!("{algorithm}-test-key"),
             },
@@ -353,7 +462,7 @@ async fn api_token_and_ssh_sig_contracts_cover_algorithms_expiry_action_and_repl
             TEST_ISSUER,
         )
         .expect("verify SSHSIG login access token");
-        assert_eq!(claims.sub, admin_id);
+        assert_eq!(claims.sub.clone(), admin_id);
         let replay = public_key_login(State(state.clone()), remote(), Json(request)).await;
         assert_eq!(
             replay.unwrap_err().into_response().status(),
@@ -366,9 +475,9 @@ async fn api_token_and_ssh_sig_contracts_cover_algorithms_expiry_action_and_repl
         fs::read_to_string(ed25519.with_extension("pub")).expect("read action-binding public key");
     admin::apply_operation(
         state,
-        admin_id,
+        admin_id.clone(),
         AdminOperation::AddUserKey {
-            user_id: admin_id,
+            user_id: admin_id.clone(),
             public_key: public_key.clone(),
             label: "action-binding".to_owned(),
         },
@@ -433,9 +542,9 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
 
     let created_user = admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::CreateUser {
-            username: "ssh-user".to_owned(),
+            username: " SSH-User ".to_owned(),
         },
     )
     .await
@@ -443,12 +552,27 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     let AdminResponse::User(user) = created_user else {
         panic!("create user returned an unexpected response");
     };
+    assert_eq!(user.user_id, "ssh-user");
+    assert_eq!(user.username, "ssh-user");
+    assert_eq!(
+        admin_request(
+            state,
+            &admin_tokens,
+            AdminOperation::CreateUser {
+                username: "SSH-USER".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err(),
+        StatusCode::CONFLICT
+    );
     let user_token = match admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::CreateApiToken {
-            user_id: user.user_id,
+            user_id: user.user_id.clone(),
             label: "ssh-user test".to_owned(),
+            expires_in_secs: None,
         },
     )
     .await
@@ -457,18 +581,28 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         AdminResponse::ApiTokenIssued { token, .. } => token,
         _ => panic!("API token creation returned an unexpected response"),
     };
+    assert_eq!(
+        identity::decode_api_token(
+            &user_token,
+            &state.inner.keys.user_access.public_key_pem,
+            TEST_ISSUER,
+        )
+        .expect("verify SSH-only user's API JWT")
+        .sub,
+        user.user_id
+    );
     assert!(matches!(
-        admin_request(state, &admin_tokens.access_token, AdminOperation::ListUsers)
+        admin_request(state, &admin_tokens, AdminOperation::ListUsers)
             .await
             .expect("list users"),
-        AdminResponse::Users(users) if users.iter().any(|candidate| candidate.user_id == user.user_id)
+        AdminResponse::Users(users) if users.iter().any(|candidate| candidate.user_id == user.user_id.clone())
     ));
 
     let created_role = admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::CreateRole {
-            name: "ssh-connect-only".to_owned(),
+            name: "SSH-Connect-Only".to_owned(),
         },
     )
     .await
@@ -476,38 +610,52 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     let AdminResponse::Role(role) = created_role else {
         panic!("create role returned an unexpected response");
     };
+    assert_eq!(role.role_id, "ssh-connect-only");
+    assert_eq!(role.name, "SSH-Connect-Only");
+    assert_eq!(
+        admin_request(
+            state,
+            &admin_tokens,
+            AdminOperation::CreateRole {
+                name: "ssh-connect-only".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err(),
+        StatusCode::CONFLICT
+    );
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
+            &admin_tokens,
             AdminOperation::ListRoles,
         )
         .await
         .expect("list roles"),
-        AdminResponse::Roles(roles) if roles.iter().any(|candidate| candidate.role_id == role.role_id)
+        AdminResponse::Roles(roles) if roles.iter().any(|candidate| candidate.role_id == role.role_id.clone())
     ));
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
+            &admin_tokens,
             AdminOperation::SetUserRoles {
-                user_id: user.user_id,
-                role_ids: vec![role.role_id, role.role_id],
+                user_id: user.user_id.clone(),
+                role_ids: vec![role.role_id.clone(), role.role_id.clone()],
             },
         )
         .await
         .expect("set user roles"),
-        AdminResponse::UserRoles(roles) if roles.len() == 1 && roles[0].role_id == role.role_id
+        AdminResponse::UserRoles(roles) if roles.len() == 1 && roles[0].role_id == role.role_id.clone()
     ));
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
-            AdminOperation::ListUserRoles { user_id: user.user_id },
+            &admin_tokens,
+            AdminOperation::ListUserRoles { user_id: user.user_id.clone() },
         )
         .await
         .expect("list user roles"),
-        AdminResponse::UserRoles(roles) if roles.len() == 1 && roles[0].role_id == role.role_id
+        AdminResponse::UserRoles(roles) if roles.len() == 1 && roles[0].role_id == role.role_id.clone()
     ));
 
     let key_path = generate_ssh_key(&fixture.data_dir, "id_admin_operation", "ed25519");
@@ -515,9 +663,9 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         fs::read_to_string(key_path.with_extension("pub")).expect("read admin test public key");
     let added_key = admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::AddUserKey {
-            user_id: user.user_id,
+            user_id: user.user_id.clone(),
             public_key,
             label: "test-key".to_owned(),
         },
@@ -531,8 +679,8 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
-            AdminOperation::ListKeys { user_id: user.user_id },
+            &admin_tokens,
+            AdminOperation::ListKeys { user_id: user.user_id.clone() },
         )
         .await
         .expect("list user keys"),
@@ -540,7 +688,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     ));
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::RemoveUserKey {
             key_id: keys[0].key_id,
         },
@@ -550,8 +698,8 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
-            AdminOperation::ListKeys { user_id: user.user_id },
+            &admin_tokens,
+            AdminOperation::ListKeys { user_id: user.user_id.clone() },
         )
         .await
         .expect("list keys after removal"),
@@ -560,9 +708,9 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
 
     let created_target = admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::CreateTarget {
-            name: "build-machine".to_owned(),
+            name: "Build-Machine".to_owned(),
         },
     )
     .await
@@ -574,29 +722,55 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     else {
         panic!("create target returned an unexpected response");
     };
+    assert_eq!(target.target_id, "build-machine");
+    assert_eq!(target.name, "Build-Machine");
+    assert_eq!(
+        admin_request(
+            state,
+            &admin_tokens,
+            AdminOperation::CreateTarget {
+                name: "BUILD-MACHINE".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        admin_request(
+            state,
+            &admin_tokens,
+            AdminOperation::CreateTarget {
+                name: "not/a-slug".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err(),
+        StatusCode::BAD_REQUEST
+    );
     let first_device = iroh::SecretKey::generate();
     let first_enrollment = control::enroll(
         State(state.clone()),
         Json(AgentEnrollmentRequest {
-            target_id: target.target_id,
+            target_id: target.target_id.clone(),
             enrollment_token: enrollment_token.clone(),
             agent_endpoint_id: first_device.public().to_string(),
         }),
     )
     .await
     .expect("enroll target");
-    assert_eq!(first_enrollment.0.target_id, target.target_id);
+    assert_eq!(first_enrollment.0.target_id, target.target_id.clone());
     assert_eq!(
         control::authenticate_agent(state, &bearer(&first_enrollment.0.agent_token))
             .await
             .expect("authenticate first enrollment"),
-        target.target_id
+        target.target_id.clone()
     );
     assert_eq!(
         control::enroll(
             State(state.clone()),
             Json(AgentEnrollmentRequest {
-                target_id: target.target_id,
+                target_id: target.target_id.clone(),
                 enrollment_token,
                 agent_endpoint_id: first_device.public().to_string(),
             }),
@@ -609,9 +783,9 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     );
     let issued = admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::IssueEnrollment {
-            target_id: target.target_id,
+            target_id: target.target_id.clone(),
         },
     )
     .await
@@ -623,7 +797,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     else {
         panic!("issue enrollment returned an unexpected response");
     };
-    assert_eq!(target_id, target.target_id);
+    assert_eq!(target_id, target.target_id.clone());
     let second_enrollment = control::enroll(
         State(state.clone()),
         Json(AgentEnrollmentRequest {
@@ -634,7 +808,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     )
     .await
     .expect("re-enroll target with a fresh code");
-    assert_eq!(second_enrollment.0.target_id, target.target_id);
+    assert_eq!(second_enrollment.0.target_id, target.target_id.clone());
     assert!(
         control::authenticate_agent(state, &bearer(&first_enrollment.0.agent_token))
             .await
@@ -644,7 +818,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     let stored_device_id = state
         .inner
         .db
-        .target_endpoint_id(target.target_id)
+        .target_endpoint_id(&target.target_id.clone())
         .await
         .expect("read stable target device identity");
     let expected_device_id = first_device.public().to_string();
@@ -655,10 +829,10 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
 
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::RenameTarget {
-            target_id: target.target_id,
-            name: "renamed-machine".to_owned(),
+            target_id: target.target_id.clone(),
+            name: "Renamed-Machine".to_owned(),
         },
     )
     .await
@@ -666,16 +840,16 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     for enabled in [false, true] {
         admin_request(
             state,
-            &admin_tokens.access_token,
+            &admin_tokens,
             AdminOperation::SetTargetEnabled {
-                target_id: target.target_id,
+                target_id: target.target_id.clone(),
                 enabled,
             },
         )
         .await
         .expect("set target enabled state");
         let target_enabled: i64 = sqlx::query_scalar("SELECT enabled FROM targets WHERE id = ?1")
-            .bind(target.target_id.to_string())
+            .bind(target.target_id.clone().to_string())
             .fetch_one(&state.inner.db.pool)
             .await
             .expect("read target enabled state");
@@ -684,10 +858,10 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
 
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::GrantTarget {
-            role_id: role.role_id,
-            target_id: target.target_id,
+            role_id: role.role_id.clone(),
+            target_id: target.target_id.clone(),
             permission: TargetPermission::SshConnect,
         },
     )
@@ -696,34 +870,34 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
-            AdminOperation::ListRoleGrants { role_id: role.role_id },
+            &admin_tokens,
+            AdminOperation::ListRoleGrants { role_id: role.role_id.clone() },
         )
         .await
         .expect("list role grants"),
-        AdminResponse::Grants(grants) if grants.len() == 1 && grants[0].target_id == target.target_id
+        AdminResponse::Grants(grants) if grants.len() == 1 && grants[0].target_id == target.target_id.clone()
     ));
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
+            &admin_tokens,
             AdminOperation::ListTargets,
         )
         .await
         .expect("list targets"),
-        AdminResponse::Targets(targets) if targets.len() == 1 && targets[0].target_id == target.target_id && targets[0].name == "renamed-machine"
+        AdminResponse::Targets(targets) if targets.len() == 1 && targets[0].target_id == target.target_id.clone() && targets[0].name == "Renamed-Machine"
     ));
 
     let (target_sender, mut target_receiver) = mpsc::channel(4);
     let target_connection_id = Uuid::new_v4();
     state.inner.online_agents.write().await.insert(
-        target.target_id,
+        target.target_id.clone(),
         control::OnlineAgent {
             connection_id: target_connection_id,
             sender: target_sender,
         },
     );
-    let admin_user = authenticate(state, &bearer(&admin_tokens.access_token))
+    let admin_user = authenticate(state, &bearer(&admin_tokens))
         .await
         .expect("authenticate admin");
     let (admin_client_sender, _admin_client_receiver) = mpsc::channel(4);
@@ -733,7 +907,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
             admin_user,
             &admin_client_sender,
             Uuid::new_v4(),
-            target.target_id,
+            &target.target_id.clone(),
             iroh::SecretKey::generate().public().to_string(),
             RouteMode::PrivateRelay,
         )
@@ -751,7 +925,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
             &login(state, &user_token)
                 .await
                 .expect("login SSH-only user")
-                .access_token,
+                .to_owned(),
             AdminOperation::ListUsers,
         )
         .await
@@ -762,23 +936,23 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     let user_tokens = login(state, &user_token)
         .await
         .expect("login SSH-only user for connection test");
-    let visible_targets = admin::targets(State(state.clone()), bearer(&user_tokens.access_token))
+    let visible_targets = admin::targets(State(state.clone()), bearer(&user_tokens))
         .await
         .expect("list targets visible to SSH-only user")
         .0;
     assert_eq!(visible_targets.len(), 1);
-    assert_eq!(visible_targets[0].target_id, target.target_id);
-    let user = authenticate(state, &bearer(&user_tokens.access_token))
+    assert_eq!(visible_targets[0].target_id, target.target_id.clone());
+    let user = authenticate(state, &bearer(&user_tokens))
         .await
         .expect("authenticate SSH-only user");
     let (user_client_sender, _user_client_receiver) = mpsc::channel(4);
     let connected_session = Uuid::new_v4();
     control::open_tunnel(
         state,
-        user,
+        user.clone(),
         &user_client_sender,
         connected_session,
-        target.target_id,
+        &target.target_id.clone(),
         iroh::SecretKey::generate().public().to_string(),
         RouteMode::PrivateRelay,
     )
@@ -792,10 +966,10 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
 
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::RevokeTarget {
-            role_id: role.role_id,
-            target_id: target.target_id,
+            role_id: role.role_id.clone(),
+            target_id: target.target_id.clone(),
             permission: TargetPermission::SshConnect,
         },
     )
@@ -804,19 +978,19 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
-            AdminOperation::ListRoleGrants { role_id: role.role_id },
+            &admin_tokens,
+            AdminOperation::ListRoleGrants { role_id: role.role_id.clone() },
         )
         .await
         .expect("list role grants after revoke"),
         AdminResponse::Grants(grants) if grants.is_empty()
     ));
-    let visible_targets = admin::targets(State(state.clone()), bearer(&user_tokens.access_token))
+    let visible_targets = admin::targets(State(state.clone()), bearer(&user_tokens))
         .await
         .expect("list targets after revoke")
         .0;
     assert!(visible_targets.is_empty());
-    let new_session_user = authenticate(state, &bearer(&user_tokens.access_token))
+    let new_session_user = authenticate(state, &bearer(&user_tokens))
         .await
         .expect("auth session remains valid after grant change");
     assert_eq!(
@@ -825,7 +999,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
             new_session_user,
             &user_client_sender,
             Uuid::new_v4(),
-            target.target_id,
+            &target.target_id.clone(),
             iroh::SecretKey::generate().public().to_string(),
             RouteMode::PrivateRelay,
         )
@@ -840,9 +1014,9 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
 
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::SetUserEnabled {
-            user_id: user.user_id,
+            user_id: user.user_id.clone(),
             enabled: false,
         },
     )
@@ -859,9 +1033,9 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     );
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::SetUserEnabled {
-            user_id: user.user_id,
+            user_id: user.user_id.clone(),
             enabled: true,
         },
     )
@@ -873,9 +1047,9 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
 
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::SetUserRoles {
-            user_id: user.user_id,
+            user_id: user.user_id.clone(),
             role_ids: Vec::new(),
         },
     )
@@ -883,18 +1057,18 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     .expect("clear user roles");
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::DeleteRole {
-            role_id: role.role_id,
+            role_id: role.role_id.clone(),
         },
     )
     .await
     .expect("delete role");
     admin_request(
         state,
-        &admin_tokens.access_token,
+        &admin_tokens,
         AdminOperation::DeleteTarget {
-            target_id: target.target_id,
+            target_id: target.target_id.clone(),
         },
     )
     .await
@@ -902,7 +1076,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     assert!(matches!(
         admin_request(
             state,
-            &admin_tokens.access_token,
+            &admin_tokens,
             AdminOperation::ListTargets,
         )
         .await

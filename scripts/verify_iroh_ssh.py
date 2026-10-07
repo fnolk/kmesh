@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -30,8 +31,17 @@ SSH_NEW_CONNECTION_TIMEOUT_SECONDS = SSH_CONNECT_TIMEOUT_SECONDS + COMMAND_TIMEO
 PATH_EVENT = re.compile(r"连接路径(切换)?：(P2P 直连|Iroh 中继) \(([^)]+)\)")
 
 
+def server_namespace(server_url: str) -> str:
+    digest = hashlib.sha256(server_url.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
 class VerificationError(RuntimeError):
     pass
+
+
+def normalize_id(value: str) -> str:
+    return value.strip().translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"))
 
 
 class Verification:
@@ -337,9 +347,9 @@ class Verification:
             raise VerificationError("SSH config ProxyCommand must resolve through the kmesh CLI name")
         self.proxy_command = proxy
         self.host_key_alias = fields.get("hostkeyalias", "")
-        expected_alias = f"kmesh/{self.args.target_id}"
+        expected_alias = f"kmesh/{server_namespace(self.args.server_url)}/{self.args.target_id}"
         if self.host_key_alias != expected_alias:
-            raise VerificationError("SSH HostKeyAlias does not match the supplied target UUID")
+            raise VerificationError("SSH HostKeyAlias does not match the supplied target ID")
         known_hosts_candidates = shlex.split(fields.get("userknownhostsfile", ""))
         self.known_hosts = next(
             (Path(value).expanduser() for value in known_hosts_candidates if Path(value).expanduser().is_file()),
@@ -992,8 +1002,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ssh-config", required=True, type=Path)
     parser.add_argument("--alias", required=True)
     parser.add_argument("--admin-config", required=True, type=Path)
-    parser.add_argument("--role-id", required=True, type=uuid.UUID)
-    parser.add_argument("--target-id", required=True, type=uuid.UUID)
+    parser.add_argument("--role-id", required=True, type=normalize_id)
+    parser.add_argument("--target-id", required=True, type=normalize_id)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--mode", choices=("private", "public-direct"), required=True)
     args = parser.parse_args()
@@ -1021,6 +1031,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("verification deployment state is invalid")
     if not deployment.get("artifact_revision") or not deployment.get("server_agent_binary_sha256"):
         parser.error("deployment state must identify the active source and server/agent artifact SHA-256")
+    if not isinstance(deployment.get("server_url"), str) or not deployment["server_url"]:
+        parser.error("deployment state must contain the active server URL")
+    args.server_url = deployment["server_url"]
     if shutil.which("ssh") is None or shutil.which("ssh-keygen") is None:
         parser.error("OpenSSH ssh and ssh-keygen are required")
     return args

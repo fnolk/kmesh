@@ -12,22 +12,22 @@ use rustyline::{
 };
 
 use crate::protocol::{
-    AdminOperation, AdminRequest, AdminResponse, ApiTokenView, RoleGrantView, TargetView,
-    UserKeyView, UserView,
+    AdminOperation, AdminRequest, AdminResponse, ApiTokenView, RelayEndpointSide,
+    RelaySessionPhase, RelayTrafficView, RoleGrantView, TargetView, UserKeyView, UserView,
 };
 
 use super::{
     ClientContext, auth,
     cli::{
-        AdminArgs, AdminCommand, ApiTokenAction, GrantAction, KeyAction, RoleAction, TargetAction,
-        UserAction,
+        AdminArgs, AdminCommand, ApiTokenAction, GrantAction, KeyAction, RelayAction, RoleAction,
+        TargetAction, UserAction,
     },
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "admin",
-    about = "Manage users, SSH keys, roles, grants, and targets",
+    about = "Manage users, SSH keys, roles, grants, targets, and relay traffic",
     disable_help_subcommand = true
 )]
 struct AdminLine {
@@ -87,7 +87,7 @@ async fn repl(context: &ClientContext) -> Result<()> {
 }
 
 async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> Result<()> {
-    let operation = match command {
+    let mut operation = match command {
         AdminCommand::Users { action } => match action {
             UserAction::List => AdminOperation::ListUsers,
             UserAction::Create { username } => AdminOperation::CreateUser { username },
@@ -105,9 +105,15 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
             UserAction::ShowRoles { user_id } => AdminOperation::ListUserRoles { user_id },
         },
         AdminCommand::Tokens { action } => match action {
-            ApiTokenAction::Create { user_id, label } => {
-                AdminOperation::CreateApiToken { user_id, label }
-            }
+            ApiTokenAction::Create {
+                user_id,
+                label,
+                expires_in,
+            } => AdminOperation::CreateApiToken {
+                user_id,
+                label,
+                expires_in_secs: expires_in,
+            },
             ApiTokenAction::List { user_id } => AdminOperation::ListApiTokens { user_id },
             ApiTokenAction::Revoke { token_id } => AdminOperation::RevokeApiToken { token_id },
         },
@@ -171,7 +177,46 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
                 AdminOperation::IssueEnrollment { target_id }
             }
         },
+        AdminCommand::Relay { action } => match action {
+            RelayAction::List => AdminOperation::ListRelayTraffic,
+            RelayAction::Close { session_id } => AdminOperation::CloseRelaySession { session_id },
+        },
     };
+    match &mut operation {
+        AdminOperation::SetUserEnabled { user_id, .. }
+        | AdminOperation::CreateApiToken { user_id, .. }
+        | AdminOperation::ListApiTokens { user_id }
+        | AdminOperation::AddUserKey { user_id, .. }
+        | AdminOperation::ListKeys { user_id }
+        | AdminOperation::ListUserRoles { user_id } => {
+            *user_id = user_id.trim().to_ascii_lowercase();
+        }
+        AdminOperation::SetUserRoles { user_id, role_ids } => {
+            *user_id = user_id.trim().to_ascii_lowercase();
+            for role_id in role_ids {
+                *role_id = role_id.trim().to_ascii_lowercase();
+            }
+        }
+        AdminOperation::DeleteRole { role_id } | AdminOperation::ListRoleGrants { role_id } => {
+            *role_id = role_id.trim().to_ascii_lowercase();
+        }
+        AdminOperation::GrantTarget {
+            role_id, target_id, ..
+        }
+        | AdminOperation::RevokeTarget {
+            role_id, target_id, ..
+        } => {
+            *role_id = role_id.trim().to_ascii_lowercase();
+            *target_id = target_id.trim().to_ascii_lowercase();
+        }
+        AdminOperation::RenameTarget { target_id, .. }
+        | AdminOperation::SetTargetEnabled { target_id, .. }
+        | AdminOperation::DeleteTarget { target_id }
+        | AdminOperation::IssueEnrollment { target_id } => {
+            *target_id = target_id.trim().to_ascii_lowercase();
+        }
+        _ => {}
+    }
     let token = auth::valid_access_token(context).await?;
     let response = context
         .api
@@ -188,9 +233,16 @@ fn print_response(response: &AdminResponse, json: bool) -> Result<()> {
     match response {
         AdminResponse::Ok => println!("操作完成。"),
         AdminResponse::Users(users) => print_users(users),
+        AdminResponse::RelayTraffic(traffic) => print_relay_traffic(traffic),
+        AdminResponse::RelaySessionClosed {
+            session_id,
+            disconnected_relay_connections,
+        } => println!(
+            "已关闭 relay SSH session {session_id}，断开 {disconnected_relay_connections} 条 relay endpoint 连接。"
+        ),
         AdminResponse::ApiTokenIssued { api_token, token } => {
             println!(
-                "API token for user {} ({}) — save it now; it is shown once:\n{token}",
+                "API JWT for user {} ({}) — save it now; it is shown once:\n{token}",
                 api_token.user_id, api_token.label
             );
         }
@@ -238,10 +290,14 @@ fn print_api_tokens(tokens: &[ApiTokenView]) {
     println!("API token list:");
     for token in tokens {
         println!(
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             token.token_id,
             token.user_id,
             token.label,
+            token.expires_at.map_or_else(
+                || "never expires".to_owned(),
+                |expires_at| { format!("expires at {expires_at}") }
+            ),
             if token.revoked_at.is_some() {
                 "revoked"
             } else {
@@ -253,11 +309,68 @@ fn print_api_tokens(tokens: &[ApiTokenView]) {
 
 fn print_user(user: &UserView) {
     println!(
-        "{}\t{}\t{}",
+        "{}\t{}",
         user.user_id,
-        user.username,
         if user.enabled { "enabled" } else { "disabled" }
     );
+}
+
+fn print_relay_traffic(traffic: &RelayTrafficView) {
+    if !traffic.enabled {
+        println!("Private relay 未启用，当前没有可查询的 relay 流量。");
+        return;
+    }
+    println!(
+        "Relay payload 流量（{} ms 窗口）：ingress {} B ({:.1} B/s)，egress {} B ({:.1} B/s)",
+        traffic.sample_duration_ms,
+        traffic.bytes_received,
+        traffic.bytes_received_per_second,
+        traffic.bytes_sent,
+        traffic.bytes_sent_per_second,
+    );
+    println!(
+        "Relay endpoint 连接 {} 条；映射到 SSH session {} 个。",
+        traffic.relay_connection_count, traffic.ssh_session_count
+    );
+    for connection in &traffic.connections {
+        match &connection.metadata {
+            Some(metadata) => {
+                let side = match metadata.endpoint_side {
+                    RelayEndpointSide::Client => "client",
+                    RelayEndpointSide::Target => "target",
+                };
+                let phase = match metadata.session_phase {
+                    RelaySessionPhase::Pending => "pending",
+                    RelaySessionPhase::Active => "active",
+                    RelaySessionPhase::Closed => "closed",
+                };
+                println!(
+                    "endpoint {} connection {} {side} session={} phase={} user={} target={} active={} ingress={} B ({:.1} B/s) egress={} B ({:.1} B/s)",
+                    connection.endpoint_id,
+                    connection.connection_id,
+                    metadata.session_id,
+                    phase,
+                    metadata.username,
+                    metadata.target_name,
+                    connection.active,
+                    connection.bytes_received,
+                    connection.bytes_received_per_second,
+                    connection.bytes_sent,
+                    connection.bytes_sent_per_second,
+                );
+            }
+            None => println!(
+                "endpoint {} connection {} unknown (unmapped) active={} ingress={} B ({:.1} B/s) egress={} B ({:.1} B/s)",
+                connection.endpoint_id,
+                connection.connection_id,
+                connection.active,
+                connection.bytes_received,
+                connection.bytes_received_per_second,
+                connection.bytes_sent,
+                connection.bytes_sent_per_second,
+            ),
+        }
+    }
 }
 
 fn print_keys(keys: &[UserKeyView]) {
@@ -307,7 +420,7 @@ fn print_help() {
     let _ = command.write_help(&mut help);
     println!("管理命令：\n{}", String::from_utf8_lossy(&help));
     println!(
-        "输入 users / tokens / keys / roles / grants / targets 后按 Tab 补全，输入 exit 退出。"
+        "输入 users / tokens / keys / roles / grants / targets / relay 后按 Tab 补全，输入 exit 退出。"
     );
 }
 
@@ -343,7 +456,7 @@ impl Completer for AdminHelper {
         let words = prefix_line[..start].split_whitespace().collect::<Vec<_>>();
         let options: &[&str] = match words.as_slice() {
             [] => &[
-                "users", "tokens", "keys", "roles", "grants", "targets", "help", "exit",
+                "users", "tokens", "keys", "roles", "grants", "targets", "relay", "help", "exit",
             ],
             ["users"] => &["list", "create", "disable", "enable", "roles", "show-roles"],
             ["tokens"] => &["create", "list", "revoke"],
@@ -359,6 +472,7 @@ impl Completer for AdminHelper {
                 "delete",
                 "issue-enrollment",
             ],
+            ["relay"] => &["list", "close"],
             _ => &[],
         };
         Ok((
@@ -381,10 +495,22 @@ mod tests {
 
     #[test]
     fn admin_parser_accepts_one_shot_json_operations_and_help_lists_groups() {
-        let user_id = uuid::Uuid::new_v4().to_string();
-        let parsed =
-            AdminLine::try_parse_from(["admin", "--json", "users", "disable", user_id.as_str()])
-                .expect("parse one-shot JSON admin operation");
+        let top_level =
+            crate::client::Cli::try_parse_from(["kmesh", "admin", "--json", "relay", "list"])
+                .expect("parse one-shot relay JSON operation");
+        assert!(matches!(
+            top_level.command,
+            crate::client::Command::Admin(AdminArgs {
+                json: true,
+                command: Some(AdminCommand::Relay {
+                    action: RelayAction::List
+                })
+            })
+        ));
+
+        let user_id = "alice";
+        let parsed = AdminLine::try_parse_from(["admin", "--json", "users", "disable", user_id])
+            .expect("parse one-shot JSON admin operation");
         assert!(parsed.json);
         assert!(matches!(
             parsed.command,
@@ -393,8 +519,26 @@ mod tests {
             })
         ));
 
+        let session_id = uuid::Uuid::new_v4();
+        let parsed = AdminLine::try_parse_from([
+            "admin",
+            "--json",
+            "relay",
+            "close",
+            &session_id.to_string(),
+        ])
+        .expect("parse relay close operation");
+        assert!(matches!(
+            parsed.command,
+            Some(AdminCommand::Relay {
+                action: RelayAction::Close { session_id: id }
+            }) if id == session_id
+        ));
+
         let help = AdminLine::command().render_help().to_string();
-        for group in ["users", "tokens", "keys", "roles", "grants", "targets"] {
+        for group in [
+            "users", "tokens", "keys", "roles", "grants", "targets", "relay",
+        ] {
             assert!(help.contains(group), "admin help lists {group}");
         }
     }
@@ -413,6 +557,7 @@ mod tests {
             ("roles ", "delete"),
             ("grants ", "remove"),
             ("targets ", "issue-enrollment"),
+            ("relay ", "close"),
         ] {
             let (_, candidates) = helper
                 .complete(line, line.len(), &context)

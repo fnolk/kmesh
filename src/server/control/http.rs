@@ -4,12 +4,11 @@ use axum::{
     response::Response,
 };
 use sqlx::Row;
-use uuid::Uuid;
 
 use super::super::{
     ServerState,
     auth::{authenticate, bearer_token},
-    db::{row_uuid, unix_time},
+    db::unix_time,
     error::ApiError,
 };
 use super::MAX_CONTROL_MESSAGE;
@@ -33,6 +32,7 @@ pub(in crate::server) async fn enroll(
         .parse::<iroh::EndpointId>()
         .map_err(|_| ApiError::bad_request("agent EndpointId is invalid"))?
         .to_string();
+    let target_id = super::super::admin::normalize_target_id(&request.target_id)?;
     let token_hash = super::super::hash_secret(&request.enrollment_token);
     let now = unix_time();
     let agent_token = super::super::new_secret();
@@ -41,7 +41,7 @@ pub(in crate::server) async fn enroll(
     let target = sqlx::query(
         "SELECT enrollment_token_hash, enrollment_expires_at, enabled, deleted_at FROM targets WHERE id = ?1",
     )
-    .bind(request.target_id.to_string())
+    .bind(&target_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(ApiError::unauthorized)?;
@@ -64,7 +64,7 @@ pub(in crate::server) async fn enroll(
     .bind(agent_token_hash)
     .bind(&endpoint_id)
     .bind(now)
-    .bind(request.target_id.to_string())
+    .bind(&target_id)
     .bind(token_hash)
     .execute(&mut *tx)
     .await?;
@@ -73,7 +73,7 @@ pub(in crate::server) async fn enroll(
     }
     tx.commit().await?;
     Ok(axum::Json(AgentEnrollmentResponse {
-        target_id: request.target_id,
+        target_id,
         agent_token,
         ticket_public_key_pem: state.inner.keys.tunnel_ticket.public_key_pem.clone(),
     }))
@@ -119,7 +119,7 @@ fn client_version_mismatch(headers: &HeaderMap) -> Option<String> {
 pub(in crate::server) async fn authenticate_agent(
     state: &ServerState,
     headers: &HeaderMap,
-) -> Result<Uuid, ApiError> {
+) -> Result<String, ApiError> {
     let hash = super::super::hash_secret(bearer_token(headers)?);
     let row = sqlx::query(
         "SELECT id FROM targets WHERE agent_token_hash = ?1 AND enabled = 1 AND deleted_at IS NULL",
@@ -128,5 +128,5 @@ pub(in crate::server) async fn authenticate_agent(
     .fetch_optional(&state.inner.db.pool)
     .await?
     .ok_or_else(ApiError::unauthorized)?;
-    row_uuid(&row, "id").map_err(ApiError::from)
+    row.try_get("id").map_err(ApiError::from)
 }

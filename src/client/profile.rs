@@ -14,11 +14,23 @@ use uuid::Uuid;
 use crate::protocol::{AgentCredentials, LoginTokens};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "credential", rename_all = "snake_case")]
+pub enum SavedCredential {
+    ApiToken {
+        token: String,
+        expires_at: Option<u64>,
+    },
+    PublicKeySession {
+        tokens: LoginTokens,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedLogin {
     pub server_url: String,
     pub profile: String,
     pub username: String,
-    pub tokens: LoginTokens,
+    pub credential: SavedCredential,
 }
 
 #[derive(Clone, Debug)]
@@ -137,19 +149,38 @@ impl ProfileStore {
     }
 }
 
-pub fn agent_credentials_path(data_dir: &Path, target_id: Uuid) -> PathBuf {
-    data_dir.join("agents").join(format!("{target_id}.json"))
+pub fn agent_credentials_path(data_dir: &Path, server_origin: &str, target_id: &str) -> PathBuf {
+    data_dir
+        .join("agents")
+        .join(component_hash(server_origin))
+        .join(format!("{}.json", component_hash(target_id)))
 }
 
-pub fn load_agent_credentials(data_dir: &Path, target_id: Uuid) -> Result<AgentCredentials> {
-    read_json(&agent_credentials_path(data_dir, target_id))?
+pub fn ensure_agent_credentials_dir(data_dir: &Path, server_origin: &str) -> Result<()> {
+    ensure_private_dir(data_dir)?;
+    let agents_dir = data_dir.join("agents");
+    ensure_private_dir(&agents_dir)?;
+    let origin_dir = agents_dir.join(component_hash(server_origin));
+    ensure_private_dir(&origin_dir)
+}
+
+pub fn load_agent_credentials(
+    data_dir: &Path,
+    server_origin: &str,
+    target_id: &str,
+) -> Result<AgentCredentials> {
+    read_json(&agent_credentials_path(data_dir, server_origin, target_id))?
         .context("target agent has not been enrolled")
 }
 
-pub fn save_agent_credentials(data_dir: &Path, credentials: &AgentCredentials) -> Result<()> {
-    ensure_private_dir(data_dir)?;
+pub fn save_agent_credentials(
+    data_dir: &Path,
+    server_origin: &str,
+    credentials: &AgentCredentials,
+) -> Result<()> {
+    ensure_agent_credentials_dir(data_dir, server_origin)?;
     write_json_atomic(
-        &agent_credentials_path(data_dir, credentials.target_id),
+        &agent_credentials_path(data_dir, server_origin, &credentials.target_id),
         credentials,
     )
 }
@@ -200,7 +231,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn component_hash(value: &str) -> String {
+pub(super) fn component_hash(value: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
 }
 
@@ -245,11 +276,13 @@ mod tests {
             server_url: "https://one.example:9443".to_owned(),
             profile: "work".to_owned(),
             username: "Alice".to_owned(),
-            tokens: LoginTokens {
-                access_token: "access-test".to_owned(),
-                refresh_token: "refresh-test".to_owned(),
-                access_expires_at: 100,
-                refresh_expires_at: 200,
+            credential: SavedCredential::PublicKeySession {
+                tokens: LoginTokens {
+                    access_token: "access-test".to_owned(),
+                    refresh_token: "refresh-test".to_owned(),
+                    access_expires_at: 100,
+                    refresh_expires_at: 200,
+                },
             },
         };
         alice.save(&saved).expect("save login atomically");
@@ -260,17 +293,43 @@ mod tests {
         let lock = alice.lock_refresh().expect("open private refresh lock");
         drop(lock);
 
-        let target_id = Uuid::new_v4();
+        let server_one = "https://one.example:9443";
+        let server_two = "https://two.example:9443";
+        let target_id = "con";
         save_agent_credentials(
             &root,
+            server_one,
             &AgentCredentials {
-                target_id,
-                agent_token: "agent-test".to_owned(),
+                target_id: target_id.to_owned(),
+                agent_token: "agent-one".to_owned(),
                 ticket_public_key_pem: "ticket-test".to_owned(),
                 endpoint_secret_key: "device-test".to_owned(),
             },
         )
         .expect("save target credentials atomically");
+        save_agent_credentials(
+            &root,
+            server_two,
+            &AgentCredentials {
+                target_id: target_id.to_owned(),
+                agent_token: "agent-two".to_owned(),
+                ticket_public_key_pem: "ticket-test".to_owned(),
+                endpoint_secret_key: "device-test".to_owned(),
+            },
+        )
+        .expect("save same target ID for another server");
+        assert_eq!(
+            load_agent_credentials(&root, server_one, target_id)
+                .expect("load target credentials from hashed path")
+                .agent_token,
+            "agent-one"
+        );
+        assert_eq!(
+            load_agent_credentials(&root, server_two, target_id)
+                .expect("load target credentials from second server")
+                .agent_token,
+            "agent-two"
+        );
 
         #[cfg(unix)]
         {
@@ -279,9 +338,14 @@ mod tests {
             assert_eq!(file_mode(&alice.login_path("alice")), 0o600);
             assert_eq!(file_mode(&alice.active_user_path()), 0o600);
             assert_eq!(file_mode(&alice.lock_path()), 0o600);
-            assert_eq!(file_mode(&agent_credentials_path(&root, target_id)), 0o600);
+            let credential_path = agent_credentials_path(&root, server_one, target_id);
+            let other_server_credential_path = agent_credentials_path(&root, server_two, target_id);
+            assert_ne!(credential_path.file_name().unwrap(), "con.json");
+            assert_ne!(credential_path, other_server_credential_path);
+            assert_eq!(file_mode(&credential_path), 0o600);
             assert_eq!(file_mode(&root), 0o700);
             assert_eq!(file_mode(&root.join("agents")), 0o700);
+            assert_eq!(file_mode(credential_path.parent().unwrap()), 0o700);
             assert_eq!(
                 file_mode(alice.login_path("alice").parent().unwrap()),
                 0o700

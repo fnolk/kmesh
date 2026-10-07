@@ -183,10 +183,7 @@ impl CaTlsConfig {
     }
 
     /// Sets the resolver used when a TLS server requests client authentication.
-    pub fn with_client_cert_resolver(
-        mut self,
-        resolver: Arc<dyn ResolvesClientCert>,
-    ) -> Self {
+    pub fn with_client_cert_resolver(mut self, resolver: Arc<dyn ResolvesClientCert>) -> Self {
         self.client_auth = Some(resolver);
         self
     }

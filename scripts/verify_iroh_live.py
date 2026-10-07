@@ -487,7 +487,7 @@ def print_plan(args: argparse.Namespace) -> None:
         "refresh-binary": [
             "stop only the current new target agent and the active new server mode",
             "atomically install the verified binary on both new hosts and restart in the same mode",
-            "reuse the schema 4 database, target UUID, and persistent agent identity",
+            "reuse the schema 5 database, readable target ID, and persistent agent identity",
         ],
         "deploy": [
             "stop the old target agent, then the old public server to release TCP 9443 and UDP 3478",
@@ -1275,6 +1275,7 @@ def deploy(harness: Harness) -> None:
         label="grant-ssh-connect",
     )
     state = {
+        "server_url": args.issuer,
         "target_id": target_id,
         "target_name": target_name,
         "user_id": user_id,
@@ -1354,7 +1355,10 @@ def fetch_target_host_key(harness: Harness, state: dict[str, Any]) -> tuple[str,
     if len(parts) < 2 or parts[0] != "ssh-ed25519":
         raise VerificationError("target returned no Ed25519 sshd host public key")
     base64.b64decode(parts[1], validate=True)
-    host_alias = f"kmesh/{state['target_id']}"
+    namespace = base64.urlsafe_b64encode(
+        hashlib.sha256(state["server_url"].encode("utf-8")).digest()
+    ).decode("ascii").rstrip("=")
+    host_alias = f"kmesh/{namespace}/{state['target_id']}"
     return host_alias, f"{host_alias} {parts[0]} {parts[1]}\n"
 
 
