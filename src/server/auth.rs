@@ -1,6 +1,3 @@
-use anyhow::Context;
-use argon2::Argon2;
-use argon2::password_hash::{PasswordHasher, SaltString};
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -9,18 +6,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sqlx::Row;
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::identity::{self, USER_TOKEN_AUDIENCE};
 use crate::protocol::{
-    AccessTokenClaims, LoginTokens, PasswordLoginRequest, PublicKeyChallenge,
-    PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest,
+    AccessTokenClaims, LoginTokens, PublicKeyChallenge, PublicKeyChallengeRequest,
+    PublicKeyLoginRequest, RefreshRequest, TokenLoginRequest,
 };
 use ssh_key::{HashAlg, PublicKey, SshSig};
 
-use super::db::{password_matches, row_uuid, unix_time};
+use super::db::{row_uuid, unix_time};
 use super::error::ApiError;
 use super::{ServerState, hash_secret, new_secret};
 
@@ -28,7 +23,6 @@ const ACCESS_TOKEN_TTL_SECS: i64 = 15 * 60;
 const REFRESH_TOKEN_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 const SSH_CHALLENGE_TTL_SECS: i64 = 60;
 const SSH_LOGIN_NAMESPACE: &str = "kmesh-login";
-static ARGON2_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 const AUTH_LIMIT_WINDOW_SECS: i64 = 60;
 const AUTH_LIMIT_PER_IP: usize = 20;
 const AUTH_LIMIT_IP_CAPACITY: usize = 4096;
@@ -72,33 +66,49 @@ pub(crate) struct AuthenticatedUser {
     pub access_expires_at: i64,
 }
 
-pub(crate) async fn password_login(
+pub(crate) async fn token_login(
     State(state): State<ServerState>,
     axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    Json(request): Json<PasswordLoginRequest>,
+    Json(request): Json<TokenLoginRequest>,
 ) -> Result<Json<LoginTokens>, ApiError> {
     state.inner.auth_rate_limiter.check(remote.ip()).await?;
-    validate_password(&request.password)?;
-    let username = normalize_username(&request.username)?;
-    let row = sqlx::query("SELECT id, password_hash, enabled FROM users WHERE username = ?1")
-        .bind(&username)
-        .fetch_optional(&state.inner.db.pool)
-        .await?;
-    let Some(row) = row else {
-        burn_password_work_limited(request.password)
-            .await
-            .map_err(ApiError::from)?;
-        return Err(ApiError::unauthorized());
-    };
-    let user_id = row_uuid(&row, "id")?;
-    let password_encoded: String = row.try_get("password_hash")?;
-    let enabled: i64 = row.try_get("enabled")?;
-    if enabled != 1 || !password_matches_limited(request.password, password_encoded).await? {
+    if request.token.is_empty() || request.token.len() > 256 {
         return Err(ApiError::unauthorized());
     }
-    issue_login_tokens(&state, user_id, "password")
+    let token_hash = hash_secret(&request.token);
+    let now = unix_time();
+    let mut tx = state
+        .inner
+        .db
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
         .await
-        .map(Json)
+        .map_err(ApiError::from)?;
+    let row = sqlx::query(
+        "SELECT t.id AS token_id, t.user_id FROM api_tokens t \
+         JOIN users u ON u.id = t.user_id \
+         WHERE t.token_hash = ?1 AND t.revoked_at IS NULL AND u.enabled = 1",
+    )
+    .bind(token_hash)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::from)?
+    .ok_or_else(ApiError::unauthorized)?;
+    let token_id = row_uuid(&row, "token_id").map_err(ApiError::from)?;
+    let user_id = row_uuid(&row, "user_id").map_err(ApiError::from)?;
+    let issued = tokens_for_new_session(&state, user_id)?;
+    insert_auth_session(
+        &mut tx,
+        user_id,
+        "api_token",
+        Some(token_id),
+        issued.session_id,
+        &issued.tokens,
+        now,
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::from)?;
+    Ok(Json(issued.tokens))
 }
 
 pub(crate) async fn public_key_challenge(
@@ -246,6 +256,7 @@ pub(crate) async fn public_key_login(
         &mut tx,
         user_id,
         "ssh_key",
+        None,
         issued.session_id,
         &issued.tokens,
         unix_time(),
@@ -437,34 +448,6 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
         .ok_or_else(ApiError::unauthorized)
 }
 
-async fn issue_login_tokens(
-    state: &ServerState,
-    user_id: Uuid,
-    auth_method: &str,
-) -> Result<LoginTokens, ApiError> {
-    let now = unix_time();
-    let issued = tokens_for_new_session(state, user_id)?;
-    let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
-    let enabled = sqlx::query_scalar::<_, i64>("SELECT enabled FROM users WHERE id = ?1")
-        .bind(user_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
-    if enabled != Some(1) {
-        return Err(ApiError::unauthorized());
-    }
-    insert_auth_session(
-        &mut tx,
-        user_id,
-        auth_method,
-        issued.session_id,
-        &issued.tokens,
-        now,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(issued.tokens)
-}
-
 struct IssuedTokens {
     session_id: Uuid,
     tokens: LoginTokens,
@@ -502,17 +485,19 @@ async fn insert_auth_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     user_id: Uuid,
     auth_method: &str,
+    api_token_id: Option<Uuid>,
     session_id: Uuid,
     tokens: &LoginTokens,
     now: i64,
 ) -> Result<(), ApiError> {
     let refresh_hash = hash_secret(&tokens.refresh_token);
     sqlx::query(
-        "INSERT INTO auth_sessions(id, user_id, auth_method, created_at, access_expires_at, refresh_expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO auth_sessions(id, user_id, api_token_id, auth_method, created_at, access_expires_at, refresh_expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(session_id.to_string())
     .bind(user_id.to_string())
+    .bind(api_token_id.map(|id| id.to_string()))
     .bind(auth_method)
     .bind(now)
     .bind(tokens.access_expires_at as i64)
@@ -542,13 +527,6 @@ pub(crate) fn normalize_username(username: &str) -> Result<String, ApiError> {
         ));
     }
     Ok(username.to_ascii_lowercase())
-}
-
-pub(crate) fn validate_password(password: &str) -> Result<(), ApiError> {
-    if password.is_empty() || password.len() > 1024 {
-        return Err(ApiError::bad_request("password length is invalid"));
-    }
-    Ok(())
 }
 
 pub(crate) fn canonical_ssh_key(value: &str) -> Result<String, ApiError> {
@@ -586,55 +564,6 @@ pub(crate) fn ssh_fingerprint(public_key: &str) -> Result<String, ApiError> {
     Ok(key.fingerprint(HashAlg::Sha256).to_string())
 }
 
-pub(crate) async fn password_hash_limited(password: String) -> anyhow::Result<String> {
-    let permit = argon2_permit().await?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let salt_bytes = rand::random::<[u8; 16]>();
-        let salt = SaltString::encode_b64(&salt_bytes)
-            .map_err(|_| anyhow::anyhow!("encode Argon2 salt"))?;
-        Ok(Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|_| anyhow::anyhow!("hash password with Argon2id"))?
-            .to_string())
-    })
-    .await
-    .context("join Argon2 password hashing task")?
-}
-
-async fn password_matches_limited(
-    password: String,
-    encoded_hash: String,
-) -> Result<bool, ApiError> {
-    let permit = argon2_permit().await.map_err(ApiError::from)?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        password_matches(&password, &encoded_hash)
-    })
-    .await
-    .map_err(ApiError::internal)
-}
-
-async fn burn_password_work_limited(password: String) -> anyhow::Result<()> {
-    let permit = argon2_permit().await?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        burn_password_work(&password);
-    })
-    .await
-    .context("join Argon2 password work task")?;
-    Ok(())
-}
-
-async fn argon2_permit() -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
-    ARGON2_SEMAPHORE
-        .get_or_init(|| Arc::new(Semaphore::new(4)))
-        .clone()
-        .acquire_owned()
-        .await
-        .context("Argon2 worker pool closed")
-}
-
 fn ssh_challenge_payload(
     issuer: &str,
     username: &str,
@@ -660,9 +589,3 @@ fn append_field(payload: &mut Vec<u8>, value: &[u8]) {
 
 #[cfg(test)]
 mod tests;
-
-fn burn_password_work(password: &str) {
-    use argon2::password_hash::SaltString;
-    let salt = SaltString::encode_b64(b"0123456789abcdef").expect("constant salt is valid");
-    let _ = Argon2::default().hash_password(password.as_bytes(), &salt);
-}

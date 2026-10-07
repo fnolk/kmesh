@@ -30,7 +30,7 @@ Copy [`config.example.toml`](config.example.toml) to `~/.kmesh/config.toml` and 
 kmesh server init --admin admin
 ```
 
-The command prompts for the initial admin password. Start the service with a certificate whose SAN covers the public server name:
+The first initialization prints the initial administrator API token once. Store it in `KMESH_TOKEN` or in the local `[auth] token` setting. Start the service with a certificate whose SAN covers the public server name:
 
 ```sh
 kmesh server run
@@ -38,29 +38,41 @@ kmesh server run
 
 For a server deployment, set `data_dir` to its persistent state location and set `server.tls_cert` and `server.tls_key` in the config. `server.bind_addr` controls both listener IPs. `server_port` controls HTTPS and `server.udp_port` controls QAD; the server publishes the actual QAD UDP port through `/v1/transport` for clients and agents. The UDP setting applies on the server. Clients and agents use the port advertised by the server.
 
-For automation, `--password-stdin` reads a password from piped stdin without echoing it or placing it in process arguments. The same option is available for password login and admin user creation/password reset; user creation and reset read two matching lines.
-
 The deployment used for the current acceptance work listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for QAD. Direct peer paths also need outbound UDP between client and target. When UDP direct paths fail, the last route uses the private relay over the same HTTPS origin; HTTPS control remains required in every route. Official relay services provide QAD for `PublicDirect` and never carry its SSH stream. In public-direct-only mode, set `server.disable_private_relay = true` or pass `--disable-private-relay`; the server then omits its private relay URL from `GET /v1/transport`.
 
-The current schema expects a fresh kmesh database. It does not migrate databases from the earlier STUN/Quinn/WSS-data implementation. Keep the old data directory as a backup and initialize the Iroh version with a separate, empty `data_dir`.
+Schema v4 stores API-token credentials and requires a fresh data directory. It does not migrate schema v3 or earlier databases, including the previous STUN/Quinn/WSS-data implementation. Keep existing data as a backup and initialize v4 with a separate, empty `data_dir`.
 
 ## Configure a target and access
 
 On an administrator workstation, log in and create the target, user, role, and grant. The target ID is stable; its name becomes the OpenSSH alias.
 
 ```sh
-kmesh login --method password --username admin
+kmesh login --method token
 kmesh admin targets create build-machine
 kmesh admin users create alice
+kmesh admin tokens create <alice-user-id> --label laptop
 kmesh admin roles create engineers
 kmesh admin users roles <alice-user-id> <engineers-role-id>
 kmesh admin grants add <engineers-role-id> <target-id>
 ```
 
-Commands that create or reset a password read it through a hidden prompt. Start the interactive shell with the same server origin:
+API tokens created by `server init` and `admin tokens create` are shown once. With `KMESH_TOKEN` set, run `kmesh login --method token`; when `[auth].method = "token"` is in the config, you can run `kmesh login`. A command-line `--token` takes priority over `KMESH_TOKEN`, which takes priority over `[auth].token`. The login exchanges the long-lived API token for the normal locally stored session tokens. Start the interactive shell with the same server origin:
+
+```toml
+[auth]
+method = "token"
+token = "kmesh_your_api_token"
+```
 
 ```sh
 kmesh admin
+```
+
+List a user's issued tokens when auditing them, and revoke a token when it should stop authenticating:
+
+```sh
+kmesh admin tokens list <user-id>
+kmesh admin tokens revoke <token-id>
 ```
 
 Inside the shell, `help` and Tab completion are available. One-shot admin commands accept `--json` for machine-readable output. Use `--server-addr` and `--server-port` to override the configured server for one command.
@@ -74,6 +86,17 @@ kmesh login \
 ```
 
 The challenge signature binds the server-provided payload and uses the `kmesh-login` namespace. kmesh sends the public key and signature; the private key stays with OpenSSH or ssh-agent.
+
+Set `[auth] method = "public-key"`, `username`, and `key` in `~/.kmesh/config.toml` to omit those options from future logins:
+
+```toml
+[auth]
+method = "public-key"
+username = "alice"
+key = "~/.ssh/id_ed25519"
+```
+
+Login settings from CLI options override TOML. A login requires an explicit method so kmesh never guesses between token and public-key authentication.
 
 On the target machine, enroll its persistent device identity and start the agent:
 
@@ -94,7 +117,7 @@ The client and agent config contains the server address plus local SSH/TLS setti
 On the client, log in and write an OpenSSH host block:
 
 ```sh
-kmesh login --method password --username alice
+kmesh login --method token
 kmesh ssh-config build-machine >> ~/.ssh/config
 ssh build-machine
 ```

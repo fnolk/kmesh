@@ -8,11 +8,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rpassword::prompt_password;
 
 use crate::protocol::{
-    LoginTokens, PasswordLoginRequest, PublicKeyChallengeRequest, PublicKeyLoginRequest,
-    RefreshRequest,
+    LoginTokens, PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest,
+    TokenLoginRequest,
 };
 
 use super::{
@@ -22,43 +21,47 @@ use super::{
 };
 
 pub async fn login(context: &ClientContext, args: &LoginArgs) -> Result<()> {
-    let username = normalize_username(&args.username);
-    anyhow::ensure!(!username.is_empty(), "username is empty");
-    let tokens = match args.method {
-        LoginMethod::Password => {
-            let password = read_password("请输入密码：", args.password_stdin)?;
-            context
+    let method = args.method.or(context.config.auth.method).context(
+        "login method is required; pass --method token or public-key, or set auth.method in config",
+    )?;
+    match method {
+        LoginMethod::Token => {
+            let token = args
+                .token
+                .as_deref()
+                .or(context.config.auth.token.as_deref())
+                .context(
+                    "API token is required; use --token, KMESH_TOKEN, or auth.token in config",
+                )?;
+            anyhow::ensure!(!token.trim().is_empty(), "API token is empty");
+            let tokens = context
                 .api
-                .password_login(&PasswordLoginRequest {
-                    username: username.clone(),
-                    password,
+                .token_login(&TokenLoginRequest {
+                    token: token.to_owned(),
                 })
-                .await?
+                .await?;
+            let username = context.api.me(&tokens.access_token).await?.user.username;
+            save_login(context, &normalize_username(&username), tokens)
         }
         LoginMethod::PublicKey => {
-            let key_path = args.key.as_deref().context(
-                "public-key login requires --key pointing to a private key or its .pub file",
-            )?;
-            public_key_login(context, &username, key_path).await?
+            let username = args
+                .username
+                .as_deref()
+                .or(context.config.auth.username.as_deref())
+                .context("public-key login requires --username or auth.username in config")?;
+            let username = normalize_username(username);
+            anyhow::ensure!(!username.is_empty(), "username is empty");
+            let current_dir = std::env::current_dir().context("resolve current directory")?;
+            let key_path = args
+                .key
+                .as_deref()
+                .map(|path| crate::config::resolve_path(path, &current_dir))
+                .or(context.config.auth.key.clone())
+                .context("public-key login requires --key or auth.key in config")?;
+            let tokens = public_key_login(context, &username, &key_path).await?;
+            save_login(context, &username, tokens)
         }
-    };
-    save_login(context, &username, tokens)
-}
-
-pub fn read_password(prompt: &str, stdin: bool) -> Result<String> {
-    if !stdin {
-        return prompt_password(prompt).context("read password");
     }
-    use std::io::IsTerminal;
-    anyhow::ensure!(
-        !std::io::stdin().is_terminal(),
-        "--password-stdin requires piped stdin"
-    );
-    let mut password = String::new();
-    std::io::stdin()
-        .read_line(&mut password)
-        .context("read password from stdin")?;
-    Ok(password.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 async fn public_key_login(

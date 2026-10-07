@@ -12,12 +12,16 @@ use rustyline::{
 };
 
 use crate::protocol::{
-    AdminOperation, AdminRequest, AdminResponse, RoleGrantView, TargetView, UserKeyView, UserView,
+    AdminOperation, AdminRequest, AdminResponse, ApiTokenView, RoleGrantView, TargetView,
+    UserKeyView, UserView,
 };
 
 use super::{
     ClientContext, auth,
-    cli::{AdminArgs, AdminCommand, GrantAction, KeyAction, RoleAction, TargetAction, UserAction},
+    cli::{
+        AdminArgs, AdminCommand, ApiTokenAction, GrantAction, KeyAction, RoleAction, TargetAction,
+        UserAction,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -86,13 +90,7 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
     let operation = match command {
         AdminCommand::Users { action } => match action {
             UserAction::List => AdminOperation::ListUsers,
-            UserAction::Create {
-                username,
-                password_stdin,
-            } => {
-                let password = read_new_password("设置新用户密码", password_stdin)?;
-                AdminOperation::CreateUser { username, password }
-            }
+            UserAction::Create { username } => AdminOperation::CreateUser { username },
             UserAction::Disable { user_id } => AdminOperation::SetUserEnabled {
                 user_id,
                 enabled: false,
@@ -101,17 +99,17 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
                 user_id,
                 enabled: true,
             },
-            UserAction::ResetPassword {
-                user_id,
-                password_stdin,
-            } => AdminOperation::ResetPassword {
-                user_id,
-                password: read_new_password("重置用户密码", password_stdin)?,
-            },
             UserAction::Roles { user_id, role_ids } => {
                 AdminOperation::SetUserRoles { user_id, role_ids }
             }
             UserAction::ShowRoles { user_id } => AdminOperation::ListUserRoles { user_id },
+        },
+        AdminCommand::Tokens { action } => match action {
+            ApiTokenAction::Create { user_id, label } => {
+                AdminOperation::CreateApiToken { user_id, label }
+            }
+            ApiTokenAction::List { user_id } => AdminOperation::ListApiTokens { user_id },
+            ApiTokenAction::Revoke { token_id } => AdminOperation::RevokeApiToken { token_id },
         },
         AdminCommand::Keys { action } => match action {
             KeyAction::List { user_id } => AdminOperation::ListKeys { user_id },
@@ -182,14 +180,6 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
     print_response(&response, json)
 }
 
-fn read_new_password(prompt: &str, stdin: bool) -> Result<String> {
-    let first = auth::read_password(&format!("请{prompt}："), stdin)?;
-    let second = auth::read_password("请再输入一次：", stdin)?;
-    anyhow::ensure!(first == second, "两次输入的密码不一致");
-    anyhow::ensure!(!first.is_empty(), "密码不能为空");
-    Ok(first)
-}
-
 fn print_response(response: &AdminResponse, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(response)?);
@@ -198,6 +188,13 @@ fn print_response(response: &AdminResponse, json: bool) -> Result<()> {
     match response {
         AdminResponse::Ok => println!("操作完成。"),
         AdminResponse::Users(users) => print_users(users),
+        AdminResponse::ApiTokenIssued { api_token, token } => {
+            println!(
+                "API token for user {} ({}) — save it now; it is shown once:\n{token}",
+                api_token.user_id, api_token.label
+            );
+        }
+        AdminResponse::ApiTokens(tokens) => print_api_tokens(tokens),
         AdminResponse::User(user) => println!(
             "用户 {}\t{}\t{}",
             user.user_id,
@@ -234,6 +231,23 @@ fn print_users(users: &[UserView]) {
     println!("用户列表：");
     for user in users {
         print_user(user);
+    }
+}
+
+fn print_api_tokens(tokens: &[ApiTokenView]) {
+    println!("API token list:");
+    for token in tokens {
+        println!(
+            "{}\t{}\t{}\t{}",
+            token.token_id,
+            token.user_id,
+            token.label,
+            if token.revoked_at.is_some() {
+                "revoked"
+            } else {
+                "active"
+            }
+        );
     }
 }
 
@@ -292,7 +306,9 @@ fn print_help() {
     let mut help = Vec::new();
     let _ = command.write_help(&mut help);
     println!("管理命令：\n{}", String::from_utf8_lossy(&help));
-    println!("输入 users / keys / roles / grants / targets 后按 Tab 补全，输入 exit 退出。");
+    println!(
+        "输入 users / tokens / keys / roles / grants / targets 后按 Tab 补全，输入 exit 退出。"
+    );
 }
 
 fn format_error(error: &anyhow::Error) -> String {
@@ -327,17 +343,10 @@ impl Completer for AdminHelper {
         let words = prefix_line[..start].split_whitespace().collect::<Vec<_>>();
         let options: &[&str] = match words.as_slice() {
             [] => &[
-                "users", "keys", "roles", "grants", "targets", "help", "exit",
+                "users", "tokens", "keys", "roles", "grants", "targets", "help", "exit",
             ],
-            ["users"] => &[
-                "list",
-                "create",
-                "disable",
-                "enable",
-                "reset-password",
-                "roles",
-                "show-roles",
-            ],
+            ["users"] => &["list", "create", "disable", "enable", "roles", "show-roles"],
+            ["tokens"] => &["create", "list", "revoke"],
             ["keys"] => &["list", "add", "remove"],
             ["roles"] => &["list", "create", "delete"],
             ["grants"] => &["list", "add", "remove"],
@@ -385,7 +394,7 @@ mod tests {
         ));
 
         let help = AdminLine::command().render_help().to_string();
-        for group in ["users", "keys", "roles", "grants", "targets"] {
+        for group in ["users", "tokens", "keys", "roles", "grants", "targets"] {
             assert!(help.contains(group), "admin help lists {group}");
         }
     }
@@ -397,7 +406,9 @@ mod tests {
         let helper = AdminHelper;
         for (line, expected) in [
             ("", "users"),
-            ("users ", "reset-password"),
+            ("", "tokens"),
+            ("users ", "roles"),
+            ("tokens ", "revoke"),
             ("keys ", "remove"),
             ("roles ", "delete"),
             ("grants ", "remove"),

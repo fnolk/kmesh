@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use clap::Parser;
 use rustls::pki_types::PrivateKeyDer;
 use ssh_key::{PublicKey, SshSig};
 use tokio::{
@@ -23,12 +24,12 @@ use uuid::Uuid;
 
 use crate::{
     client::{
-        ClientContext,
+        Cli, ClientContext, Command as ClientCommand,
         api::Api,
         profile::{ProfileStore, SavedLogin},
     },
-    config::{Config, TlsConfig},
-    protocol::LoginTokens,
+    config::{AuthConfig, Config, LoginMethod, TlsConfig},
+    protocol::{LoginTokens, MeView, UserView},
 };
 
 use super::*;
@@ -37,6 +38,7 @@ const REFRESH_CHILD_ENV: &str = "KMESH_TEST_REFRESH_CHILD";
 const SSH_AGENT_CHILD_PUBLIC_KEY_ENV: &str = "KMESH_TEST_SSH_AGENT_PUBLIC_KEY";
 const SSH_AGENT_CHILD_INPUT_ENV: &str = "KMESH_TEST_SSH_AGENT_INPUT";
 const SSH_AGENT_CHILD_OUTPUT_ENV: &str = "KMESH_TEST_SSH_AGENT_OUTPUT";
+const TOKEN_ENV_CHILD: &str = "KMESH_TEST_TOKEN_ENV_CHILD";
 
 struct TestDirectory(PathBuf);
 
@@ -65,6 +67,152 @@ fn server_address_and_port(origin: &str) -> (String, u16) {
             .to_owned(),
         origin.port_or_known_default().expect("test server port"),
     )
+}
+
+async fn auth_context(config: Config) -> ClientContext {
+    let api = Api::new(&config).await.expect("build test API client");
+    let profiles = ProfileStore::new(
+        &config.data_dir,
+        &config.server_origin().expect("test server origin"),
+        &config.profile,
+    );
+    ClientContext {
+        config,
+        api,
+        profiles,
+    }
+}
+
+#[tokio::test]
+async fn login_reports_missing_method_token_username_and_key_before_network() {
+    let context = auth_context(Config::default()).await;
+    let error = super::login(&context, &LoginArgs::default())
+        .await
+        .expect_err("login requires an explicit method");
+    assert!(format!("{error:#}").contains("login method is required"));
+
+    let context = auth_context(Config {
+        auth: AuthConfig {
+            method: Some(LoginMethod::Token),
+            ..AuthConfig::default()
+        },
+        ..Config::default()
+    })
+    .await;
+    let error = super::login(&context, &LoginArgs::default())
+        .await
+        .expect_err("token login requires a token");
+    assert!(format!("{error:#}").contains("API token is required"));
+
+    let context = auth_context(Config {
+        auth: AuthConfig {
+            method: Some(LoginMethod::PublicKey),
+            key: Some("/tmp/id_ed25519".into()),
+            ..AuthConfig::default()
+        },
+        ..Config::default()
+    })
+    .await;
+    let error = super::login(&context, &LoginArgs::default())
+        .await
+        .expect_err("public-key login requires a username");
+    assert!(format!("{error:#}").contains("--username or auth.username"));
+
+    let context = auth_context(Config {
+        auth: AuthConfig {
+            method: Some(LoginMethod::PublicKey),
+            username: Some("alice".to_owned()),
+            ..AuthConfig::default()
+        },
+        ..Config::default()
+    })
+    .await;
+    let error = super::login(&context, &LoginArgs::default())
+        .await
+        .expect_err("public-key login requires a key");
+    assert!(format!("{error:#}").contains("--key or auth.key"));
+}
+
+#[tokio::test]
+async fn cli_public_key_settings_override_toml_and_expand_home_key_path() {
+    let cli = Cli::try_parse_from([
+        "kmesh",
+        "login",
+        "--method",
+        "public-key",
+        "--username",
+        "cli-user",
+        "--key",
+        "~/kmesh-login-test-missing-key",
+    ])
+    .expect("parse public-key login overrides");
+    let ClientCommand::Login(args) = cli.command else {
+        panic!("expected login command");
+    };
+    let context = auth_context(Config {
+        auth: AuthConfig {
+            method: Some(LoginMethod::Token),
+            key: Some("/config-only-key".into()),
+            token: Some("toml-token".to_owned()),
+            ..AuthConfig::default()
+        },
+        ..Config::default()
+    })
+    .await;
+    let error = super::login(&context, &args)
+        .await
+        .expect_err("CLI public-key method overrides TOML and reads CLI key");
+    let expected_key = dirs::home_dir()
+        .expect("home directory")
+        .join("kmesh-login-test-missing-key");
+    assert!(format!("{error:#}").contains(&expected_key.display().to_string()));
+}
+
+#[tokio::test]
+async fn token_env_precedence_child() {
+    let Ok(mode) = std::env::var(TOKEN_ENV_CHILD) else {
+        return;
+    };
+    let cli = if mode == "cli" {
+        Cli::try_parse_from(["kmesh", "login", "--method", "token", "--token", ""])
+    } else {
+        Cli::try_parse_from(["kmesh", "login"])
+    }
+    .expect("parse child login command");
+    let ClientCommand::Login(args) = cli.command else {
+        panic!("expected login command");
+    };
+    let context = auth_context(Config {
+        auth: AuthConfig {
+            method: Some(LoginMethod::Token),
+            token: Some("toml-token".to_owned()),
+            ..AuthConfig::default()
+        },
+        ..Config::default()
+    })
+    .await;
+    let error = super::login(&context, &args)
+        .await
+        .expect_err("empty CLI/environment token overrides TOML");
+    assert!(format!("{error:#}").contains("API token is empty"));
+}
+
+#[tokio::test]
+async fn cli_token_and_environment_override_toml_in_isolated_processes() {
+    let executable = std::env::current_exe().expect("resolve auth test executable");
+    for (mode, environment_token) in [("cli", "environment-token"), ("environment", "")] {
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "client::auth::tests::token_env_precedence_child",
+                "--nocapture",
+            ])
+            .env(TOKEN_ENV_CHILD, mode)
+            .env("KMESH_TOKEN", environment_token)
+            .output()
+            .expect("run token precedence child process");
+        assert!(output.status.success(), "token precedence child passed");
+    }
 }
 
 struct SshAgent {
@@ -200,6 +348,120 @@ async fn one_refresh_request(
             .expect("write refresh response body");
         stream.shutdown().await.expect("close refresh response");
     }
+}
+
+async fn one_token_login_and_me(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    expected_token: &'static str,
+    tokens: LoginTokens,
+    me: MeView,
+) {
+    for (expected_path, response, expected_auth) in [
+        (
+            "POST /v1/auth/token ",
+            serde_json::to_vec(&tokens).expect("encode login tokens"),
+            None,
+        ),
+        (
+            "GET /v1/me ",
+            serde_json::to_vec(&me).expect("encode current user"),
+            Some("authorization: bearer access-token"),
+        ),
+    ] {
+        let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("token login request arrives")
+            .expect("accept token login request");
+        let mut stream = timeout(Duration::from_secs(5), acceptor.accept(socket))
+            .await
+            .expect("HTTPS handshake completes")
+            .expect("accept HTTPS login request");
+        let request = timeout(Duration::from_secs(5), read_http_request(&mut stream))
+            .await
+            .expect("login HTTP request completes");
+        let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(request_text.starts_with(&expected_path.to_ascii_lowercase()));
+        if expected_path.starts_with("POST") {
+            assert!(request_text.contains(expected_token));
+        }
+        if let Some(expected_auth) = expected_auth {
+            assert!(request_text.contains(expected_auth));
+        }
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write login response headers");
+        stream
+            .write_all(&response)
+            .await
+            .expect("write login response body");
+        stream.shutdown().await.expect("close login response");
+    }
+}
+
+#[tokio::test]
+async fn token_login_uses_toml_token_fetches_actual_username_and_saves_session() {
+    let directory = TestDirectory::new("token-login-test");
+    let (acceptor, ca_file) = test_tls_acceptor(&directory.0);
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind local token login server");
+    let server_port = listener.local_addr().unwrap().port();
+    let now = unix_now().unwrap();
+    let tokens = LoginTokens {
+        access_token: "access-token".to_owned(),
+        refresh_token: "refresh-token".to_owned(),
+        access_expires_at: now + 900,
+        refresh_expires_at: now + 3600,
+    };
+    let me = MeView {
+        user: UserView {
+            user_id: Uuid::new_v4(),
+            username: "Alice".to_owned(),
+            enabled: true,
+        },
+        roles: Vec::new(),
+    };
+    let expected_token = "kmesh_test_api_token";
+    let server = tokio::spawn(one_token_login_and_me(
+        listener,
+        acceptor,
+        expected_token,
+        tokens.clone(),
+        me,
+    ));
+    let config = Config {
+        server_addr: "127.0.0.1".to_owned(),
+        server_port,
+        data_dir: directory.0.clone(),
+        tls: TlsConfig {
+            ca_certificates: vec![ca_file],
+            server_name: None,
+        },
+        auth: AuthConfig {
+            method: Some(LoginMethod::Token),
+            token: Some(expected_token.to_owned()),
+            ..AuthConfig::default()
+        },
+        ..Config::default()
+    };
+    let context = auth_context(config).await;
+
+    super::login(&context, &LoginArgs::default())
+        .await
+        .expect("login with configured API token");
+    server.await.expect("token login server completes");
+
+    assert_eq!(context.profiles.active_user().unwrap(), "alice");
+    let saved = context.profiles.load("alice").unwrap().unwrap();
+    assert_eq!(saved.username, "alice");
+    assert_eq!(saved.tokens.access_token, tokens.access_token);
+    assert_eq!(saved.tokens.refresh_token, tokens.refresh_token);
 }
 
 #[test]

@@ -5,16 +5,14 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::protocol::{
-    AdminOperation, AdminRequest, AdminResponse, MeView, RoleGrantView, RoleView, TargetPermission,
-    TargetView, UserKeyView, UserView,
+    AdminOperation, AdminRequest, AdminResponse, ApiTokenView, MeView, RoleGrantView, RoleView,
+    TargetPermission, TargetView, UserKeyView, UserView,
 };
 
-use super::auth::{
-    authenticate, canonical_ssh_key, password_hash_limited, ssh_fingerprint, validate_password,
-};
+use super::auth::{authenticate, canonical_ssh_key, ssh_fingerprint};
 use super::db::{row_uuid, unix_time};
 use super::error::ApiError;
-use super::{ServerState, hash_secret, new_secret};
+use super::{ServerState, hash_secret, new_api_token, new_secret};
 
 pub(crate) async fn me(
     State(state): State<ServerState>,
@@ -83,6 +81,11 @@ pub(crate) async fn apply_operation(
 
     match &operation {
         Op::ListUsers => return Ok(AdminResponse::Users(list_users(state).await?)),
+        Op::ListApiTokens { user_id } => {
+            return Ok(AdminResponse::ApiTokens(
+                list_api_tokens(state, *user_id).await?,
+            ));
+        }
         Op::ListKeys { user_id } => {
             return Ok(AdminResponse::Keys(list_keys(state, *user_id).await?));
         }
@@ -101,21 +104,9 @@ pub(crate) async fn apply_operation(
         _ => {}
     }
 
-    let mut operation = operation;
-    let password_hash = match &mut operation {
-        Op::CreateUser { password, .. } | Op::ResetPassword { password, .. } => {
-            validate_password(password)?;
-            Some(
-                password_hash_limited(std::mem::take(password))
-                    .await
-                    .map_err(ApiError::from)?,
-            )
-        }
-        _ => None,
-    };
     let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
     let mut audit = prepare_audit_event(actor_user_id, &operation, &mut tx).await?;
-    let response = apply_operation_write(&mut tx, password_hash, operation).await?;
+    let response = apply_operation_write(&mut tx, operation).await?;
     complete_audit_event(&mut audit, &response);
     sqlx::query(
         "INSERT INTO admin_audit(id, occurred_at, actor_user_id, operation, object_type, object_id, context_json) \
@@ -136,7 +127,6 @@ pub(crate) async fn apply_operation(
 
 async fn apply_operation_write(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    password_hash: Option<String>,
     operation: AdminOperation,
 ) -> Result<AdminResponse, ApiError> {
     use AdminOperation as Op;
@@ -146,21 +136,18 @@ async fn apply_operation_write(
         | Op::ListRoles
         | Op::ListUserRoles { .. }
         | Op::ListRoleGrants { .. }
+        | Op::ListApiTokens { .. }
         | Op::ListTargets => unreachable!("read operations are dispatched before the transaction"),
-        Op::CreateUser {
-            username,
-            password: _,
-        } => {
+        Op::CreateUser { username } => {
             let username = normalize_username(&username)?;
             let id = Uuid::new_v4();
             let now = unix_time();
             sqlx::query(
-                "INSERT INTO users(id, username, password_hash, enabled, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, 1, ?4, ?4)",
+                "INSERT INTO users(id, username, enabled, created_at, updated_at) \
+                 VALUES (?1, ?2, 1, ?3, ?3)",
             )
             .bind(id.to_string())
             .bind(&username)
-            .bind(password_hash.expect("password hash was prepared before opening transaction"))
             .bind(now)
             .execute(&mut **tx)
             .await
@@ -189,24 +176,65 @@ async fn apply_operation_write(
             ensure_admin_remains(tx).await?;
             Ok(AdminResponse::Ok)
         }
-        Op::ResetPassword {
-            user_id,
-            password: _,
-        } => {
-            let password_hash =
-                password_hash.expect("password hash was prepared before opening transaction");
+        Op::CreateApiToken { user_id, label } => {
+            let label = normalize_name(&label, "API token label")?;
+            let token_id = Uuid::new_v4();
+            let token = new_api_token();
             let now = unix_time();
-            let changed =
-                sqlx::query("UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3")
-                    .bind(password_hash)
-                    .bind(now)
-                    .bind(user_id.to_string())
-                    .execute(&mut **tx)
-                    .await?;
-            if changed.rows_affected() == 0 {
-                return Err(ApiError::not_found("user does not exist"));
+            let inserted = sqlx::query(
+                "INSERT INTO api_tokens(id, user_id, token_hash, label, created_at) \
+                 SELECT ?1, id, ?3, ?4, ?5 FROM users WHERE id = ?2 AND enabled = 1",
+            )
+            .bind(token_id.to_string())
+            .bind(user_id.to_string())
+            .bind(hash_secret(&token))
+            .bind(&label)
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .map_err(map_constraint)?;
+            if inserted.rows_affected() != 1 {
+                return Err(ApiError::not_found("enabled user does not exist"));
             }
-            revoke_user_sessions(tx, user_id, now).await?;
+            Ok(AdminResponse::ApiTokenIssued {
+                api_token: ApiTokenView {
+                    token_id,
+                    user_id,
+                    label,
+                    created_at: now,
+                    revoked_at: None,
+                },
+                token,
+            })
+        }
+        Op::RevokeApiToken { token_id } => {
+            let now = unix_time();
+            let changed = sqlx::query(
+                "UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, ?1) WHERE id = ?2",
+            )
+            .bind(now)
+            .bind(token_id.to_string())
+            .execute(&mut **tx)
+            .await?;
+            if changed.rows_affected() == 0 {
+                return Err(ApiError::not_found("API token does not exist"));
+            }
+            sqlx::query(
+                "UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, ?1) \
+                 WHERE api_token_id = ?2",
+            )
+            .bind(now)
+            .bind(token_id.to_string())
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "UPDATE refresh_tokens SET revoked_at = COALESCE(revoked_at, ?1) \
+                 WHERE session_id IN (SELECT id FROM auth_sessions WHERE api_token_id = ?2)",
+            )
+            .bind(now)
+            .bind(token_id.to_string())
+            .execute(&mut **tx)
+            .await?;
             Ok(AdminResponse::Ok)
         }
         Op::AddUserKey {
@@ -455,6 +483,28 @@ async fn prepare_audit_event(
             None,
             serde_json::json!({ "username": username }),
         ),
+        Op::CreateApiToken { user_id, label } => (
+            "create_api_token",
+            "api_token",
+            None,
+            serde_json::json!({ "user_id": user_id, "label": label.trim() }),
+        ),
+        Op::RevokeApiToken { token_id } => {
+            let row = sqlx::query("SELECT user_id, label FROM api_tokens WHERE id = ?1")
+                .bind(token_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+            (
+                "revoke_api_token",
+                "api_token",
+                Some(*token_id),
+                serde_json::json!({
+                    "token_id": token_id,
+                    "user_id": row.as_ref().map(|row| row.try_get::<String, _>("user_id")).transpose()?,
+                    "label": row.as_ref().map(|row| row.try_get::<String, _>("label")).transpose()?,
+                }),
+            )
+        }
         Op::SetUserEnabled { user_id, enabled } => ("set_user_enabled", "user", Some(*user_id), {
             let row = sqlx::query("SELECT username, enabled FROM users WHERE id = ?1")
                 .bind(user_id.to_string())
@@ -467,12 +517,6 @@ async fn prepare_audit_event(
                 "enabled": enabled,
             })
         }),
-        Op::ResetPassword { user_id, .. } => (
-            "reset_password",
-            "user",
-            Some(*user_id),
-            serde_json::json!({ "user_id": user_id }),
-        ),
         Op::AddUserKey { user_id, label, .. } => (
             "add_user_key",
             "ssh_key",
@@ -652,6 +696,7 @@ async fn prepare_audit_event(
         | Op::ListRoles
         | Op::ListUserRoles { .. }
         | Op::ListRoleGrants { .. }
+        | Op::ListApiTokens { .. }
         | Op::ListTargets => unreachable!("read operations are dispatched before the transaction"),
     };
 
@@ -671,6 +716,12 @@ fn complete_audit_event(event: &mut AuditEvent, response: &AdminResponse) {
         ("create_user", AdminResponse::User(user)) => {
             event.object_id = Some(user.user_id);
             event.context["username"] = serde_json::json!(user.username);
+        }
+        ("create_api_token", AdminResponse::ApiTokenIssued { api_token, .. }) => {
+            event.object_id = Some(api_token.token_id);
+            event.context["token_id"] = serde_json::json!(api_token.token_id);
+            event.context["user_id"] = serde_json::json!(api_token.user_id);
+            event.context["label"] = serde_json::json!(api_token.label);
         }
         ("add_user_key", AdminResponse::Keys(keys)) => {
             let key = keys.first().expect("adding one key returns that key");
@@ -710,6 +761,30 @@ async fn list_users(state: &ServerState) -> Result<Vec<UserView>, ApiError> {
                 user_id: row_uuid(&row, "id")?,
                 username: row.try_get("username")?,
                 enabled: row.try_get::<i64, _>("enabled")? == 1,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()
+}
+
+async fn list_api_tokens(
+    state: &ServerState,
+    user_id: Uuid,
+) -> Result<Vec<ApiTokenView>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id, user_id, label, created_at, revoked_at FROM api_tokens \
+         WHERE user_id = ?1 ORDER BY created_at, id",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.inner.db.pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ApiTokenView {
+                token_id: row_uuid(&row, "id")?,
+                user_id: row_uuid(&row, "user_id")?,
+                label: row.try_get("label")?,
+                created_at: row.try_get("created_at")?,
+                revoked_at: row.try_get("revoked_at")?,
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()

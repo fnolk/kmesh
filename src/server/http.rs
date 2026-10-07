@@ -6,7 +6,7 @@ use super::ServerState;
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/v1/auth/password", post(super::auth::password_login))
+        .route("/v1/auth/token", post(super::auth::token_login))
         .route(
             "/v1/auth/challenge",
             post(super::auth::public_key_challenge),
