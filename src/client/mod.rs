@@ -234,10 +234,27 @@ pub async fn run(cli: Cli) -> Result<()> {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use clap::Parser;
+    use clap::error::ErrorKind;
+    use clap::{CommandFactory, Parser};
     use uuid::Uuid;
 
     use super::{Cli, load_config_at};
+
+    #[test]
+    fn long_version_displays_shadow_build_metadata() {
+        let error = Cli::try_parse_from(["kmesh", "--version"])
+            .expect_err("--version exits after displaying build metadata");
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        let output = error.to_string();
+        assert!(output.contains(crate::build::PKG_VERSION));
+        assert!(output.contains("branch:"));
+        assert!(output.contains(crate::build::SHORT_COMMIT));
+        assert!(output.contains(&format!("source_ref:{}", crate::version::SOURCE_REF)));
+        assert_eq!(
+            Cli::command().get_long_version(),
+            Some(crate::version::CLI_LONG_VERSION)
+        );
+    }
 
     #[test]
     fn default_config_loads_from_its_path_and_cli_overrides_toml() {

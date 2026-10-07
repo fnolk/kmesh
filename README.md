@@ -18,7 +18,9 @@ install -m 0755 target/release/kmesh ~/.local/bin/kmesh
 
 Add `~/.local/bin` to `PATH` for an ordinary user install. Service deployments may place the binary in a system-owned path for their service units.
 
-The CI workflow is configured to build Linux x86_64/aarch64 musl and macOS Intel/Apple Silicon binaries and upload each target's artifact. It also runs native formatting, Clippy, and test checks. kmesh uses Rust TLS libraries; its Linux dependency graph includes `openssl-probe` for certificate discovery and contains no OpenSSL TLS or `native-tls` package.
+The CI workflow builds Linux x86_64/aarch64 musl and macOS Intel/Apple Silicon binaries and runs formatting, Clippy, and test checks. Publishing a GitHub release tagged `v<version>` builds and attaches one archive per platform; the tag must match the version in `Cargo.toml`. kmesh uses Rust TLS libraries; its Linux dependency graph includes `openssl-probe` for certificate discovery and contains no OpenSSL TLS or `native-tls` package.
+
+`kmesh --version` prints the package version, build branch, commit ID, build time, and Rust toolchain metadata. The server checks this version on every `/v1` API request and both client and agent control connections. Stable releases interoperate within the same major version; `0.x` releases also require the same minor version. Prerelease builds require matching major, minor, patch, and prerelease identifiers.
 
 ## Start the public server
 
