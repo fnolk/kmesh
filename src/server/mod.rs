@@ -63,6 +63,7 @@ pub async fn initialize(
     let admin_username = auth::normalize_username(admin_username)?;
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create server data directory {}", data_dir.display()))?;
+    #[cfg(unix)]
     set_private_dir(data_dir)?;
 
     let lock_path = data_dir.join("initialize.lock");
@@ -76,6 +77,7 @@ pub async fn initialize(
     let user_count = db.user_count().await?;
     let key_path = data_dir.join("token-keys.json");
     if key_path.exists() {
+        #[cfg(unix)]
         set_private_file(&key_path)?;
     } else if user_count > 0 {
         bail!("initialized database is missing persistent token keys");
@@ -270,24 +272,18 @@ fn open_private_file(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("open private file {}", path.display()))
 }
 
+#[cfg(unix)]
 fn set_private_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("secure data directory {}", path.display()))?;
-    }
-    Ok(())
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure data directory {}", path.display()))
 }
 
+#[cfg(unix)]
 fn set_private_file(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("secure private file {}", path.display()))?;
-    }
-    Ok(())
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("secure private file {}", path.display()))
 }
 
 fn write_private_atomically(path: &Path, contents: &[u8]) -> Result<()> {

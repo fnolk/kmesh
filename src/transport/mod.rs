@@ -1,7 +1,7 @@
 //! Iroh QUIC transport for SSH streams and HTTPS control-plane connections.
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("kmesh transport supports Linux and macOS only");
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("kmesh transport supports Linux, macOS, and Windows");
 
 mod http;
 mod iroh;

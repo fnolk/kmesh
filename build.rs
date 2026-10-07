@@ -1,9 +1,7 @@
-use std::{
-    env, fs,
-    io::BufReader,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{env, fs, io::BufReader, path::PathBuf, sync::Arc};
+
+#[cfg(unix)]
+use std::path::Path;
 
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
@@ -74,6 +72,7 @@ fn main() {
         let output = out_dir.join(input.output_name);
         fs::write(&output, contents)
             .unwrap_or_else(|_| panic!("write embedded TLS material {}", input.output_name));
+        #[cfg(unix)]
         set_private_file(&output);
     }
 }
@@ -149,11 +148,9 @@ fn private_key(contents: &[u8], label: &str) -> PrivateKeyDer<'static> {
         .unwrap_or_else(|| panic!("{label} PEM contains no private key"))
 }
 
+#[cfg(unix)]
 fn set_private_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .unwrap_or_else(|_| panic!("restrict permissions for embedded TLS material"));
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|_| panic!("restrict permissions for embedded TLS material"));
 }
