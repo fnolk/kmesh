@@ -10,7 +10,7 @@ mod udp_handoff;
 
 use std::{error::Error as StdError, io};
 
-pub use http::{BoxedIo, WsStream, connect_wss, http_client};
+pub use http::{WsStream, connect_wss, http_client};
 pub use iroh::{
     HandoffOptions, IROH_SSH_ALPN, IrohByteStream, IrohEndpointOptions, IrohPathKind,
     IrohPathStats, IrohSelectedPath, RelayChoice, accept_peer, allowed_relay_urls, connect_peer,
@@ -107,19 +107,6 @@ pub fn is_auth_failure_source(error: &(dyn StdError + 'static)) -> bool {
                 {
                     return true;
                 }
-                _ => {}
-            }
-        }
-        if let Some(error) = error.downcast_ref::<iroh_relay::client::DialError>() {
-            match error {
-                iroh_relay::client::DialError::ProxyConnectInvalidStatus { status, .. }
-                    if status.as_u16() == 407 =>
-                {
-                    return true;
-                }
-                iroh_relay::client::DialError::ProxyInvalidUrl { .. }
-                | iroh_relay::client::DialError::ProxyInvalidTlsServername { .. }
-                | iroh_relay::client::DialError::ProxyInvalidTargetPort { .. } => return true,
                 _ => {}
             }
         }

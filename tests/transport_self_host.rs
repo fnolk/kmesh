@@ -160,7 +160,6 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
             tls: TlsConfig {
                 ca_certificates: vec![certificate_file.0.clone()],
                 server_name: None,
-                proxy: None,
             },
             handoff: None,
         },

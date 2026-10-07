@@ -304,7 +304,6 @@ async fn refresh_process_child() {
         tls: TlsConfig {
             ca_certificates: vec![ca_file],
             server_name: None,
-            proxy: None,
         },
         ..Config::default()
     };
@@ -499,7 +498,6 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
         tls: TlsConfig {
             ca_certificates: vec![ca_file],
             server_name: None,
-            proxy: None,
         },
         ..Config::default()
     };

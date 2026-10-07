@@ -3,7 +3,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use iroh::{Endpoint, SecretKey, Watcher as _};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use uuid::Uuid;
 
 use crate::{
@@ -399,13 +400,16 @@ pub(super) async fn open_ssh_session(
     }
 }
 
-async fn wait_for_discovery_or_native_plan(
-    control: &mut WsStream,
+async fn wait_for_discovery_or_native_plan<S>(
+    control: &mut WebSocketStream<S>,
     session_id: Uuid,
     route_mode: RouteMode,
     setup_deadline: tokio::time::Instant,
     discovery: impl Future<Output = Result<MappingDiscovery, TransportError>> + Send,
-) -> Result<(MappingDiscovery, Option<NativePlan>)> {
+) -> Result<(MappingDiscovery, Option<NativePlan>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let discovery = async {
         match tokio::time::timeout_at(setup_deadline, discovery).await {
             Ok(result) => result.map_err(classify_transport_error),
@@ -437,24 +441,30 @@ async fn wait_for_discovery_or_native_plan(
     }
 }
 
-pub(super) async fn send_setup_control(
-    control: &mut WsStream,
+pub(super) async fn send_setup_control<S>(
+    control: &mut WebSocketStream<S>,
     message: &ControlMessage,
     route_mode: RouteMode,
     deadline: tokio::time::Instant,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     tokio::time::timeout_at(deadline, Api::send_control(control, message))
         .await
         .map_err(|_| route_network_timeout(route_mode, "sending SSH setup control"))?
         .map_err(|error| classify_anyhow_network_error(error, route_mode))
 }
 
-pub(super) async fn next_client_session_message(
-    control: &mut WsStream,
+pub(super) async fn next_client_session_message<S>(
+    control: &mut WebSocketStream<S>,
     session_id: Uuid,
     route_mode: RouteMode,
     deadline: tokio::time::Instant,
-) -> Result<Option<ControlMessage>> {
+) -> Result<Option<ControlMessage>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         let message = tokio::time::timeout_at(deadline, control.next())
             .await
@@ -717,7 +727,7 @@ async fn wait_activated(control: &mut WsStream, session_id: Uuid) -> Result<()> 
 mod tests {
     use super::super::is_retryable_route_failure;
     use super::*;
-    use crate::transport::{BoxedIo, TransportError};
+    use crate::transport::TransportError;
     use anyhow::anyhow;
     use std::io;
     use tokio::sync::oneshot;
@@ -787,12 +797,10 @@ mod tests {
     #[tokio::test]
     async fn early_standard_plan_is_retained_until_bounded_qad_finishes() {
         let (client_io, server_io) = tokio::io::duplex(4096);
-        let mut client_control: WsStream =
-            WebSocketStream::from_raw_socket(Box::new(client_io) as BoxedIo, Role::Client, None)
-                .await;
-        let mut server_control: WsStream =
-            WebSocketStream::from_raw_socket(Box::new(server_io) as BoxedIo, Role::Server, None)
-                .await;
+        let mut client_control =
+            WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server_control =
+            WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
         let session_id = Uuid::new_v4();
         let (finish_discovery, discovery_gate) = oneshot::channel();
         let discovery = async move {
@@ -843,12 +851,10 @@ mod tests {
     #[tokio::test]
     async fn server_error_cancels_qad_discovery_immediately() {
         let (client_io, server_io) = tokio::io::duplex(4096);
-        let mut client_control: WsStream =
-            WebSocketStream::from_raw_socket(Box::new(client_io) as BoxedIo, Role::Client, None)
-                .await;
-        let mut server_control: WsStream =
-            WebSocketStream::from_raw_socket(Box::new(server_io) as BoxedIo, Role::Server, None)
-                .await;
+        let mut client_control =
+            WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server_control =
+            WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
         let session_id = Uuid::new_v4();
         let (started_tx, started_rx) = oneshot::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -911,12 +917,10 @@ mod tests {
     #[tokio::test]
     async fn server_close_cancels_qad_discovery_immediately() {
         let (client_io, server_io) = tokio::io::duplex(4096);
-        let mut client_control: WsStream =
-            WebSocketStream::from_raw_socket(Box::new(client_io) as BoxedIo, Role::Client, None)
-                .await;
-        let mut server_control: WsStream =
-            WebSocketStream::from_raw_socket(Box::new(server_io) as BoxedIo, Role::Server, None)
-                .await;
+        let mut client_control =
+            WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server_control =
+            WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
         let session_id = Uuid::new_v4();
         let (started_tx, started_rx) = oneshot::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();

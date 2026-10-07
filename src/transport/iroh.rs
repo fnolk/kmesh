@@ -20,9 +20,9 @@ use iroh_relay::{RelayQuicConfig, tls::CaTlsConfig};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    config::{HttpProxyConfig, TlsConfig},
+    config::TlsConfig,
     protocol::{RouteMode, SelectedPath},
-    transport::{TransportError, http::validate_proxy_url},
+    transport::TransportError,
 };
 
 pub const IROH_SSH_ALPN: &[u8] = b"kmesh/ssh/1";
@@ -105,10 +105,6 @@ pub async fn create_endpoint(
                 "private relay-only endpoint cannot use a direct UDP handoff".to_owned(),
             ));
         }
-    }
-
-    if let Some(proxy) = &options.tls.proxy {
-        builder = builder.proxy_url(build_proxy_url(proxy)?);
     }
 
     let endpoint = builder
@@ -481,25 +477,4 @@ pub(super) fn build_ca_tls_config(tls: &TlsConfig) -> Result<CaTlsConfig, Transp
     } else {
         Ok(CaTlsConfig::default().with_extra_roots(certificates))
     }
-}
-
-fn build_proxy_url(proxy: &HttpProxyConfig) -> Result<reqwest::Url, TransportError> {
-    let mut url = validate_proxy_url(&proxy.url)?;
-    match (&proxy.username, &proxy.password) {
-        (Some(username), Some(password)) => {
-            url.set_username(username).map_err(|_| {
-                TransportError::Configuration("invalid HTTP proxy username".to_owned())
-            })?;
-            url.set_password(Some(password)).map_err(|_| {
-                TransportError::Configuration("invalid HTTP proxy password".to_owned())
-            })?;
-        }
-        (None, None) => {}
-        _ => {
-            return Err(TransportError::Configuration(
-                "HTTP proxy username and password must be configured together".to_owned(),
-            ));
-        }
-    }
-    Ok(url)
 }

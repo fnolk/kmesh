@@ -45,7 +45,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
 
-`--all-targets` includes library and binary tests, integration tests, and examples. Current tests cover protocol and identity boundaries, same-socket QAD discovery, signed UDP handoff, direct-only and private-relay endpoint policy, SSH-shaped QUIC streams, HTTPS CONNECT proxying, and failure classification. These tests do not establish that two deployed NATs select a direct path.
+`--all-targets` includes library and binary tests, integration tests, and examples. Current tests cover protocol and identity boundaries, same-socket QAD discovery, signed UDP handoff, direct-only and private-relay endpoint policy, SSH-shaped QUIC streams, direct HTTPS/WSS connections with custom CA certificates, and failure classification. These tests do not establish that two deployed NATs select a direct path.
 
 ## Live acceptance gates
 
@@ -56,7 +56,7 @@ Use one short, recorded run per required route and attach the same session ID's 
 | `PrivateDirect` | The client and agent report the same session; Iroh selects `Direct`; OpenSSH completes a command over that connection. QAD observations alone do not count as direct-path proof. |
 | `PublicDirect` | The direct-only endpoints select `Direct`; the SSH stream uses that direct path. Official relay services may provide QAD, and this route never carries SSH data through a public relay. |
 | `PrivateRelay` | Iroh selects the configured private relay URL; OpenSSH completes a command. The endpoint reports no IP transport candidates for this route. |
-| Route fallback | A bounded direct attempt fails, a fresh authorized route attempt is recorded, and the next route completes SSH on its own allowed path. Ticket, identity, TLS/CA, proxy-authentication, configuration, and RBAC errors terminate the route plan. |
+| Route fallback | A bounded direct attempt fails, a fresh authorized route attempt is recorded, and the next route completes SSH on its own allowed path. Ticket, identity, TLS/CA, configuration, and RBAC errors terminate the route plan. |
 
 After the path gates pass, verify OpenSSH host-key checking, a nonzero remote exit code, SCP/SFTP content hashes, local forwarding, ControlMaster reuse, and the RBAC boundary: an activated SSH session continues while a new connection after revocation is denied. These checks use the deployed OpenSSH client and target `sshd`; an Iroh nonce exchange is not an SSH acceptance test.
 

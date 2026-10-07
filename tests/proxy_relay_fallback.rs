@@ -20,7 +20,7 @@ fn only_classified_network_failures_advance_the_route_attempt() {
         TransportError::Tls("untrusted certificate".to_owned()),
         TransportError::Configuration("invalid relay URL".to_owned()),
         TransportError::EndpointClosed,
-        TransportError::WebSocket("proxy returned 407".to_owned()),
+        TransportError::WebSocket("relay returned HTTP 403".to_owned()),
     ];
     for error in terminal {
         assert!(!error.is_network_failure(), "{error} must fail closed");

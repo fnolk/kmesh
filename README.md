@@ -115,23 +115,18 @@ The generated block sets `ProxyCommand`, a stable `HostKeyAlias`, and OpenSSH `C
 
 The kmesh client state is separated by server origin, profile, and normalized username. Token and agent identity files use mode `0600`, their directories use mode `0700`, and refresh tokens rotate under a cross-process file lock. A refresh with an uncertain network result clears the local login and asks the user to sign in again.
 
-## Enterprise proxies and private CAs
+## Private CA certificates
 
-HTTPS control and Iroh relay connections use the same proxy and CA settings. Add proxy and enterprise CA values to the client config:
+If the server uses a private TLS certificate authority, add its certificate to the client config:
 
 ```toml
 server_url = "https://kmesh.example.com:9443"
 
 [tls]
 ca_certificates = ["/etc/ssl/certs/company-root.pem"]
-
-[tls.proxy]
-url = "https://proxy.corp.example:8443"
-username = "kmesh-client"
-password = "read-from-a-protected-config-file"
 ```
 
-The HTTPS control and private Iroh relay connections support HTTP or HTTPS CONNECT, Basic authentication, and configured enterprise CAs. `PrivateRelay` needs outbound HTTPS to the server origin; `PrivateDirect` and `PublicDirect` still depend on UDP being allowed between peers. Keep config files containing proxy passwords readable only by the user. OpenSSH verifies the target SSH host key independently of TLS and Iroh endpoint identity.
+The configured certificate authority verifies the HTTPS control connection and private Iroh relay. `PrivateRelay` needs outbound HTTPS to the server origin; `PrivateDirect` and `PublicDirect` still depend on UDP being allowed between peers. OpenSSH verifies the target SSH host key independently of TLS and Iroh endpoint identity.
 
 ## Service files
 
