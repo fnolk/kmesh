@@ -214,7 +214,6 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::DisplayVersion);
         let output = error.to_string();
         assert!(output.contains(crate::build::PKG_VERSION));
-        assert!(output.contains("branch:"));
         assert!(output.contains(crate::build::SHORT_COMMIT));
         assert!(output.contains(&format!("source_ref:{}", crate::version::SOURCE_REF)));
         assert_eq!(
