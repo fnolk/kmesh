@@ -8,7 +8,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use iroh::{RelayUrl, SecretKey};
+use iroh::{RelayUrl, SecretKey, Watcher as _};
 use iroh_relay::{
     client::ClientBuilder,
     server::{
@@ -27,6 +27,7 @@ use rcgen::generate_simple_self_signed;
 use rustls::pki_types::PrivateKeyDer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 use tokio_rustls::TlsAcceptor;
@@ -123,7 +124,11 @@ fn assert_connect_auth(headers: &[u8]) {
     assert_eq!(auth.value, expected.as_bytes());
 }
 
-async fn proxy_tunnel<S>(mut incoming: S, origin: SocketAddr)
+async fn proxy_tunnel<S>(
+    mut incoming: S,
+    origin: SocketAddr,
+    mut application_exchange_complete: watch::Receiver<bool>,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -134,16 +139,25 @@ where
         .await
         .unwrap();
     let mut upstream = TcpStream::connect(origin).await.unwrap();
-    tokio::io::copy_bidirectional(&mut incoming, &mut upstream)
-        .await
-        .unwrap();
+    match tokio::io::copy_bidirectional(&mut incoming, &mut upstream).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+            while !*application_exchange_complete.borrow() {
+                if application_exchange_complete.changed().await.is_err() {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn start_connect_proxy(
     scheme: &str,
     origin: SocketAddr,
     acceptor: TlsAcceptor,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+) -> (SocketAddr, tokio::task::JoinHandle<()>, watch::Sender<bool>) {
     start_connect_proxy_with_connections(scheme, origin, acceptor, 1).await
 }
 
@@ -152,22 +166,32 @@ async fn start_connect_proxy_with_connections(
     origin: SocketAddr,
     acceptor: TlsAcceptor,
     connection_count: usize,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+) -> (SocketAddr, tokio::task::JoinHandle<()>, watch::Sender<bool>) {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
     let secure = scheme == "https";
+    let (application_exchange_complete, task_application_exchange_complete) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut tunnels = JoinSet::new();
         for _ in 0..connection_count {
             let (stream, _) = listener.accept().await.unwrap();
             let acceptor = acceptor.clone();
+            let application_exchange_complete = task_application_exchange_complete.clone();
             tunnels.spawn(async move {
                 if secure {
-                    proxy_tunnel(acceptor.accept(stream).await.unwrap(), origin).await;
+                    proxy_tunnel(
+                        acceptor.accept(stream).await.unwrap(),
+                        origin,
+                        application_exchange_complete,
+                    )
+                    .await
+                    .unwrap();
                 } else {
-                    proxy_tunnel(stream, origin).await;
+                    proxy_tunnel(stream, origin, application_exchange_complete)
+                        .await
+                        .unwrap();
                 }
             });
         }
@@ -175,7 +199,7 @@ async fn start_connect_proxy_with_connections(
             result.unwrap();
         }
     });
-    (address, task)
+    (address, task, application_exchange_complete)
 }
 
 async fn start_rejecting_connect_proxy(
@@ -289,7 +313,7 @@ async fn rest_and_wss_use_connect_basic_and_enterprise_ca() {
         .unwrap();
     let http_origin_addr = http_origin.local_addr().unwrap();
     let http_origin_task = tokio::spawn(serve_http_origin(http_origin, acceptor.clone()));
-    let (http_proxy_addr, http_proxy_task) =
+    let (http_proxy_addr, http_proxy_task, http_exchange_complete) =
         start_connect_proxy("http", http_origin_addr, acceptor.clone()).await;
     let http_tls = tls_config(&identity, proxy_config("http", http_proxy_addr));
     let client = http_client(&http_tls).unwrap();
@@ -313,13 +337,14 @@ async fn rest_and_wss_use_connect_basic_and_enterprise_ca() {
             .unwrap(),
         "ok"
     );
-    timeout(Duration::from_secs(5), http_proxy_task)
-        .await
-        .expect("REST proxy tunnel closes")
-        .unwrap();
     timeout(Duration::from_secs(5), http_origin_task)
         .await
         .expect("REST origin closes")
+        .unwrap();
+    http_exchange_complete.send_replace(true);
+    timeout(Duration::from_secs(5), http_proxy_task)
+        .await
+        .expect("REST proxy tunnel closes")
         .unwrap();
 
     let wss_origin = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -327,7 +352,7 @@ async fn rest_and_wss_use_connect_basic_and_enterprise_ca() {
         .unwrap();
     let wss_origin_addr = wss_origin.local_addr().unwrap();
     let wss_origin_task = tokio::spawn(serve_wss_origin(wss_origin, acceptor.clone()));
-    let (wss_proxy_addr, wss_proxy_task) =
+    let (wss_proxy_addr, wss_proxy_task, wss_exchange_complete) =
         start_connect_proxy("https", wss_origin_addr, acceptor).await;
     let wss_tls = tls_config(&identity, proxy_config("https", wss_proxy_addr));
     let request = format!("wss://127.0.0.1:{}/relay", wss_origin_addr.port())
@@ -365,15 +390,16 @@ async fn rest_and_wss_use_connect_basic_and_enterprise_ca() {
         .await
         .expect("WSS close response flushes")
         .unwrap();
+    timeout(Duration::from_secs(5), wss_origin_task)
+        .await
+        .expect("WSS origin closes after the Close response")
+        .unwrap();
+    wss_exchange_complete.send_replace(true);
     websocket.get_mut().shutdown().await.unwrap();
     drop(websocket);
     timeout(Duration::from_secs(5), wss_proxy_task)
         .await
         .expect("WSS proxy tunnel closes")
-        .unwrap();
-    timeout(Duration::from_secs(5), wss_origin_task)
-        .await
-        .expect("WSS origin closes")
         .unwrap();
 }
 
@@ -390,13 +416,15 @@ async fn iroh_private_relay_carries_ssh_bytes_through_http_and_https_connect() {
     };
     let request = b"SSH-2.0-kmesh-proxy\r\nexec: uname -a\r\n";
     let response = b"OpenSSH_9.9 exit-status=0\r\n";
+    // Iroh allows 5s for the first net report and 10s for the relay handshake, plus 3s to schedule both.
+    let registration_timeout = Duration::from_secs(iroh::NET_REPORT_TIMEOUT + 13);
 
     for scheme in ["http", "https"] {
         let acceptor = tls_acceptor(&identity);
-        let (client_proxy_addr, client_proxy_task) =
+        let (client_proxy_addr, client_proxy_task, client_exchange_complete) =
             start_connect_proxy_with_connections(scheme, relay_https_addr, acceptor.clone(), 2)
                 .await;
-        let (agent_proxy_addr, agent_proxy_task) =
+        let (agent_proxy_addr, agent_proxy_task, agent_exchange_complete) =
             start_connect_proxy_with_connections(scheme, relay_https_addr, acceptor, 2).await;
         let client_tls = tls_config(&identity, proxy_config(scheme, client_proxy_addr));
         let agent_tls = tls_config(&identity, proxy_config(scheme, agent_proxy_addr));
@@ -424,17 +452,27 @@ async fn iroh_private_relay_carries_ssh_bytes_through_http_and_https_connect() {
         .await
         .unwrap();
         for endpoint in [&client, &agent] {
-            timeout(
-                Duration::from_secs(8),
+            let readiness = timeout(
+                registration_timeout,
                 wait_endpoint_ready(
                     endpoint,
                     &relay_choice,
-                    Instant::now() + Duration::from_secs(8),
+                    Instant::now() + registration_timeout,
                 ),
             )
             .await
-            .expect("private relay registration completes through CONNECT")
-            .expect("private relay registers through CONNECT");
+            .unwrap_or_else(|_| {
+                panic!(
+                    "private relay registration timed out; home relay status: {:?}",
+                    endpoint.home_relay_status().get()
+                )
+            });
+            if let Err(error) = readiness {
+                panic!(
+                    "private relay registration failed: {error:?}; home relay status: {:?}",
+                    endpoint.home_relay_status().get()
+                );
+            }
         }
 
         let client_addr = client.addr();
@@ -511,6 +549,8 @@ async fn iroh_private_relay_carries_ssh_bytes_through_http_and_https_connect() {
         drop(stream);
         target.await.unwrap();
 
+        client_exchange_complete.send_replace(true);
+        agent_exchange_complete.send_replace(true);
         client.close().await;
         agent.close().await;
         timeout(Duration::from_secs(5), client_proxy_task)
@@ -533,7 +573,7 @@ async fn iroh_relay_rejects_untrusted_ca_and_proxy_407_as_authentication_failure
     let relay_url: reqwest::Url = format!("https://127.0.0.1:{}", relay_https_addr.port())
         .parse()
         .unwrap();
-    let (proxy_addr, proxy_task) =
+    let (proxy_addr, proxy_task, application_exchange_complete) =
         start_connect_proxy("http", relay_https_addr, tls_acceptor(&identity)).await;
     let mut proxy_url: reqwest::Url = format!("http://{proxy_addr}").parse().unwrap();
     proxy_url.set_username("kmesh-test").unwrap();
@@ -557,6 +597,7 @@ async fn iroh_relay_rejects_untrusted_ca_and_proxy_407_as_authentication_failure
     .expect_err("self-signed relay certificate requires the configured CA");
     assert!(is_auth_failure_source(&untrusted_error));
     assert!(!is_network_failure_source(&untrusted_error));
+    application_exchange_complete.send_replace(true);
     timeout(Duration::from_secs(5), proxy_task)
         .await
         .expect("untrusted relay CONNECT tunnel closes")
