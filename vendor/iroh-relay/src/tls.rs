@@ -22,6 +22,7 @@ use rustls::{
 pub struct CaTlsConfig {
     mode: Mode,
     extra_roots: Vec<CertificateDer<'static>>,
+    enable_sni: bool,
     #[debug(skip)]
     client_auth: Option<Arc<dyn ResolvesClientCert>>,
 }
@@ -31,6 +32,7 @@ impl Clone for CaTlsConfig {
         Self {
             mode: self.mode.clone(),
             extra_roots: self.extra_roots.clone(),
+            enable_sni: self.enable_sni,
             client_auth: self.client_auth.clone(),
         }
     }
@@ -70,6 +72,7 @@ impl Default for CaTlsConfig {
         Self {
             mode: Mode::EmbeddedWebPki,
             extra_roots: vec![],
+            enable_sni: true,
             client_auth: None,
         }
     }
@@ -87,6 +90,7 @@ impl CaTlsConfig {
         Self {
             mode: Mode::System,
             extra_roots: Vec::new(),
+            enable_sni: true,
             client_auth: None,
         }
     }
@@ -98,6 +102,7 @@ impl CaTlsConfig {
         Self {
             mode: Mode::EmbeddedWebPki,
             extra_roots: Vec::new(),
+            enable_sni: true,
             client_auth: None,
         }
     }
@@ -110,6 +115,7 @@ impl CaTlsConfig {
         Self {
             mode: Mode::InsecureSkipVerify,
             extra_roots: Vec::new(),
+            enable_sni: true,
             client_auth: None,
         }
     }
@@ -119,6 +125,7 @@ impl CaTlsConfig {
         Self {
             mode: Mode::ExtraRootsOnly,
             extra_roots: roots.into_iter().collect(),
+            enable_sni: true,
             client_auth: None,
         }
     }
@@ -159,6 +166,7 @@ impl CaTlsConfig {
         Self {
             mode: Mode::CustomServerCertVerifier { builder },
             extra_roots: Vec::new(),
+            enable_sni: true,
             client_auth: None,
         }
     }
@@ -180,6 +188,12 @@ impl CaTlsConfig {
         resolver: Arc<dyn ResolvesClientCert>,
     ) -> Self {
         self.client_auth = Some(resolver);
+        self
+    }
+
+    /// Sets whether the generated client config sends the network hostname as TLS SNI.
+    pub fn with_sni(mut self, enabled: bool) -> Self {
+        self.enable_sni = enabled;
         self
     }
 
@@ -241,6 +255,8 @@ impl CaTlsConfig {
             Some(client_auth) => builder.with_client_cert_resolver(client_auth.clone()),
             None => builder.with_no_client_auth(),
         };
+        let mut config = config;
+        config.enable_sni = self.enable_sni;
         Ok(config)
     }
 }

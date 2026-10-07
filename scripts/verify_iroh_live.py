@@ -11,7 +11,6 @@ import base64
 import argparse
 import datetime as dt
 import hashlib
-import http.client
 import ipaddress
 import json
 import os
@@ -19,7 +18,6 @@ import re
 import select
 import signal
 import shlex
-import ssl
 import socket
 import stat
 import subprocess
@@ -1103,34 +1101,54 @@ def expect_data(response: dict[str, Any], result_name: str, label: str) -> Any:
 
 def wait_health(harness: Harness, phase: str) -> None:
     args = harness.args
-    context = ssl.create_default_context(cafile=str(args.ca_cert_file))
-    context.load_cert_chain(
-        certfile=str(args.client_cert_file),
-        keyfile=str(args.client_key_file),
-    )
+    server_addr = args.server_addr
+    if ":" in server_addr and not server_addr.startswith("["):
+        server_addr = f"[{server_addr}]"
+    request = (
+        f"GET /health HTTP/1.1\r\nHost: {server_addr}:{args.server_port}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
     deadline = time.monotonic() + 20
     last_error = ""
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection((args.server_addr, args.server_port), timeout=3) as raw_socket:
-                with context.wrap_socket(raw_socket, server_hostname=MTLS_SERVER_NAME) as connection:
-                    connection.settimeout(3)
-                    host_header = args.server_addr
-                    if ":" in host_header and not host_header.startswith("["):
-                        host_header = f"[{host_header}]"
-                    connection.sendall(
-                        f"GET /health HTTP/1.1\r\nHost: {host_header}:{args.server_port}\r\n"
-                        "Connection: close\r\n\r\n".encode("ascii")
-                    )
-                    response = http.client.HTTPResponse(connection)
-                    response.begin()
-                    status = response.status
-                    response.close()
+            result = subprocess.run(
+                [
+                    "openssl",
+                    "s_client",
+                    "-connect",
+                    f"{server_addr}:{args.server_port}",
+                    "-noservername",
+                    "-verify_hostname",
+                    MTLS_SERVER_NAME,
+                    "-verify_return_error",
+                    "-CAfile",
+                    str(args.ca_cert_file),
+                    "-cert",
+                    str(args.client_cert_file),
+                    "-key",
+                    str(args.client_key_file),
+                    "-quiet",
+                ],
+                input=request,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+            status_line = result.stdout.split(b"\r\n", 1)[0].decode("ascii", "replace")
+            status_match = re.fullmatch(r"HTTP/1\.[01] (\d{3})(?: .*)?", status_line)
+            if result.returncode != 0:
+                last_error = result.stderr.decode("utf-8", "replace").strip()
+            elif status_match is None:
+                last_error = f"invalid HTTP response: {status_line!r}"
+            else:
+                status = int(status_match.group(1))
                 if status == 200:
                     harness.record(phase, "https-health", status="passed", exit_code=0)
                     return
                 last_error = f"HTTP {status}"
-        except (http.client.HTTPException, OSError, ssl.SSLError) as error:
+        except (OSError, subprocess.TimeoutExpired) as error:
             last_error = str(error)
         time.sleep(1)
     harness.record(phase, "https-health", status="failed", stderr=last_error)
