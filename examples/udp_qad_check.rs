@@ -1,9 +1,5 @@
 use std::{
-    fs::File,
-    io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
-    path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -11,9 +7,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::StreamExt;
 use iroh::{RelayMode, endpoint::PathId};
 use iroh_relay::quic::{QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON, QuicClient};
-use iroh_relay::tls::CaTlsConfig;
 use noq::Endpoint;
-use rustls::RootCertStore;
 use serde_json::{Value, json};
 use tokio::{
     net::lookup_host,
@@ -22,11 +16,9 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use kmesh::{
-    config::TlsConfig,
-    transport::{
-        MappingDiscovery, QadPlan, QadReflector, discover_ipv4_mappings, observe_ipv4_mappings,
-    },
+use kmesh::transport::{
+    MappingDiscovery, QadPlan, QadReflector, discover_ipv4_mappings, observe_ipv4_mappings,
+    tls::{private_client_config, public_client_config},
 };
 
 const SERVER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -48,7 +40,6 @@ enum Mode {
 
 struct Args {
     mode: Mode,
-    ca_file: Option<PathBuf>,
     local_ip: Option<Ipv4Addr>,
 }
 
@@ -74,7 +65,6 @@ fn parse_args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
     let mut mode = Mode::PrivateB;
     let mut mode_seen = false;
-    let mut ca_file = None;
     let mut local_ip = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -89,7 +79,6 @@ fn parse_args() -> Result<Args> {
                 };
                 mode_seen = true;
             }
-            "--ca-file" => ca_file = args.next().map(PathBuf::from),
             "--local-ip" => {
                 local_ip = Some(
                     args.next()
@@ -99,41 +88,24 @@ fn parse_args() -> Result<Args> {
                 )
             }
             _ => bail!(
-                "usage: udp_qad_check [--mode private-b --ca-file <PEM> --local-ip <IPv4>] | [--mode official]"
+                "usage: udp_qad_check [--mode private-b --local-ip <IPv4>] | [--mode official]"
             ),
         }
     }
     if mode == Mode::PrivateB {
-        ensure!(
-            ca_file.is_some() && local_ip.is_some(),
-            "private-b mode requires --ca-file and --local-ip"
-        );
+        ensure!(local_ip.is_some(), "private-b mode requires --local-ip");
     } else {
         ensure!(
-            mode_seen && ca_file.is_none() && local_ip.is_none(),
+            mode_seen && local_ip.is_none(),
             "official mode requires --mode official and uses only the default trusted root store"
         );
     }
-    Ok(Args {
-        mode,
-        ca_file,
-        local_ip,
-    })
+    Ok(Args { mode, local_ip })
 }
 
 async fn run_private_b(args: Args) -> Result<()> {
-    let ca_file = args.ca_file.context("--ca-file is required")?;
     let local_ip = IpAddr::V4(args.local_ip.context("--local-ip is required")?);
-    let mut roots = RootCertStore::empty();
-    let mut reader = BufReader::new(File::open(&ca_file).context("open CA file")?);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<std::result::Result<Vec<_>, _>>()?;
-    ensure!(!certs.is_empty(), "CA file contains no certificates");
-    for cert in certs {
-        roots.add(cert).context("add CA certificate")?;
-    }
-    let tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let tls = private_client_config()?;
     let endpoint =
         Endpoint::client(SocketAddr::new(local_ip, 0)).context("bind one QAD UDP socket")?;
     let local_socket = endpoint.local_addr().context("read local QAD UDP socket")?;
@@ -321,12 +293,7 @@ async fn run_official() -> Result<()> {
 
     let pair_started = Instant::now();
     let pair_deadline = TokioInstant::now() + OFFICIAL_PAIR_ATTEMPT_TIMEOUT;
-    let pair_result = discover_ipv4_mappings(
-        &QadPlan::OfficialDefault,
-        &TlsConfig::default(),
-        pair_deadline,
-    )
-    .await;
+    let pair_result = discover_ipv4_mappings(&QadPlan::OfficialDefault, pair_deadline).await;
     let pair_elapsed_ms = pair_started.elapsed().as_millis();
     let pair_result = match pair_result {
         Ok(MappingDiscovery::Ready(discovered)) => {
@@ -372,16 +339,13 @@ async fn run_official() -> Result<()> {
 
             let socket = StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
                 .context("bind single-reflector IPv4 QAD socket")?;
-            let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
-            let tls = CaTlsConfig::default()
-                .client_config(crypto_provider)
-                .context("build TLS config with the official WebPKI trust roots")?;
+            let tls = public_client_config();
             let reflector = QadReflector {
                 addr: address,
                 server_name: server_name.clone(),
             };
             let (socket, observations) =
-                observe_ipv4_mappings(socket, tls, &[reflector], deadline, deadline)
+                observe_ipv4_mappings(socket, vec![tls], &[reflector], deadline, deadline)
                     .await
                     .with_context(|| format!("single official reflector QAD at {address}"))?;
             let local_socket = socket.local_addr().context("read retained QAD socket")?;
@@ -424,7 +388,7 @@ async fn run_official() -> Result<()> {
     let output = json!({
         "protocol": "Iroh QAD over QUIC/UDP",
         "mode": "official_default",
-        "tls_verification": "CaTlsConfig::default with embedded WebPKI trust roots; B CA is not loaded",
+        "tls_verification": "official QAD uses public WebPKI trust roots; private QAD uses the embedded kmesh mTLS identity",
         "production_qad_plan": {
             "reflectors": official.iter().enumerate().map(|(index, (server_name, port))| json!({
                 "order": index + 1,

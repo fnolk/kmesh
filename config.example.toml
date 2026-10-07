@@ -19,11 +19,6 @@ profile = "default"
 # username = "your-account"
 # key = "~/.ssh/id_ed25519"
 
-[tls]
-# Add private CA certificate paths when the server certificate uses a private CA.
-# ca_certificates = ["~/certs/kmesh-ca.pem"]
-# server_name = "kmesh.example.com"
-
 [ssh]
 address = "127.0.0.1:22"
 connect_timeout_secs = 10
@@ -32,7 +27,4 @@ connect_timeout_secs = 10
 # Address used by the server's HTTPS and QAD listeners.
 bind_addr = "0.0.0.0"
 udp_port = 3478
-# Set these certificate paths before running `kmesh server run`.
-# tls_cert = "/etc/kmesh/tls.crt"
-# tls_key = "/etc/kmesh/tls.key"
 disable_private_relay = false

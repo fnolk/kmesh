@@ -11,6 +11,7 @@ import base64
 import argparse
 import datetime as dt
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -25,7 +26,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -44,8 +44,8 @@ SSH_CONNECT_TIMEOUT_SECONDS = 65
 SSH_COMMAND_TIMEOUT_SECONDS = 15
 SSH_NEW_CONNECTION_TIMEOUT_SECONDS = SSH_CONNECT_TIMEOUT_SECONDS + SSH_COMMAND_TIMEOUT_SECONDS
 INITIAL_ADMIN_TOKEN_PREFIX = "初始管理员 API token（仅显示一次）："
-CA_DEFAULT = Path("/Users/example/.cache/kmesh-live/server/ca.pem")
 STATE_DEFAULT = Path("/Users/example/.cache/kmesh-live/client/iroh-integrated-20261003")
+MTLS_SERVER_NAME = "kmesh.internal"
 PATH_EVENT_RE = re.compile(
     r"连接路径(?P<change>切换)?：(?P<label>P2P 直连|Iroh 中继) \((?P<address>[^)]+)\)"
 )
@@ -448,7 +448,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=repo / "target/x86_64-unknown-linux-musl/release/kmesh",
     )
     parser.add_argument("--artifact-revision", default=None)
-    parser.add_argument("--ca-file", type=Path, default=CA_DEFAULT)
     parser.add_argument("--run-id", default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("plan", help="print planned boundaries without contacting hosts")
@@ -479,7 +478,7 @@ def print_plan(args: argparse.Namespace) -> None:
     plan = {
         "stage": [
             "read-only preflight; fail if /opt/kmesh-iroh-verification already exists",
-            "copy the Linux musl binary, reuse the existing TLS files, write two new server units and one agent template",
+            "copy the Linux musl binary with embedded mTLS identities, write two new server units and one agent template",
             "initialize a fresh SQLite data directory and capture the one-time admin API token into a 0600 local file",
             "leave both old units, binaries, and data running and untouched",
         ],
@@ -533,8 +532,13 @@ def ensure_client_inputs(harness: Harness) -> None:
         raise VerificationError("--client-binary must name the native kmesh executable")
     if not os.access(args.client_binary, os.X_OK):
         raise VerificationError("client binary is not executable")
-    if not args.ca_file.is_file():
-        raise VerificationError("--ca-file does not exist")
+    for variable, path in (
+        ("KMESH_CA_CERT_PATH", args.ca_cert_file),
+        ("KMESH_CLIENT_CERT_PATH", args.client_cert_file),
+        ("KMESH_CLIENT_KEY_PATH", args.client_key_file),
+    ):
+        if not path.is_file():
+            raise VerificationError(f"{variable} must name a PEM file for the mTLS health check")
 
 
 def preflight(harness: Harness) -> None:
@@ -626,7 +630,7 @@ def stage(harness: Harness) -> None:
             + " ".join(
                 shlex.quote(path)
                 for path in (
-                    (f"{REMOTE_ROOT}/bin", f"{REMOTE_ROOT}/server-data", f"{REMOTE_ROOT}/tls")
+                    (f"{REMOTE_ROOT}/bin", f"{REMOTE_ROOT}/server-data")
                     if label == "server"
                     else (f"{REMOTE_ROOT}/bin", f"{REMOTE_ROOT}/agent-data")
                 )
@@ -647,20 +651,6 @@ def stage(harness: Harness) -> None:
             f"&& rm {REMOTE_ROOT}/bin/kmesh.stage",
         )
 
-    old_tls = "/opt/kmesh-verification/tls"
-    harness.ssh_raw(
-        "stage",
-        "server-copy-existing-tls",
-        args.server_ssh,
-        f"install -m 0644 {old_tls}/server-cert.pem {REMOTE_ROOT}/tls/server-cert.pem "
-        f"&& install -m 0600 {old_tls}/server-key.pem {REMOTE_ROOT}/tls/server-key.pem",
-    )
-    harness.ssh_raw(
-        "stage",
-        "target-copy-existing-ca",
-        args.target_ssh,
-        f"install -m 0644 /opt/kmesh-verification/ca.pem {REMOTE_ROOT}/ca.pem",
-    )
     server_config = (
         f"server_addr = {json.dumps(args.server_addr)}\n"
         f"server_port = {args.server_port}\n"
@@ -669,8 +659,6 @@ def stage(harness: Harness) -> None:
         "[server]\n"
         "bind_addr = \"0.0.0.0\"\n"
         "udp_port = 3478\n"
-        f"tls_cert = {json.dumps(REMOTE_ROOT + '/tls/server-cert.pem')}\n"
-        f"tls_key = {json.dumps(REMOTE_ROOT + '/tls/server-key.pem')}\n"
         "disable_private_relay = false\n"
     )
     harness.remote(
@@ -700,8 +688,6 @@ def stage(harness: Harness) -> None:
         f"server_port = {args.server_port}\n"
         f"data_dir = {json.dumps(REMOTE_ROOT + '/agent-data')}\n"
         "profile = \"verification\"\n\n"
-        "[tls]\n"
-        f"ca_certificates = [{json.dumps(REMOTE_ROOT + '/ca.pem')}]\n\n"
         "[ssh]\n"
         "address = \"127.0.0.1:22\"\n"
         "connect_timeout_secs = 10\n"
@@ -949,9 +935,7 @@ def client_config(harness: Harness) -> None:
         f"server_addr = {json.dumps(args.server_addr)}\n"
         f"server_port = {args.server_port}\n"
         f"profile = \"verification\"\n"
-        f"data_dir = {json.dumps(str(harness.client_state))}\n\n"
-        "[tls]\n"
-        f"ca_certificates = [{json.dumps(str(args.ca_file))}]\n"
+        f"data_dir = {json.dumps(str(harness.client_state))}\n"
     )
     harness.args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if harness.client_config.exists():
@@ -1118,19 +1102,35 @@ def expect_data(response: dict[str, Any], result_name: str, label: str) -> Any:
 
 
 def wait_health(harness: Harness, phase: str) -> None:
-    context = ssl.create_default_context(cafile=str(harness.args.ca_file))
+    args = harness.args
+    context = ssl.create_default_context(cafile=str(args.ca_cert_file))
+    context.load_cert_chain(
+        certfile=str(args.client_cert_file),
+        keyfile=str(args.client_key_file),
+    )
     deadline = time.monotonic() + 20
     last_error = ""
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(
-                harness.args.issuer + "/health", context=context, timeout=3
-            ) as response:
-                if response.status == 200:
+            with socket.create_connection((args.server_addr, args.server_port), timeout=3) as raw_socket:
+                with context.wrap_socket(raw_socket, server_hostname=MTLS_SERVER_NAME) as connection:
+                    connection.settimeout(3)
+                    host_header = args.server_addr
+                    if ":" in host_header and not host_header.startswith("["):
+                        host_header = f"[{host_header}]"
+                    connection.sendall(
+                        f"GET /health HTTP/1.1\r\nHost: {host_header}:{args.server_port}\r\n"
+                        "Connection: close\r\n\r\n".encode("ascii")
+                    )
+                    response = http.client.HTTPResponse(connection)
+                    response.begin()
+                    status = response.status
+                    response.close()
+                if status == 200:
                     harness.record(phase, "https-health", status="passed", exit_code=0)
                     return
-                last_error = f"HTTP {response.status}"
-        except (OSError, ssl.SSLError) as error:
+                last_error = f"HTTP {status}"
+        except (http.client.HTTPException, OSError, ssl.SSLError) as error:
             last_error = str(error)
         time.sleep(1)
     harness.record(phase, "https-health", status="failed", stderr=last_error)
@@ -2175,6 +2175,9 @@ def rollback(harness: Harness) -> None:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    args.ca_cert_file = Path(os.environ.get("KMESH_CA_CERT_PATH", ""))
+    args.client_cert_file = Path(os.environ.get("KMESH_CLIENT_CERT_PATH", ""))
+    args.client_key_file = Path(os.environ.get("KMESH_CLIENT_KEY_PATH", ""))
     if not 1 <= args.server_port <= 65535:
         parser.error("--server-port must be between 1 and 65535")
     if not args.server_addr or args.server_addr != args.server_addr.strip() or any(

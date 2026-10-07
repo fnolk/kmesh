@@ -126,7 +126,7 @@ pub(super) async fn open_ssh_session(
             session_id,
             route_mode,
             deadline,
-            discover_ipv4_mappings(qad_plan, &context.config.tls, deadline),
+            discover_ipv4_mappings(qad_plan, deadline),
         )
         .await?;
         let (discovery_message, mut discovered) = match discovery {
@@ -253,7 +253,6 @@ pub(super) async fn open_ssh_session(
                 true,
                 IrohEndpointOptions {
                     relay_choice: route_transport.relay_choice.clone(),
-                    tls: context.config.tls.clone(),
                     handoff,
                 }
             ),

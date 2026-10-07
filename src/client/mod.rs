@@ -75,22 +75,6 @@ fn load_config_at(cli: &Cli, default_config_path: &Path) -> Result<Config> {
         .parent()
         .context("configuration file path has no parent directory")?;
     config.data_dir = resolve_path(&config.data_dir, config_dir);
-    config.tls.ca_certificates = config
-        .tls
-        .ca_certificates
-        .iter()
-        .map(|path| resolve_path(path, config_dir))
-        .collect();
-    config.server.tls_cert = config
-        .server
-        .tls_cert
-        .as_deref()
-        .map(|path| resolve_path(path, config_dir));
-    config.server.tls_key = config
-        .server
-        .tls_key
-        .as_deref()
-        .map(|path| resolve_path(path, config_dir));
     config.auth.key = config
         .auth
         .key
@@ -132,21 +116,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let bind_addr = args.bind_addr.unwrap_or(config.server.bind_addr);
                 let udp_port = args.udp_port.unwrap_or(config.server.udp_port);
                 anyhow::ensure!(udp_port != 0, "UDP port must be between 1 and 65535");
-                let current_dir = std::env::current_dir().context("resolve current directory")?;
-                let tls_cert = args
-                    .tls_cert
-                    .as_deref()
-                    .map(|path| resolve_path(path, &current_dir));
-                let tls_cert = tls_cert
-                    .or(config.server.tls_cert.clone())
-                    .context("set server.tls_cert or pass --tls-cert")?;
-                let tls_key = args
-                    .tls_key
-                    .as_deref()
-                    .map(|path| resolve_path(path, &current_dir));
-                let tls_key = tls_key
-                    .or(config.server.tls_key.clone())
-                    .context("set server.tls_key or pass --tls-key")?;
                 let disable_private_relay = args
                     .disable_private_relay
                     .unwrap_or(config.server.disable_private_relay);
@@ -154,8 +123,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                     data_dir: config.data_dir.clone(),
                     issuer,
                     bind: std::net::SocketAddr::new(bind_addr, config.server_port),
-                    tls_cert,
-                    tls_key,
                     qad_bind: std::net::SocketAddr::new(bind_addr, udp_port),
                     disable_private_relay,
                 })
@@ -263,7 +230,7 @@ mod tests {
         let config_path = directory.join("config.toml");
         fs::write(
             &config_path,
-            "server_addr = \"toml.example\"\nserver_port = 9443\nprofile = \"work\"\ndata_dir = \"state\"\n\n[auth]\nmethod = \"public-key\"\nusername = \"toml-user\"\nkey = \"keys/id_ed25519\"\ntoken = \"toml-token\"\n\n[tls]\nca_certificates = [\"ca.pem\"]\n\n[server]\nudp_port = 4000\ntls_cert = \"server.crt\"\ntls_key = \"server.key\"\n",
+            "server_addr = \"toml.example\"\nserver_port = 9443\nprofile = \"work\"\ndata_dir = \"state\"\n\n[auth]\nmethod = \"public-key\"\nusername = \"toml-user\"\nkey = \"keys/id_ed25519\"\ntoken = \"toml-token\"\n\n[server]\nudp_port = 4000\n",
         )
         .expect("write temporary config");
         let target = Uuid::new_v4().to_string();
@@ -298,9 +265,6 @@ mod tests {
             config.data_dir,
             std::env::current_dir().unwrap().join("cli-state")
         );
-        assert_eq!(config.tls.ca_certificates, [directory.join("ca.pem")]);
-        assert_eq!(config.server.tls_cert, Some(directory.join("server.crt")));
-        assert_eq!(config.server.tls_key, Some(directory.join("server.key")));
         assert_eq!(config.server_origin().unwrap(), "https://cli.example:9555");
         fs::remove_dir_all(directory).expect("remove temporary config directory");
     }
@@ -335,7 +299,8 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("kmesh-config-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).expect("create temporary config directory");
         let config_path = directory.join("config.toml");
-        fs::write(&config_path, "[server]\nudp_port = 0\n").expect("write config");
+        fs::write(&config_path, "data_dir = \".\"\n\n[server]\nudp_port = 0\n")
+            .expect("write config");
 
         let client_cli =
             Cli::try_parse_from(["kmesh", "--config", config_path.to_str().unwrap(), "logout"])
@@ -373,8 +338,11 @@ mod tests {
         .expect("parse server port override");
         let error = super::run(overridden_cli)
             .await
-            .expect_err("server TLS config is required after port override");
-        assert!(format!("{error:#}").contains("set server.tls_cert or pass --tls-cert"));
+            .expect_err("server must be initialized before it can run");
+        assert!(
+            format!("{error:#}").contains("server is not initialized"),
+            "unexpected server startup error: {error:#}"
+        );
         fs::remove_dir_all(directory).expect("remove temporary config directory");
     }
 }

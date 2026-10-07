@@ -11,7 +11,6 @@ use std::{
 };
 
 use clap::Parser;
-use rustls::pki_types::PrivateKeyDer;
 use ssh_key::{PublicKey, SshSig};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -28,7 +27,7 @@ use crate::{
         api::Api,
         profile::{ProfileStore, SavedLogin},
     },
-    config::{AuthConfig, Config, LoginMethod, TlsConfig},
+    config::{AuthConfig, Config, LoginMethod},
     protocol::{LoginTokens, MeView, UserView},
 };
 
@@ -241,28 +240,10 @@ fn generate_ssh_key(directory: &Path, name: &str) -> PathBuf {
     private_key
 }
 
-fn test_tls_acceptor(directory: &Path) -> (TlsAcceptor, PathBuf) {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
-        .expect("generate local test certificate");
-    let cert_pem = certificate.cert.pem();
-    let key_pem = certificate.signing_key.serialize_pem();
-    let ca_path = directory.join("test-ca.pem");
-    fs::write(&ca_path, cert_pem.as_bytes()).expect("write local CA certificate");
-    let certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .expect("parse local certificate");
-    let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem.as_bytes()))
-            .expect("parse local private key")
-            .expect("local certificate has a private key");
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates, key)
-        .expect("build local HTTPS server config");
-    (TlsAcceptor::from(Arc::new(config)), ca_path)
+fn test_tls_acceptor() -> TlsAcceptor {
+    TlsAcceptor::from(
+        crate::transport::tls::server_config().expect("build production mTLS server config"),
+    )
 }
 
 async fn read_http_request(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
@@ -407,7 +388,7 @@ async fn one_token_login_and_me(
 #[tokio::test]
 async fn token_login_uses_toml_token_fetches_actual_username_and_saves_session() {
     let directory = TestDirectory::new("token-login-test");
-    let (acceptor, ca_file) = test_tls_acceptor(&directory.0);
+    let acceptor = test_tls_acceptor();
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("bind local token login server");
@@ -439,10 +420,6 @@ async fn token_login_uses_toml_token_fetches_actual_username_and_saves_session()
         server_addr: "127.0.0.1".to_owned(),
         server_port,
         data_dir: directory.0.clone(),
-        tls: TlsConfig {
-            ca_certificates: vec![ca_file],
-            server_name: None,
-        },
         auth: AuthConfig {
             method: Some(LoginMethod::Token),
             token: Some(expected_token.to_owned()),
@@ -568,7 +545,6 @@ async fn refresh_process_child() {
     }
     let server_url = std::env::var("KMESH_TEST_REFRESH_SERVER").expect("refresh test server URL");
     let data_dir = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_DATA").expect("data dir"));
-    let ca_file = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_CA").expect("CA file"));
     let output = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_OUTPUT").expect("output file"));
     let ready = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_READY").expect("ready file"));
     let go = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_GO").expect("start gate"));
@@ -578,10 +554,6 @@ async fn refresh_process_child() {
         server_port,
         data_dir: data_dir.clone(),
         profile: "shared-profile".to_owned(),
-        tls: TlsConfig {
-            ca_certificates: vec![ca_file],
-            server_name: None,
-        },
         ..Config::default()
     };
     let api = Api::new(&config).await.expect("build API client");
@@ -612,7 +584,7 @@ async fn refresh_process_child() {
 #[tokio::test]
 async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() {
     let directory = TestDirectory::new("refresh-process-test");
-    let (acceptor, ca_file) = test_tls_acceptor(&directory.0);
+    let acceptor = test_tls_acceptor();
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("bind local refresh server");
@@ -673,7 +645,6 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
         .env(REFRESH_CHILD_ENV, "1")
         .env("KMESH_TEST_REFRESH_SERVER", &server_url)
         .env("KMESH_TEST_REFRESH_DATA", &directory.0)
-        .env("KMESH_TEST_REFRESH_CA", &ca_file)
         .env("KMESH_TEST_REFRESH_OUTPUT", &first_output)
         .env("KMESH_TEST_REFRESH_READY", &first_ready)
         .env("KMESH_TEST_REFRESH_GO", &go)
@@ -685,7 +656,6 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
         .env(REFRESH_CHILD_ENV, "1")
         .env("KMESH_TEST_REFRESH_SERVER", &server_url)
         .env("KMESH_TEST_REFRESH_DATA", &directory.0)
-        .env("KMESH_TEST_REFRESH_CA", &ca_file)
         .env("KMESH_TEST_REFRESH_OUTPUT", &second_output)
         .env("KMESH_TEST_REFRESH_READY", &second_ready)
         .env("KMESH_TEST_REFRESH_GO", &go)
@@ -734,7 +704,7 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
 #[tokio::test]
 async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
     let directory = TestDirectory::new("uncertain-refresh-test");
-    let (acceptor, ca_file) = test_tls_acceptor(&directory.0);
+    let acceptor = test_tls_acceptor();
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("bind local refresh server");
@@ -777,10 +747,6 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
         server_port,
         data_dir: directory.0.clone(),
         profile: "uncertain-profile".to_owned(),
-        tls: TlsConfig {
-            ca_certificates: vec![ca_file],
-            server_name: None,
-        },
         ..Config::default()
     };
     let api = Api::new(&config).await.expect("build API client");

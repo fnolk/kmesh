@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
-    fs::File,
-    io::{self, BufReader},
+    io,
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
@@ -20,7 +19,6 @@ use iroh_relay::{RelayQuicConfig, tls::CaTlsConfig};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    config::TlsConfig,
     protocol::{RouteMode, SelectedPath},
     transport::TransportError,
 };
@@ -36,7 +34,6 @@ pub struct HandoffOptions {
 #[derive(Clone, Debug)]
 pub struct IrohEndpointOptions {
     pub relay_choice: RelayChoice,
-    pub tls: TlsConfig,
     pub handoff: Option<HandoffOptions>,
 }
 
@@ -79,12 +76,17 @@ pub async fn create_endpoint(
         net_report_config.https_probes = true;
     }
 
+    let ca_tls_config = if matches!(&options.relay_choice, RelayChoice::Private { .. }) {
+        crate::transport::tls::private_ca_tls_config()?
+    } else {
+        CaTlsConfig::default()
+    };
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .alpns(alpns)
         .relay_mode(relay_mode)
         .net_report_config(net_report_config)
-        .ca_tls_config(build_ca_tls_config(&options.tls)?);
+        .ca_tls_config(ca_tls_config);
 
     match (&options.relay_choice, options.handoff) {
         (RelayChoice::DirectOnly, Some(handoff)) => {
@@ -445,36 +447,4 @@ pub(super) fn validate_relay_url(url: reqwest::Url) -> Result<iroh::RelayUrl, Tr
         ));
     }
     Ok(url.into())
-}
-
-pub(super) fn build_ca_tls_config(tls: &TlsConfig) -> Result<CaTlsConfig, TransportError> {
-    let mut certificates = Vec::new();
-    for path in &tls.ca_certificates {
-        let file = File::open(path).map_err(|error| {
-            TransportError::Configuration(format!(
-                "open CA certificate file {}: {error}",
-                path.display()
-            ))
-        })?;
-        certificates.extend(
-            rustls_pemfile::certs(&mut BufReader::new(file))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    TransportError::Configuration(format!(
-                        "parse CA certificate file {}: {error}",
-                        path.display()
-                    ))
-                })?,
-        );
-    }
-
-    if tls.ca_certificates.is_empty() {
-        Ok(CaTlsConfig::default())
-    } else if certificates.is_empty() {
-        Err(TransportError::Configuration(
-            "configured CA certificate files contain no certificates".to_owned(),
-        ))
-    } else {
-        Ok(CaTlsConfig::default().with_extra_roots(certificates))
-    }
 }

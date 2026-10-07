@@ -19,7 +19,6 @@ use iroh_relay::{
     http::ProtocolVersion,
     server::{Access, AccessControl, ClientRequest},
 };
-use rcgen::generate_simple_self_signed;
 use sqlx::Row;
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
 use tokio::{
@@ -35,7 +34,6 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::{
-    config::TlsConfig,
     identity,
     protocol::{
         AdminOperation, AdminResponse, AgentEnrollmentRequest, ControlMessage, DiscoveryResult,
@@ -3088,31 +3086,17 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     let fixture = fixture(&issuer).await;
     let state = &fixture.state;
 
-    let server_cert = generate_simple_self_signed(vec!["localhost".to_owned()])
-        .expect("generate local relay certificate");
-    let cert_path = fixture.data_dir.join("relay-cert.pem");
-    let key_path = fixture.data_dir.join("relay-key.pem");
-    std::fs::write(&cert_path, server_cert.cert.pem()).expect("write local relay certificate");
-    std::fs::write(&key_path, server_cert.signing_key.serialize_pem())
-        .expect("write local relay key");
-    let tls = TlsConfig {
-        ca_certificates: vec![cert_path.clone()],
-        ..TlsConfig::default()
-    };
-
     let relay_server = super::iroh::listen_and_serve(
         super::router(state.clone()),
         Some(Arc::new(state.clone())),
         SocketAddr::from(([127, 0, 0, 1], https_port)),
         SocketAddr::from(([127, 0, 0, 1], 0)),
-        &cert_path,
-        &key_path,
     )
     .await
     .expect("start local HTTPS relay and QAD");
     state.inner.transport_info.write().await.qad_port = relay_server.qad_addr().port();
 
-    let http = http_client(&tls).expect("build TLS-verified HTTP client");
+    let http = http_client().expect("build embedded mTLS HTTP client");
     let ping = http
         .get(format!("{issuer}/ping"))
         .send()
@@ -3155,7 +3139,6 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
         &issuer,
         "agent/control",
         &agent_token,
-        &tls,
         &incompatible_version,
     )
     .await;
@@ -3178,7 +3161,6 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
         &issuer,
         "connect",
         &login.access_token,
-        &tls,
         &incompatible_version,
     )
     .await;
@@ -3197,13 +3179,11 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
     };
     let endpoint_options = IrohEndpointOptions {
         relay_choice: relay_choice.clone(),
-        tls: tls.clone(),
         handoff: None,
     };
-    let mut agent_control = connect_control_ws(&issuer, "agent/control", &agent_token, &tls).await;
+    let mut agent_control = connect_control_ws(&issuer, "agent/control", &agent_token).await;
 
-    let mut client_control =
-        connect_control_ws(&issuer, "connect", &login.access_token, &tls).await;
+    let mut client_control = connect_control_ws(&issuer, "connect", &login.access_token).await;
     let client_secret = SecretKey::generate();
     let session_id = Uuid::new_v4();
     send_control(
@@ -3601,20 +3581,14 @@ async fn self_hosted_https_private_relay_and_activated_ssh_stream_work_together(
         .expect("stop local relay and QAD");
 }
 
-async fn connect_control_ws(
-    issuer: &str,
-    path: &str,
-    token: &str,
-    tls: &TlsConfig,
-) -> crate::transport::WsStream {
-    connect_control_ws_with_version(issuer, path, token, tls, crate::version::VERSION).await
+async fn connect_control_ws(issuer: &str, path: &str, token: &str) -> crate::transport::WsStream {
+    connect_control_ws_with_version(issuer, path, token, crate::version::VERSION).await
 }
 
 async fn connect_control_ws_with_version(
     issuer: &str,
     path: &str,
     token: &str,
-    tls: &TlsConfig,
     version: &str,
 ) -> crate::transport::WsStream {
     let mut url =
@@ -3632,7 +3606,7 @@ async fn connect_control_ws_with_version(
         crate::version::VERSION_HEADER,
         WsHeaderValue::from_str(version).expect("build WSS version header"),
     );
-    crate::transport::connect_wss(request, tls)
+    crate::transport::connect_wss(request)
         .await
         .expect("connect TLS-verified WSS control channel")
 }

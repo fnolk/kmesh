@@ -8,14 +8,15 @@ use iroh::{
         Connection, NetReportConfig, PortmapperConfig, RecvStream, SendStream, VarInt, presets,
     },
 };
-use iroh_relay::{RelayQuicConfig, tls::CaTlsConfig};
+use iroh_relay::RelayQuicConfig;
+use kmesh::transport::tls::private_ca_tls_config;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    fs::{self, File},
-    io::{BufReader, Write},
+    fs,
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     path::PathBuf,
     process::ExitCode,
@@ -85,7 +86,6 @@ struct Args {
     observe_mappings: bool,
     mapping_candidates: bool,
     peer_ip_only: bool,
-    ca_file: Option<PathBuf>,
     local_ip: Option<Ipv4Addr>,
     endpoint_secret_key_file: Option<PathBuf>,
 }
@@ -175,16 +175,7 @@ async fn run() -> Result<()> {
     })];
     let builder = match args.relay_selection {
         RelaySelection::Private => {
-            let ca_file = args
-                .ca_file
-                .as_ref()
-                .context("private relay mode requires --ca-file")?;
-            let mut ca_reader = BufReader::new(File::open(ca_file).context("open B CA file")?);
-            let certs = rustls_pemfile::certs(&mut ca_reader)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("parse B CA file")?;
-            ensure!(!certs.is_empty(), "B CA file contains no certificates");
-            let ca_tls = CaTlsConfig::default().with_extra_roots(certs);
+            let ca_tls = private_ca_tls_config()?;
             let local_ip = args
                 .local_ip
                 .context("private relay mode requires --local-ip")?;
@@ -813,7 +804,6 @@ fn parse_args() -> Result<Args> {
     let mut observe_mappings = false;
     let mut mapping_candidates = false;
     let mut peer_ip_only = false;
-    let mut ca_file = None;
     let mut local_ip = None;
     let mut endpoint_secret_key_file = None;
     let mut args = std::env::args().skip(1);
@@ -836,7 +826,6 @@ fn parse_args() -> Result<Args> {
             "--observe-mappings" => observe_mappings = true,
             "--mapping-candidates" => mapping_candidates = true,
             "--peer-ip-only" => peer_ip_only = true,
-            "--ca-file" => ca_file = args.next().map(PathBuf::from),
             "--local-ip" => {
                 local_ip = Some(
                     args.next()
@@ -850,7 +839,7 @@ fn parse_args() -> Result<Args> {
             }
             _ => {
                 bail!(
-                    "usage: udp_ac_check --role target|client --relay-mode private|public [--observe-mappings | --mapping-candidates [--peer-ip-only]] [--ca-file <PEM>] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
+                    "usage: udp_ac_check --role target|client --relay-mode private|public [--observe-mappings | --mapping-candidates [--peer-ip-only]] [--local-ip <IPv4> --endpoint-secret-key-file <FILE>]"
                 )
             }
         }
@@ -870,7 +859,6 @@ fn parse_args() -> Result<Args> {
     );
     match relay_selection {
         RelaySelection::Private => {
-            ensure!(ca_file.is_some(), "private relay mode requires --ca-file");
             ensure!(local_ip.is_some(), "private relay mode requires --local-ip");
             ensure!(
                 endpoint_secret_key_file.is_some(),
@@ -888,7 +876,6 @@ fn parse_args() -> Result<Args> {
         observe_mappings,
         mapping_candidates,
         peer_ip_only,
-        ca_file,
         local_ip,
         endpoint_secret_key_file,
     })

@@ -106,10 +106,6 @@ pub struct ServerRunArgs {
     pub bind_addr: Option<IpAddr>,
     #[arg(long, help = "UDP port for the QAD listener (default 3478)")]
     pub udp_port: Option<u16>,
-    #[arg(long, help = "Path to the TLS certificate chain")]
-    pub tls_cert: Option<PathBuf>,
-    #[arg(long, help = "Path to the TLS private key")]
-    pub tls_key: Option<PathBuf>,
     #[arg(
         long,
         num_args = 0..=1,

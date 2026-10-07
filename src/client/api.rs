@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
 
 use crate::{
-    config::{Config, TlsConfig},
+    config::Config,
     protocol::{
         AdminRequest, AdminResponse, AgentEnrollmentRequest, AgentEnrollmentResponse,
         ControlMessage, LoginTokens, PublicKeyChallenge, PublicKeyChallengeRequest,
@@ -34,20 +34,14 @@ pub enum ApiFailure {
 #[derive(Clone)]
 pub struct Api {
     base_url: String,
-    tls: TlsConfig,
     http: reqwest::Client,
 }
 
 impl Api {
     pub async fn new(config: &Config) -> Result<Self> {
-        let http =
-            http_client(&config.tls).map_err(|error| anyhow!("build HTTP client: {error}"))?;
+        let http = http_client().map_err(|error| anyhow!("build HTTP client: {error}"))?;
         let base_url = config.server_origin()?;
-        Ok(Self {
-            base_url,
-            tls: config.tls.clone(),
-            http,
-        })
+        Ok(Self { base_url, http })
     }
 
     pub fn issuer(&self) -> &str {
@@ -211,7 +205,7 @@ impl Api {
             crate::version::VERSION_HEADER,
             HeaderValue::from_static(crate::version::VERSION),
         );
-        tokio::time::timeout(Duration::from_secs(15), connect_wss(request, &self.tls))
+        tokio::time::timeout(Duration::from_secs(15), connect_wss(request))
             .await
             .map_err(|_| {
                 anyhow!(ApiFailure::Network(

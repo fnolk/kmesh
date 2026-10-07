@@ -2,6 +2,8 @@
 
 `verify_iroh_live.py` separates read-only preflight, side-by-side staging, service transition, binary refresh, and transport checks. Staging creates `/opt/kmesh-iroh-verification`, a fresh SQLite database, two mutually exclusive server units, and one target-agent template. `deploy` is the service transition; `refresh-binary` updates only the new namespace while preserving the current mode, database, and target identity. The original verification server and agent files/data remain available for rollback.
 
+Build the client and Linux binaries with the same five mTLS inputs described in [`../README.md`](../README.md#build-time-mtls-certificates), then keep `KMESH_CA_CERT_PATH`, `KMESH_CLIENT_CERT_PATH`, and `KMESH_CLIENT_KEY_PATH` set when running this script. The binaries embed their mTLS identities; the script's Python health probe uses those three PEM files to present the client identity and verify the fixed server name `kmesh.internal`.
+
 The current deployment uses code revision `548523fc39dffdef84ec9edbd574ac8d944bf38b`. Password and SSHSIG logins both succeeded. OpenSSH connected to `target-1` (`server-1`), verified the Ed25519 host key read through the authenticated management SSH connection, and returned the requested exit code 23. Two fresh PublicDefault SSH connections under the same kmesh login session also succeeded after the control-close fix.
 
 Private-mode extended checks were run against revision `423a4a77fa1ae76540c7403417058f9aa9a84b7d`. They passed the 1 MiB SCP/SFTP hash comparison, local forwarding to the target SSHD banner, strict rejection of a wrong host key, ControlMaster reuse, and the RBAC revoke boundary. The existing master continued after revocation, a fresh connection was denied, and the grant was restored.

@@ -1,6 +1,4 @@
 use std::{
-    fs::File,
-    io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     path::PathBuf,
     process::ExitCode,
@@ -14,6 +12,7 @@ use iroh::{
     endpoint::{NetReportConfig, PortmapperConfig, presets},
 };
 use iroh_relay::{RelayQuicConfig, tls::CaTlsConfig};
+use kmesh::transport::tls::private_ca_tls_config;
 use serde::Serialize;
 use serde_json::json;
 use tokio::time::{Instant, timeout_at};
@@ -24,7 +23,6 @@ const ALPN: &[u8] = b"kmesh/udp-handoff-check/1";
 const ROUND_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Args {
-    ca_file: PathBuf,
     local_ip: Ipv4Addr,
     endpoint_secret_key_file: PathBuf,
 }
@@ -44,13 +42,11 @@ struct EndpointSnapshot {
 }
 
 fn parse_args() -> Result<Args> {
-    let mut ca_file = None;
     let mut local_ip = None;
     let mut endpoint_secret_key_file = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--ca-file" => ca_file = args.next().map(PathBuf::from),
             "--local-ip" => {
                 local_ip = Some(
                     args.next()
@@ -63,12 +59,11 @@ fn parse_args() -> Result<Args> {
                 endpoint_secret_key_file = args.next().map(PathBuf::from)
             }
             _ => bail!(
-                "usage: udp_handoff_check --ca-file <PEM> --local-ip <IPv4> --endpoint-secret-key-file <FILE>"
+                "usage: udp_handoff_check --local-ip <IPv4> --endpoint-secret-key-file <FILE>"
             ),
         }
     }
     Ok(Args {
-        ca_file: ca_file.context("--ca-file is required")?,
         local_ip: local_ip.context("--local-ip is required")?,
         endpoint_secret_key_file: endpoint_secret_key_file
             .context("--endpoint-secret-key-file is required")?,
@@ -214,12 +209,7 @@ async fn run() -> Result<()> {
         .map_err(|_| anyhow!("Endpoint secret key must contain 32 bytes"))?;
     let secret_key = SecretKey::from_bytes(&bytes);
 
-    let mut ca_reader = BufReader::new(File::open(&args.ca_file).context("open B CA file")?);
-    let certs = rustls_pemfile::certs(&mut ca_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("parse B CA file")?;
-    ensure!(!certs.is_empty(), "B CA file contains no certificates");
-    let ca_tls = CaTlsConfig::default().with_extra_roots(certs);
+    let ca_tls = private_ca_tls_config()?;
 
     let old_endpoint = bind_endpoint(
         secret_key.clone(),

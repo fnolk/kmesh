@@ -21,8 +21,6 @@ PRIVATE_RELAY_URL = "https://192.0.2.11:9443/"
 B_QAD_PORT = 3478
 OFFICIAL_RELAY_URL = "https://aps1-1.relay.n0.iroh.link./"
 OFFICIAL_QAD_PORT = 7842
-CLIENT_CA = "/Users/example/.cache/kmesh-live/server/ca.pem"
-TARGET_CA = "/opt/kmesh-iroh-verification/ca.pem"
 TIMEOUT = 60
 LOG_FILTER = "warn,iroh::socket=trace"
 PID_MARKER = re.compile(rb"KMESH_AC_REMOTE_PID=([0-9]+)")
@@ -295,7 +293,6 @@ async def run(args):
     pid_file = f"/tmp/kmesh-udp-ac-{run_id}.pid"
     target_args = [
         args.target_bin, "--role", "target", "--relay-mode", args.relay_mode,
-        "--ca-file", TARGET_CA,
     ]
     if args.relay_mode == "private":
         target_args.extend([
@@ -378,7 +375,6 @@ exec {' '.join(shlex.quote(arg) for arg in target_args)}
             raise TimeoutError("runner deadline elapsed before start")
         client_args = [
             str(client_bin), "--role", "client", "--relay-mode", args.relay_mode,
-            "--ca-file", CLIENT_CA,
         ]
         if args.relay_mode == "private":
             client_args.extend([

@@ -1,7 +1,5 @@
 use std::{
-    io::BufReader,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
-    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -11,25 +9,40 @@ use iroh_relay::server::{
     CertConfig, QuicConfig as RelayQuicConfig, RelayConfig as RelayHttpConfig,
     Server as RelayServer, ServerConfig as RelayServerConfig, TlsConfig as RelayTlsConfig,
 };
-use iroh_relay::tls::CaTlsConfig;
-use kmesh::{
-    config::TlsConfig,
-    transport::{
-        IrohEndpointOptions, QadReflector, RelayChoice, allowed_relay_urls, create_endpoint,
-        observe_ipv4_mappings, validate_endpoint_addr, wait_endpoint_ready,
-    },
+use kmesh::transport::{
+    IrohEndpointOptions, QadReflector, RelayChoice, allowed_relay_urls, create_endpoint,
+    observe_ipv4_mappings, tls::private_client_config, validate_endpoint_addr, wait_endpoint_ready,
 };
-use rcgen::generate_simple_self_signed;
-use rustls::pki_types::PrivateKeyDer;
+use rustls::{RootCertStore, server::WebPkiClientVerifier};
 use tokio::time::{Instant, timeout};
-use uuid::Uuid;
 
-struct TestCertificate(PathBuf);
-
-impl Drop for TestCertificate {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+fn embedded_server_tls() -> rustls::ServerConfig {
+    let read = |name: &str| {
+        std::fs::read(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
+            .unwrap_or_else(|error| panic!("read {name}: {error}"))
+    };
+    let certificates = |pem: &[u8]| {
+        rustls_pemfile::certs(&mut std::io::BufReader::new(pem))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let mut roots = RootCertStore::empty();
+    for certificate in certificates(&read("KMESH_CA_CERT_PATH")) {
+        roots.add(certificate).unwrap();
     }
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        read("KMESH_SERVER_KEY_PATH").as_slice(),
+    ))
+    .unwrap()
+    .unwrap();
+    rustls::ServerConfig::builder()
+        .with_client_cert_verifier(
+            WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .unwrap(),
+        )
+        .with_single_cert(certificates(&read("KMESH_SERVER_CERT_PATH")), key)
+        .unwrap()
 }
 
 #[test]
@@ -59,25 +72,7 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    let certificate = generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
-    let certificate_pem = certificate.cert.pem();
-    let key_pem = certificate.signing_key.serialize_pem();
-    let ca_path = std::env::temp_dir().join(format!("kmesh-iroh-ca-{}.pem", Uuid::new_v4()));
-    std::fs::write(&ca_path, &certificate_pem).unwrap();
-    let certificate_file = TestCertificate(ca_path);
-
-    let server_certificates =
-        rustls_pemfile::certs(&mut BufReader::new(certificate_pem.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-    let server_key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-            .unwrap()
-            .unwrap();
-    let server_tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(server_certificates, server_key)
-        .unwrap();
+    let server_tls = embedded_server_tls();
 
     let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut relay_http = RelayHttpConfig::new(loopback);
@@ -99,13 +94,7 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
         unreachable!("the self-hosted QAD listener is bound to IPv4 loopback")
     };
 
-    let mut ca_reader = BufReader::new(certificate_pem.as_bytes());
-    let ca_certs = rustls_pemfile::certs(&mut ca_reader)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let ca_tls = CaTlsConfig::default().with_extra_roots(ca_certs);
-    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
-    let qad_tls = ca_tls.client_config(crypto_provider).unwrap();
+    let qad_tls = private_client_config().unwrap();
     let qad_socket = StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let SocketAddr::V4(local_qad_socket) = qad_socket.local_addr().unwrap() else {
         unreachable!("QAD test socket was bound to IPv4 loopback")
@@ -120,7 +109,7 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
         Duration::from_secs(10),
         observe_ipv4_mappings(
             qad_socket,
-            qad_tls,
+            vec![qad_tls],
             &[reflector],
             probe_deadline,
             cleanup_deadline,
@@ -156,10 +145,6 @@ async fn self_hosted_endpoint_is_relay_only_and_qad_reports_on_its_own_socket() 
             relay_choice: RelayChoice::Private {
                 url: relay_url,
                 quic_port: qad_addr.port(),
-            },
-            tls: TlsConfig {
-                ca_certificates: vec![certificate_file.0.clone()],
-                server_name: None,
             },
             handoff: None,
         },
