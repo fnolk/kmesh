@@ -63,10 +63,9 @@ where
         .map_err(TransportError::Network)?;
     socket.set_nodelay(true).map_err(TransportError::Network)?;
     let config = Arc::new(super::tls::private_client_config()?);
-    let server_name =
-        ServerName::try_from(super::tls::TLS_SERVER_NAME.to_owned()).map_err(|error| {
-            TransportError::Configuration(format!("invalid TLS server name: {error}"))
-        })?;
+    let server_name = ServerName::try_from(socket_host.to_owned()).map_err(|error| {
+        TransportError::Configuration(format!("invalid WSS server host: {error}"))
+    })?;
     let stream = TlsConnector::from(config)
         .connect(server_name, socket)
         .await

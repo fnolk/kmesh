@@ -120,13 +120,15 @@ pub fn private_client_config() -> Result<ClientConfig, TransportError> {
     ensure_crypto_provider();
     let verifier = fixed_server_verifier(root_cert_store()?)?;
     let (certificate_chain, private_key) = client_identity()?;
-    ClientConfig::builder()
+    let mut config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(certificate_chain, private_key)
         .map_err(|error| {
             TransportError::Configuration(format!("build embedded client TLS identity: {error}"))
-        })
+        })?;
+    config.enable_sni = false;
+    Ok(config)
 }
 
 /// Build a client TLS config for public WebPKI QAD reflectors.
@@ -162,7 +164,8 @@ pub fn private_ca_tls_config() -> Result<CaTlsConfig, TransportError> {
     });
     let resolver = private_client_config()?.client_auth_cert_resolver.clone();
     Ok(CaTlsConfig::custom_server_cert_verifier(verifier_builder)
-        .with_client_cert_resolver(resolver))
+        .with_client_cert_resolver(resolver)
+        .with_sni(false))
 }
 
 pub(crate) fn fixed_server_verifier(
@@ -218,7 +221,10 @@ mod tests {
 
     async fn server_handshake(
         client_config: ClientConfig,
-    ) -> (Result<(), String>, JoinHandle<Result<(), String>>) {
+    ) -> (
+        Result<(), String>,
+        JoinHandle<Result<Option<String>, String>>,
+    ) {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .expect("bind TLS test listener");
@@ -229,7 +235,7 @@ mod tests {
             acceptor
                 .accept(stream)
                 .await
-                .map(|_| ())
+                .map(|stream| stream.get_ref().1.server_name().map(str::to_owned))
                 .map_err(|error| error.to_string())
         });
         let server_name =
@@ -254,10 +260,14 @@ mod tests {
         )
         .await;
         client.expect("embedded mTLS client handshake succeeds");
-        server
-            .await
-            .expect("join server handshake")
-            .expect("server accepts the embedded client");
+        assert_eq!(
+            server
+                .await
+                .expect("join server handshake")
+                .expect("server accepts the embedded client"),
+            None,
+            "private mTLS omits the network host from TLS SNI"
+        );
 
         let client_config = ClientConfig::builder()
             .dangerous()
@@ -342,5 +352,21 @@ mod tests {
                 .verify_server_cert(certificate, &certificates[1..], &name, &[], time)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn private_tls_configs_omit_sni_and_public_qad_keeps_webpki_sni() {
+        let private = private_client_config().expect("build embedded private client config");
+        assert!(!private.enable_sni);
+        assert!(private.client_auth_cert_resolver.has_certs());
+
+        let private_relay = private_ca_tls_config()
+            .expect("build embedded private relay TLS config")
+            .client_config(Arc::new(rustls::crypto::ring::default_provider()))
+            .expect("build embedded private relay client config");
+        assert!(!private_relay.enable_sni);
+        assert!(private_relay.client_auth_cert_resolver.has_certs());
+
+        assert!(public_client_config().enable_sni);
     }
 }

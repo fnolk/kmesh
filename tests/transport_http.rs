@@ -18,7 +18,12 @@ use kmesh::transport::{
     tls::private_ca_tls_config,
 };
 use rcgen::generate_simple_self_signed;
-use rustls::{RootCertStore, pki_types::PrivateKeyDer, server::WebPkiClientVerifier};
+use rustls::{
+    RootCertStore,
+    pki_types::PrivateKeyDer,
+    server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier},
+    sign::CertifiedKey,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -65,6 +70,12 @@ fn parse_private_key(pem: &[u8]) -> PrivateKeyDer<'static> {
 }
 
 fn embedded_server_config() -> rustls::ServerConfig {
+    embedded_server_config_with_sni_observer(None)
+}
+
+fn embedded_server_config_with_sni_observer(
+    sni_observer: Option<Arc<std::sync::Mutex<Vec<Option<String>>>>>,
+) -> rustls::ServerConfig {
     ensure_crypto_provider();
     let ca = parse_certificates(&configured_pem("KMESH_CA_CERT_PATH"));
     let mut roots = RootCertStore::empty();
@@ -74,13 +85,42 @@ fn embedded_server_config() -> rustls::ServerConfig {
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
         .unwrap();
-    rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(
-            parse_certificates(&configured_pem("KMESH_SERVER_CERT_PATH")),
-            parse_private_key(&configured_pem("KMESH_SERVER_KEY_PATH")),
-        )
-        .unwrap()
+    let certificate_chain = parse_certificates(&configured_pem("KMESH_SERVER_CERT_PATH"));
+    let private_key = parse_private_key(&configured_pem("KMESH_SERVER_KEY_PATH"));
+    let builder = rustls::ServerConfig::builder().with_client_cert_verifier(verifier);
+    match sni_observer {
+        Some(sni_observer) => {
+            let certified_key = CertifiedKey::from_der(
+                certificate_chain,
+                private_key,
+                &rustls::crypto::ring::default_provider(),
+            )
+            .unwrap();
+            builder.with_cert_resolver(Arc::new(RecordingCertResolver {
+                certified_key: Arc::new(certified_key),
+                sni_observer,
+            }))
+        }
+        None => builder
+            .with_single_cert(certificate_chain, private_key)
+            .unwrap(),
+    }
+}
+
+#[derive(Debug)]
+struct RecordingCertResolver {
+    certified_key: Arc<CertifiedKey>,
+    sni_observer: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+impl ResolvesServerCert for RecordingCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.sni_observer
+            .lock()
+            .unwrap()
+            .push(client_hello.server_name().map(str::to_owned));
+        Some(self.certified_key.clone())
+    }
 }
 
 fn untrusted_server_config(identity: &LocalCertificate) -> rustls::ServerConfig {
@@ -132,17 +172,36 @@ async fn start_local_relay(server_tls: rustls::ServerConfig) -> (RelayServer, So
     (server, https_addr)
 }
 
-async fn serve_http_origin(listener: TcpListener, acceptor: TlsAcceptor) {
-    let (stream, _) = listener.accept().await.unwrap();
-    let mut stream = acceptor.accept(stream).await.unwrap();
-    let _headers = read_headers(&mut stream).await;
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-        .await
-        .unwrap();
+async fn serve_http_origin(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    request_count: usize,
+) -> Vec<(Option<String>, String)> {
+    let mut requests = Vec::with_capacity(request_count);
+    for _ in 0..request_count {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+        let server_name = stream.get_ref().1.server_name().map(str::to_owned);
+        let headers = read_headers(&mut stream).await;
+        let headers = String::from_utf8(headers).unwrap();
+        let host = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("host")
+                    .then(|| value.trim().to_owned())
+            })
+            .expect("HTTP request carries its destination host");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        requests.push((server_name, host));
+    }
+    requests
 }
 
-async fn serve_wss_origin(listener: TcpListener, acceptor: TlsAcceptor) {
+async fn serve_wss_origin(listener: TcpListener, acceptor: TlsAcceptor) -> Option<String> {
     let (stream, _) = listener.accept().await.unwrap();
     let stream = acceptor.accept(stream).await.unwrap();
     let mut websocket = accept_async(stream).await.unwrap();
@@ -156,7 +215,14 @@ async fn serve_wss_origin(listener: TcpListener, acceptor: TlsAcceptor) {
         .unwrap();
     websocket.send(Message::Close(None)).await.unwrap();
     let _ = websocket.next().await;
+    let server_name = websocket
+        .get_ref()
+        .get_ref()
+        .1
+        .server_name()
+        .map(str::to_owned);
     websocket.get_mut().shutdown().await.unwrap();
+    server_name
 }
 
 async fn reject_wss_origin(listener: TcpListener, acceptor: TlsAcceptor) {
@@ -177,33 +243,40 @@ async fn rest_and_wss_use_the_embedded_mtls_identity_over_direct_connections() {
         .await
         .unwrap();
     let http_origin_addr = http_origin.local_addr().unwrap();
-    let http_origin_task = tokio::spawn(serve_http_origin(http_origin, acceptor.clone()));
+    let http_origin_task = tokio::spawn(serve_http_origin(http_origin, acceptor.clone(), 2));
     let client = http_client().unwrap();
-    let response = timeout(
-        Duration::from_secs(5),
-        client
-            .get(format!(
-                "https://127.0.0.1:{}/rest",
-                http_origin_addr.port()
-            ))
-            .send(),
-    )
-    .await
-    .expect("REST request completes")
-    .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(response.bytes().await.unwrap(), "ok");
-    timeout(Duration::from_secs(5), http_origin_task)
+    for host in ["localhost", "127.0.0.1"] {
+        let response = timeout(
+            Duration::from_secs(5),
+            client
+                .get(format!("https://{host}:{}/rest", http_origin_addr.port()))
+                .send(),
+        )
+        .await
+        .expect("REST request completes")
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), "ok");
+    }
+    let server_requests = timeout(Duration::from_secs(5), http_origin_task)
         .await
         .expect("REST origin closes")
         .unwrap();
+    assert_eq!(
+        server_requests,
+        vec![
+            (None, format!("localhost:{}", http_origin_addr.port())),
+            (None, format!("127.0.0.1:{}", http_origin_addr.port())),
+        ],
+        "REST preserves each URL host while private mTLS omits SNI"
+    );
 
     let wss_origin = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
     let wss_origin_addr = wss_origin.local_addr().unwrap();
     let wss_origin_task = tokio::spawn(serve_wss_origin(wss_origin, acceptor));
-    let request = format!("wss://127.0.0.1:{}/relay", wss_origin_addr.port())
+    let request = format!("wss://localhost:{}/relay", wss_origin_addr.port())
         .into_client_request()
         .unwrap();
     let mut websocket = timeout(Duration::from_secs(5), connect_wss(request))
@@ -235,18 +308,26 @@ async fn rest_and_wss_use_the_embedded_mtls_identity_over_direct_connections() {
         Message::Close(_)
     ));
     websocket.flush().await.unwrap();
-    timeout(Duration::from_secs(5), wss_origin_task)
-        .await
-        .expect("WSS origin closes after the Close response")
-        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(5), wss_origin_task)
+            .await
+            .expect("WSS origin closes after the Close response")
+            .unwrap(),
+        None,
+        "WSS private mTLS omits the network host from TLS SNI"
+    );
 }
 
 #[tokio::test]
 async fn private_iroh_relay_uses_mtls_and_rejects_a_wrong_ca() {
     ensure_crypto_provider();
-    let (relay_server, relay_https_addr) = start_local_relay(embedded_server_config()).await;
+    let sni_observer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (relay_server, relay_https_addr) = start_local_relay(
+        embedded_server_config_with_sni_observer(Some(sni_observer.clone())),
+    )
+    .await;
     let relay_url = RelayUrl::from(
-        format!("https://127.0.0.1:{}", relay_https_addr.port())
+        format!("https://localhost:{}", relay_https_addr.port())
             .parse::<reqwest::Url>()
             .unwrap(),
     );
@@ -263,6 +344,12 @@ async fn private_iroh_relay_uses_mtls_and_rejects_a_wrong_ca() {
     .await
     .expect("mTLS relay connect completes")
     .expect("embedded client certificate authenticates to the private relay");
+    let observed_sni = sni_observer.lock().unwrap().clone();
+    assert!(!observed_sni.is_empty(), "relay received a TLS ClientHello");
+    assert!(
+        observed_sni.iter().all(Option::is_none),
+        "private relay handshake omits SNI: {observed_sni:?}"
+    );
     relay_server.shutdown().await.unwrap();
 
     let identity = local_certificate();

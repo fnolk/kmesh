@@ -24,7 +24,7 @@ The CI workflow builds Linux x86_64/aarch64 musl, macOS Apple Silicon, and Windo
 
 ## Start the public server
 
-Set `server_addr` to the public IP address or hostname clients use to reach the server. The mTLS server identity is always `DNS:kmesh.internal`, so the network address can change independently. kmesh builds the HTTPS origin internally from `server_addr` and `server_port`; configuration and command-line arguments take the address without `https://` or a path. The default ports are TCP 9443 for HTTPS and UDP 3478 for QAD.
+Set `server_addr` to the public IP address or hostname clients use to reach the server. Private mTLS handshakes omit SNI, so this address is used for network resolution and the HTTP `Host` value only. The server certificate still identifies the kmesh service as `DNS:kmesh.internal`; clients validate that identity against the embedded CA independently of the configured address. kmesh builds the HTTPS origin internally from `server_addr` and `server_port`; configuration and command-line arguments take the address without `https://` or a path. The default ports are TCP 9443 for HTTPS and UDP 3478 for QAD.
 
 Copy [`config.example.toml`](config.example.toml) to `~/.kmesh/config.toml` and edit it for this host. When that file exists, kmesh uses it for defaults. Explicit command-line options override TOML values, and built-in values apply when neither supplies a setting. Paths in TOML may start with `~/`; other relative paths resolve from the config file's directory. The default data directory is `~/.cache/kmesh`.
 
@@ -130,7 +130,7 @@ The kmesh client state is separated by server origin, profile, and normalized us
 
 ## Build-time mTLS certificates
 
-Every build needs a CA certificate, a server certificate and key, and a client certificate and key. The CA certificate is the public trust anchor each side uses to verify its peer's certificate; its separate private key signs certificates and stays outside the build inputs. The server certificate must identify `DNS:kmesh.internal`; `server_addr` remains a separately configurable network address. The server validates the peer's client certificate against the embedded CA and `clientAuth` usage. Clients and agents validate the peer's server certificate against the embedded CA, `serverAuth` usage, and fixed `DNS:kmesh.internal` identity.
+Every build needs a CA certificate, a server certificate and key, and a client certificate and key. The CA certificate is the public trust anchor each side uses to verify its peer's certificate; its separate private key signs certificates and stays outside the build inputs. The server certificate must identify `DNS:kmesh.internal`; `server_addr` remains a separately configurable network address and private mTLS handshakes omit SNI. The server validates the peer's client certificate against the embedded CA and `clientAuth` usage. Clients and agents validate the peer's server certificate against the embedded CA, `serverAuth` usage, and fixed `DNS:kmesh.internal` service identity. Public QAD connections continue to use normal WebPKI validation and hostname SNI.
 
 Open-source users can create a local CA and both identities with the included OpenSSL script. It writes a private output directory with mode `0700`, protects PEM files with mode `0600`, and issues server/client certificates with the required EKUs and validity through `2099-12-31 23:59:59 UTC`:
 
