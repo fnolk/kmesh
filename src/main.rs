@@ -56,7 +56,7 @@ async fn main() {
         Ok(()) if proxy => std::process::exit(0),
         Ok(()) => {}
         Err(error) => {
-            eprintln!("执行失败：{error:#}");
+            eprintln!("Command failed: {}", kmesh::client::format_error(&error));
             std::process::exit(1);
         }
     }

@@ -88,7 +88,7 @@ async fn login_reports_missing_method_token_username_and_key_before_network() {
     let error = super::login(&context, &LoginArgs::default())
         .await
         .expect_err("login requires an explicit method");
-    assert!(format!("{error:#}").contains("login method is required"));
+    assert!(format!("{error:#}").contains("Login method is required"));
 
     let context = auth_context(Config {
         auth: AuthConfig {
@@ -101,7 +101,7 @@ async fn login_reports_missing_method_token_username_and_key_before_network() {
     let error = super::login(&context, &LoginArgs::default())
         .await
         .expect_err("token login requires a token");
-    assert!(format!("{error:#}").contains("API JWT is required"));
+    assert!(format!("{error:#}").contains("API token is required"));
 
     let context = auth_context(Config {
         auth: AuthConfig {
@@ -193,7 +193,7 @@ async fn token_env_precedence_child() {
     let error = super::login(&context, &args)
         .await
         .expect_err("empty CLI/environment token overrides TOML");
-    assert!(format!("{error:#}").contains("API JWT is empty"));
+    assert!(format!("{error:#}").contains("API token is empty"));
 }
 
 #[tokio::test]
@@ -460,7 +460,62 @@ async fn expired_api_jwt_requires_a_replacement_without_refreshing() {
         .expect("select expired API JWT");
 
     let error = super::valid_access_token(&context).await.unwrap_err();
-    assert!(error.to_string().contains("配置新 token"));
+    assert_eq!(
+        error.to_string(),
+        "API token expired. Set a new token and run kmesh login."
+    );
+    assert!(context.profiles.load("alice").unwrap().is_none());
+    assert!(context.profiles.active_user().is_err());
+}
+
+#[tokio::test]
+async fn missing_saved_login_reports_the_login_command() {
+    let directory = TestDirectory::new("missing-saved-login-test");
+    let context = auth_context(Config {
+        data_dir: directory.0.clone(),
+        ..Config::default()
+    })
+    .await;
+    let error = super::valid_access_token_for_user(&context, "alice")
+        .await
+        .expect_err("missing login requires authentication");
+    assert_eq!(error.to_string(), "No saved login. Run kmesh login.");
+}
+
+#[tokio::test]
+async fn expired_public_key_session_reports_the_login_command_and_clears_credentials() {
+    let directory = TestDirectory::new("expired-public-key-session-test");
+    let context = auth_context(Config {
+        data_dir: directory.0.clone(),
+        ..Config::default()
+    })
+    .await;
+    let now = unix_now().unwrap();
+    context
+        .profiles
+        .save(&SavedLogin {
+            server_url: context.api.issuer().to_owned(),
+            profile: context.config.profile.clone(),
+            username: "alice".to_owned(),
+            credential: SavedCredential::PublicKeySession {
+                tokens: LoginTokens {
+                    access_token: "expired-access-token".to_owned(),
+                    refresh_token: "expired-refresh-token".to_owned(),
+                    access_expires_at: now - 1,
+                    refresh_expires_at: now - 1,
+                },
+            },
+        })
+        .expect("save expired public-key session");
+    context
+        .profiles
+        .set_active_user("alice")
+        .expect("select expired public-key session");
+
+    let error = super::valid_access_token(&context)
+        .await
+        .expect_err("expired public-key session requires authentication");
+    assert_eq!(error.to_string(), "Login expired. Run kmesh login.");
     assert!(context.profiles.load("alice").unwrap().is_none());
     assert!(context.profiles.active_user().is_err());
 }
@@ -789,10 +844,12 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
         config,
         api,
     };
+    let error = super::valid_access_token_for_user(&context, "alice")
+        .await
+        .expect_err("an uncertain refresh requires authentication");
     assert!(
-        super::valid_access_token_for_user(&context, "alice")
-            .await
-            .is_err()
+        format!("{error:#}")
+            .contains("Cannot confirm the credential refresh. Run kmesh login again.")
     );
     server
         .await

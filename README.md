@@ -44,6 +44,80 @@ The deployment used for the current acceptance work listens on TCP 9443 for HTTP
 
 Schema v5 stores API JWT registration and direct tunnel credential references. It requires a fresh data directory and does not migrate earlier databases. Keep existing data as a backup and initialize v5 with a separate, empty `data_dir`.
 
+## Compact admin interface
+
+Use the overview to inspect users, role assignments, targets, and credential counts
+in one command. Use a detail view to inspect each access path, API token metadata,
+and SSH public key fingerprints for the related users:
+
+```sh
+kmesh admin overview        # Short form: kmesh a ls
+kmesh a u s alice           # users show alice
+kmesh a r s engineers       # roles show engineers
+kmesh a t s build-machine   # targets show build-machine
+kmesh a ls -j               # Joined JSON view
+```
+
+The overview separates user and target state from target availability. An enabled
+but offline target can remain authorized. The access path is user → role →
+`ssh_connect` grant → target. The `admin` role alone does not grant SSH access.
+Detail views show the selected access paths and their disabled-user or
+disabled-target blockers. Relationship columns show each object's full assignments.
+Tokens and keys belong to users; they are not target-specific credentials.
+
+`TOKENS A/T` means active/total API tokens, with expired and revoked tokens
+excluded from the active count. An active token cannot authenticate a disabled
+user. Key counts include currently registered keys. Lists show complete IDs and
+SHA256 key fingerprints. They do not print token values or public key blobs.
+Token creation and enrollment commands still show the new credential once.
+Existing `--json` responses keep their original API shape, including public key
+text in `keys list`; new joined JSON views contain fingerprints only.
+
+Joined views use sequential reads of the existing API. They are not atomic
+snapshots. The view reports its collection time and fails if a required read or a
+relationship check fails. Run it again after concurrent administrative changes. Retained grants to targets
+missing from the target list appear as unavailable references with a warning;
+they never count as authorized access.
+The overview needs three resource-list requests, one per user for roles, one per
+role for grants, and two per relevant user for token and key metadata. Use the
+original resource-list commands when only a small list is needed.
+
+Common short forms:
+
+```sh
+kmesh a u c alice                       # users create
+kmesh a r c engineers                   # roles create
+kmesh a u roles alice engineers         # Replace all roles for alice
+kmesh a g a engineers build-machine     # grants add; add one permission
+kmesh a tk c alice -l laptop -e 604800   # tokens create; lifetime in seconds
+kmesh a k a alice ~/.ssh/id_ed25519.pub -l laptop
+kmesh a t en build-machine              # targets issue-enrollment
+kmesh a rx ls                           # relay list
+```
+
+Resource aliases are `u` (users), `r` (roles), `t` (targets), `tk` (tokens),
+`k`/`pk` (keys), `g` (grants), and `rx` (relay). Actions include `ls`/`l` (list),
+`s` (show), `c`/`new` (create), `a` (add), `rm` (remove/delete/revoke), `on`/`off`
+(enable/disable), `mv` (rename), and `en` (issue-enrollment), where applicable.
+Aliases are explicit; arbitrary command prefixes are not accepted. Existing
+long commands still work. `users roles` replaces all assignments; with no role
+IDs, it clears them. `grants add` only adds the named permission.
+
+Global short options work before or after subcommands: `-c` config, `-d` data
+directory, `-p` profile, `-s` server address, and `-P` server port. Admin accepts
+`-j` JSON, token/key creation accepts `-l` label, token creation accepts `-e`
+lifetime, and grant changes accept `-x` permission. Use `--help` on each command
+for its arguments. The interactive shell supports the same resource and action
+aliases and Tab completion. `kmesh admin` opens the shell; `kmesh admin -j` prints
+the overview as JSON and exits.
+
+Human-readable tables use spaces, clear headings, row counts, complete IDs, and
+explicit empty results. Terminal control characters in table values are escaped.
+Use `--json` for scripts. Runtime messages and help use English with the
+[CLI language and display guide](docs/cli-style.md). This is best-effort
+STE-informed writing, not a claim of certified ASD-STE100 compliance. User data,
+exact identifiers, and dependency diagnostics retain their original meanings.
+
 ## Configure a target and access
 
 On an administrator workstation, log in and create the target, user, role, and grant. Usernames are trimmed and lowercased for their unique user IDs. Role IDs are the trimmed role names with ASCII letters lowercased. Target names at creation and rename use a 1–64 character ASCII slug (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`; the first character is alphanumeric). On creation, the lowercase name becomes the fixed target ID while its casing remains the display name. Rename changes the name and OpenSSH alias while preserving the ID. Admin commands and SSH selection refer to users, roles, and targets by ID.

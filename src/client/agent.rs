@@ -54,11 +54,11 @@ pub(super) struct TunnelOffer {
 pub(super) struct AgentAuthenticationFailure(pub(super) String);
 
 #[derive(Debug, thiserror::Error)]
-#[error("server selected an authentication failure: {0}")]
+#[error("server rejected authentication: {0}")]
 pub(super) struct ServerAuthenticationFailure(pub(super) String);
 
 #[derive(Debug, thiserror::Error)]
-#[error("kmesh agent/server version incompatibility: {0}")]
+#[error("kmesh agent and server versions are incompatible: {0}")]
 pub(super) struct AgentVersionIncompatibility(pub(super) String);
 
 pub async fn enroll(

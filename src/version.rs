@@ -18,14 +18,14 @@ pub const CLI_LONG_VERSION: &str = shadow_rs::formatcp!(
 pub fn mismatch(client_version: Option<&str>) -> Option<String> {
     let Some(client_version) = client_version else {
         return Some(format!(
-            "client did not identify its kmesh version; this server runs kmesh {VERSION}. Update the client or agent."
+            "The client did not identify its kmesh version. The server runs kmesh {VERSION}. Update the client or agent."
         ));
     };
     let client = match Version::parse(client_version) {
         Ok(version) => version,
         Err(_) => {
             return Some(format!(
-                "client sent invalid kmesh version {client_version:?}; this server runs kmesh {VERSION}."
+                "The client sent an invalid kmesh version: {client_version:?}. The server runs kmesh {VERSION}."
             ));
         }
     };
@@ -34,7 +34,7 @@ pub fn mismatch(client_version: Option<&str>) -> Option<String> {
         return None;
     }
     Some(format!(
-        "client kmesh version {client} is incompatible with server kmesh {server}; stable releases require the same major version, 0.x releases also require the same minor version, and prerelease releases require the same major, minor, patch, and prerelease identifier. Update the client or agent."
+        "Client kmesh {client} and server kmesh {server} are incompatible. Stable releases must have the same major version. Versions 0.x must also have the same minor version. For prereleases, the major, minor, patch, and prerelease values must match. Update the client or agent."
     ))
 }
 
