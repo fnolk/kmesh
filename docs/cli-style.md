@@ -6,9 +6,9 @@ remain compatibility interfaces.
 
 ## Language reference
 
-The CLI uses a best-effort, STE-informed English style. This is not a claim of
-formal ASD-STE100 compliance or certification. Full verification requires the
-current standard, its dictionary, and a technical and language review.
+CLI help, results, errors, and shell messages use English. They follow ASD-STE100
+Issue 9 vocabulary and sentence rules. Review new output against the current
+standard, dictionary, and project glossary.
 
 The official [downloads page](https://www.asd-ste100.org/STE_downloads.html)
 identifies Issue 9, January 2025, as the current edition. The
@@ -43,8 +43,9 @@ Use the same term for the same object in help, output, errors, and documentation
 | Term | Meaning in kmesh |
 | --- | --- |
 | user | A server account identified by its user ID. |
-| role | A named set of target permissions assigned to users. |
-| grant | A role's permission for a target. |
+| platform role | The fixed `member` or `admin` value in `system_role`. It controls platform administration. |
+| access group | A named set of users with the same target access needs. |
+| grant | An access group's permission to connect to a target. The `grant` command gives this permission. |
 | target | A registered machine reached through its target agent. |
 | target ID | The stable identifier accepted by commands. A rename does not change it. |
 | target name | The display name and source of the OpenSSH alias. |
@@ -64,7 +65,7 @@ the surrounding prose uses a longer technical term.
 
 ## Wording checklist
 
-- Start command descriptions with the action: "List user accounts" or "Create a role."
+- Start command descriptions with the action: "Show user accounts" or "Create an access group."
 - Use active voice. State who or what failed when that information is available.
 - Keep required arguments, units, defaults, and side effects explicit.
 - Say whether an operation adds, removes, or replaces assignments. These actions differ.
@@ -82,7 +83,7 @@ Save this API token now. It is shown only once.
 No SSH public keys.
 The user does not exist.
 If the token has expired, create a replacement token.
-Replace all roles assigned to this user.
+Set access groups for this user. To remove all groups, use an empty group ID list.
 ```
 
 These examples illustrate project style. They are not individually certified
@@ -107,7 +108,7 @@ every view provides every field.
   key and its management ID distinguishable and available in the documented
   detailed or machine-readable output.
 - Show the relationship that answers the administrator's question: a user's
-  roles and target grants, a role's users and targets, or a target's granting roles.
+  platform role and access groups, an access group's users and targets, or a target's granting groups.
   Distinguish configured grants from effective access and current connectivity.
 - Do not present missing or failed join data as an empty relationship. Fail
   clearly, or mark partial results explicitly.
@@ -117,10 +118,13 @@ every view provides every field.
   document if a joined view is assembled from multiple, non-atomic reads.
 - Keep read-only views read-only. A short display command must never issue a
   token, change permissions, or revoke a credential.
+- Show a user's platform role and access groups in separate fields.
+- Show access group IDs in grant tables and access path columns.
+- State that platform roles control administration and access groups control SSH access.
 
 ## Aliases and compatibility
 
-- Retain existing canonical commands and flags. Add explicit aliases rather than
+- Use the current canonical commands and flags. Add explicit aliases rather than
   accepting arbitrary command prefixes.
 - Use each alias for one meaning at its command level. Prefer readable resource
   names in documentation and short aliases for repeated interactive use.
@@ -128,10 +132,22 @@ every view provides every field.
   one-shot parser, including action aliases after a resource alias.
 - Preserve argument order, validation, normalization, and destructive semantics
   across aliases. Do not create a different operation behind a shorter spelling.
-- Preserve existing JSON response shapes. Put new joined views behind new
-  commands rather than changing established machine interfaces.
+- Keep current JSON response fields stable within one protocol version. Change the
+  protocol version when a required field or operation changes.
 - Keep command data on stdout and diagnostics on stderr. `proxy` stdout carries
   only SSH bytes; `ssh-config` stdout must remain valid OpenSSH configuration.
 - Keep JSON output valid and free of banners, table headings, or progress text.
+- `show` displays matching records or a detail view.
+- `list` displays every matching record.
+- `create` adds a resource with a new ID.
+- `delete` removes a resource and its dependent rows.
+- `add` creates the named relationship.
+- `remove` deletes the named relationship.
+- `enable` permits new use of a resource; `disable` stops new use.
+- `rename` changes a display name and keeps its stable ID.
+- `issue` creates a one-time credential for the named target.
+- `manage` selects and runs the administration commands for the named resource.
+
+These are kmesh CLI command verbs. Use them only with the meanings above.
 - Test help, aliases, completion, empty results, long labels, control characters,
   token expiry, secret exclusion, and existing invocation forms.

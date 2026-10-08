@@ -42,25 +42,26 @@ For a server deployment, set `data_dir` to its persistent state location. `serve
 
 The deployment used for the current acceptance work listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for QAD. Direct peer paths also need outbound UDP between client and target. When UDP direct paths fail, the last route uses the private relay over the same HTTPS origin; HTTPS control remains required in every route. Official relay services provide QAD for `PublicDirect` and never carry its SSH stream. In public-direct-only mode, set `server.disable_private_relay = true` or pass `--disable-private-relay`; the server then omits its private relay URL from `GET /v1/transport`.
 
-Schema v5 stores API JWT registration and direct tunnel credential references. It requires a fresh data directory and does not migrate earlier databases. Keep existing data as a backup and initialize v5 with a separate, empty `data_dir`.
+Version 0.4.0 uses the 0.4 API and schema version 6. It separates platform roles from access groups. It requires a fresh data directory. It does not migrate earlier databases. Initialize it in a separate, empty `data_dir`. Version 0.3 clients cannot use a 0.4.0 server.
 
 ## Compact admin interface
 
-Use the overview to inspect users, role assignments, targets, and credential counts
+Use the overview to inspect users, platform roles, access groups, targets, and credential counts
 in one command. Use a detail view to inspect each access path, API token metadata,
 and SSH public key fingerprints for the related users:
 
 ```sh
 kmesh admin overview        # Short form: kmesh a ls
 kmesh a u s alice           # users show alice
-kmesh a r s engineers       # roles show engineers
+kmesh a r ls                 # roles list
+kmesh a g s engineers       # groups show engineers
 kmesh a t s build-machine   # targets show build-machine
 kmesh a ls -j               # Joined JSON view
 ```
 
 The overview separates user and target state from target availability. An enabled
-but offline target can remain authorized. The access path is user → role →
-`ssh_connect` grant → target. The `admin` role alone does not grant SSH access.
+but offline target can remain authorized. The access path is user → access group →
+`ssh_connect` grant → target. The `admin` platform role gives no SSH access.
 Detail views show the selected access paths and their disabled-user or
 disabled-target blockers. Relationship columns show each object's full assignments.
 Tokens and keys belong to users; they are not target-specific credentials.
@@ -70,38 +71,41 @@ excluded from the active count. An active token cannot authenticate a disabled
 user. Key counts include currently registered keys. Lists show complete IDs and
 SHA256 key fingerprints. They do not print token values or public key blobs.
 Token creation and enrollment commands still show the new credential once.
-Existing `--json` responses keep their original API shape, including public key
-text in `keys list`; new joined JSON views contain fingerprints only.
+Admin commands with `--json` return the 0.4 API response shape. The
+`keys list` response includes public key text; joined JSON views contain
+fingerprints only.
 
 Joined views use sequential reads of the existing API. They are not atomic
 snapshots. The view reports its collection time and fails if a required read or a
 relationship check fails. Run it again after concurrent administrative changes. Retained grants to targets
 missing from the target list appear as unavailable references with a warning;
 they never count as authorized access.
-The overview needs three resource-list requests, one per user for roles, one per
-role for grants, and two per relevant user for token and key metadata. Use the
+The overview needs three resource-list requests, one per user for access groups,
+one per access group for grants, and two per relevant user for token and key metadata. Use the
 original resource-list commands when only a small list is needed.
 
 Common short forms:
 
 ```sh
 kmesh a u c alice                       # users create
-kmesh a r c engineers                   # roles create
-kmesh a u roles alice engineers         # Replace all roles for alice
-kmesh a g a engineers build-machine     # grants add; add one permission
+kmesh a g c engineers                   # groups create
+kmesh a u roles alice admin             # Set alice's platform role
+kmesh a u groups alice engineers        # Set access groups for alice
+kmesh a gr a engineers build-machine    # grants add; add one permission
 kmesh a tk c alice -l laptop -e 604800   # tokens create; lifetime in seconds
 kmesh a k a alice ~/.ssh/id_ed25519.pub -l laptop
 kmesh a t en build-machine              # targets issue-enrollment
 kmesh a rx ls                           # relay list
 ```
 
-Resource aliases are `u` (users), `r` (roles), `t` (targets), `tk` (tokens),
-`k`/`pk` (keys), `g` (grants), and `rx` (relay). Actions include `ls`/`l` (list),
+Resource aliases are `u` (users), `r` (roles), `g` (groups), `gr` (grants), `t` (targets), `tk` (tokens),
+`k`/`pk` (keys), and `rx` (relay). Actions include `ls`/`l` (list),
 `s` (show), `c`/`new` (create), `a` (add), `rm` (remove/delete/revoke), `on`/`off`
 (enable/disable), `mv` (rename), and `en` (issue-enrollment), where applicable.
-Aliases are explicit; arbitrary command prefixes are not accepted. Existing
-long commands still work. `users roles` replaces all assignments; with no role
-IDs, it clears them. `grants add` only adds the named permission.
+Aliases are explicit; arbitrary command prefixes are not accepted. Use the
+canonical commands in this release. `users roles` sets one platform role: `member` or
+`admin`. `users groups` replaces all access groups. Use an empty group ID list to
+remove every access group. `grants add` adds the named permission.
 
 Global short options work before or after subcommands: `-c` config, `-d` data
 directory, `-p` profile, `-s` server address, and `-P` server port. Admin accepts
@@ -114,13 +118,13 @@ the overview as JSON and exits.
 Human-readable tables use spaces, clear headings, row counts, complete IDs, and
 explicit empty results. Terminal control characters in table values are escaped.
 Use `--json` for scripts. Runtime messages and help use English with the
-[CLI language and display guide](docs/cli-style.md). This is best-effort
-STE-informed writing, not a claim of certified ASD-STE100 compliance. User data,
-exact identifiers, and dependency diagnostics retain their original meanings.
+[CLI language and display guide](docs/cli-style.md). The guide sets the ASD-STE100
+Issue 9 vocabulary, sentence length, and project term rules. User data, exact
+identifiers, and dependency diagnostics retain their original meanings.
 
 ## Configure a target and access
 
-On an administrator workstation, log in and create the target, user, role, and grant. Usernames are trimmed and lowercased for their unique user IDs. Role IDs are the trimmed role names with ASCII letters lowercased. Target names at creation and rename use a 1–64 character ASCII slug (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`; the first character is alphanumeric). On creation, the lowercase name becomes the fixed target ID while its casing remains the display name. Rename changes the name and OpenSSH alias while preserving the ID. Admin commands and SSH selection refer to users, roles, and targets by ID.
+On an administrator workstation, log in and create the target, user, access group, and grant. New users have the `member` platform role and no access groups. The fixed platform roles are `member` and `admin`. Access group IDs are the trimmed names with ASCII letters lowercased. Target names at creation and rename use a 1–64 character ASCII slug (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`; the first character is alphanumeric). On creation, the lowercase name becomes the fixed target ID while its casing remains the display name. Rename changes the name and OpenSSH alias while preserving the ID. Admin commands refer to users, access groups, and targets by ID. Platform roles use the fixed values `member` and `admin`.
 
 `ssh-config` scopes `HostKeyAlias` by the canonical server origin and target ID. Agent credentials use the same server-origin scope, so equal target IDs on different servers keep separate known-host entries and credentials.
 
@@ -130,9 +134,17 @@ kmesh admin targets create build-machine
 kmesh admin users create alice
 kmesh admin tokens create alice --label laptop
 kmesh admin tokens create alice --label automation --expires-in 604800
-kmesh admin roles create engineers
-kmesh admin users roles alice engineers
+kmesh admin roles list
+kmesh admin groups create engineers
+kmesh admin users groups alice engineers
 kmesh admin grants add engineers build-machine
+```
+
+Give Alice platform admin access when she must change server users, groups,
+targets, credentials, or relay traffic:
+
+```sh
+kmesh admin users roles alice admin
 ```
 
 API JWTs created by `server init` and `admin tokens create` are shown once. They act as Bearer credentials directly. Omitting `--expires-in` creates a long-lived JWT; `--expires-in <seconds>` sets its lifetime. With `KMESH_TOKEN` set, run `kmesh login --method token`; when `[auth].method = "token"` is in the config, you can run `kmesh login`. A command-line `--token` takes priority over `KMESH_TOKEN`, which takes priority over `[auth].token`. Login validates the JWT with the server and saves that same JWT for later API and control requests. An expired JWT requires a replacement token and another `kmesh login`; token authentication does not use refresh tokens. Public-key login keeps its separate access and refresh session. Start the interactive shell with the same server origin:

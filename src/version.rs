@@ -88,5 +88,6 @@ mod tests {
                 .expect("invalid version rejected")
                 .contains("invalid kmesh version")
         );
+        assert!(mismatch(Some("0.3.1")).is_some());
     }
 }

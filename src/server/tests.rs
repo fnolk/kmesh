@@ -151,6 +151,19 @@ async fn api_requires_a_semver_compatible_kmesh_client() {
         .await
         .expect("serve missing-version request");
     assert_eq!(response.status(), axum::http::StatusCode::UPGRADE_REQUIRED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/transport")
+                .header(crate::version::VERSION_HEADER, "0.3.1")
+                .body(axum::body::Body::empty())
+                .expect("build 0.3 client request"),
+        )
+        .await
+        .expect("serve 0.3 client request");
+    assert_eq!(response.status(), axum::http::StatusCode::UPGRADE_REQUIRED);
     let body = axum::body::to_bytes(response.into_body(), 1024)
         .await
         .expect("read version rejection");
@@ -196,11 +209,18 @@ async fn api_requires_a_semver_compatible_kmesh_client() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
 
-async fn admin_role_id(state: &ServerState) -> String {
-    sqlx::query_scalar::<_, String>("SELECT id FROM roles WHERE name = 'admin'")
-        .fetch_one(&state.inner.db.pool)
+async fn admin_group_id(state: &ServerState) -> String {
+    let now = crate::server::db::unix_time();
+    sqlx::query("INSERT OR IGNORE INTO access_groups(id, name, created_at) VALUES ('admin-access', 'admin-access', ?1)")
+        .bind(now)
+        .execute(&state.inner.db.pool)
         .await
-        .expect("read admin role")
+        .expect("create admin access group fixture");
+    sqlx::query("INSERT OR IGNORE INTO user_access_groups(user_id, group_id) SELECT id, 'admin-access' FROM users WHERE username = 'admin'")
+        .execute(&state.inner.db.pool)
+        .await
+        .expect("assign admin access group fixture");
+    "admin-access".to_owned()
 }
 
 async fn admin_user_id(state: &ServerState) -> String {
@@ -269,12 +289,12 @@ async fn create_enrolled_target(
 }
 
 async fn grant_target(state: &ServerState, target_id: &str) {
-    let role_id = admin_role_id(state).await;
+    let group_id = admin_group_id(state).await;
     super::admin::apply_operation(
         state,
         admin_user_id(state).await,
         AdminOperation::GrantTarget {
-            role_id,
+            group_id,
             target_id: target_id.to_owned(),
             permission: TargetPermission::SshConnect,
         },
@@ -284,12 +304,12 @@ async fn grant_target(state: &ServerState, target_id: &str) {
 }
 
 async fn revoke_target(state: &ServerState, target_id: &str) {
-    let role_id = admin_role_id(state).await;
+    let group_id = admin_group_id(state).await;
     super::admin::apply_operation(
         state,
         admin_user_id(state).await,
         AdminOperation::RevokeTarget {
-            role_id,
+            group_id,
             target_id: target_id.to_owned(),
             permission: TargetPermission::SshConnect,
         },
@@ -794,7 +814,7 @@ fn endpoint_connect_request(endpoint_id: iroh::EndpointId) -> ClientRequest {
 }
 
 #[tokio::test]
-async fn schema_v2_requires_a_fresh_data_directory() {
+async fn schema_v5_requires_a_fresh_data_directory() {
     let data_dir = std::env::temp_dir().join(format!("kmesh-schema-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&data_dir).expect("create schema test directory");
     let db = Database::open(data_dir.join("server.sqlite3"))
@@ -806,7 +826,7 @@ async fn schema_v2_requires_a_fresh_data_directory() {
     .execute(&db.pool)
     .await
     .expect("create previous schema marker");
-    sqlx::query("INSERT INTO schema_migrations(version, applied_at) VALUES (2, 0)")
+    sqlx::query("INSERT INTO schema_migrations(version, applied_at) VALUES (5, 0)")
         .execute(&db.pool)
         .await
         .expect("record previous schema version");
@@ -814,7 +834,7 @@ async fn schema_v2_requires_a_fresh_data_directory() {
     let error = db
         .apply_schema()
         .await
-        .expect_err("schema version 2 must fail before applying schema 3");
+        .expect_err("schema version 5 must fail before applying schema 6");
     assert!(
         error
             .to_string()
@@ -917,7 +937,7 @@ async fn admin_audit_commits_with_mutations_and_failed_audit_rolls_back() {
 }
 
 #[tokio::test]
-async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
+async fn admin_audit_redacts_secrets_and_preserves_deleted_access_group_relations() {
     let fixture = fixture("https://kmesh.test").await;
     let state = &fixture.state;
     let actor_id = admin_user_id(state).await;
@@ -933,6 +953,17 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     let AdminResponse::User(user) = created_user else {
         panic!("user creation returned an unexpected result");
     };
+    assert_eq!(user.system_role, crate::protocol::SystemRole::Member);
+    super::admin::apply_operation(
+        state,
+        actor_id.clone(),
+        AdminOperation::SetUserSystemRole {
+            user_id: user.user_id.clone(),
+            system_role: crate::protocol::SystemRole::Admin,
+        },
+    )
+    .await
+    .expect("promote audited user");
     let issued = super::admin::apply_operation(
         state,
         actor_id.clone(),
@@ -992,33 +1023,33 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     )
     .await
     .expect("register audited SSH key");
-    let created_role = super::admin::apply_operation(
+    let created_access_group = super::admin::apply_operation(
         state,
         actor_id.clone(),
-        AdminOperation::CreateRole {
-            name: "audit-role".to_owned(),
+        AdminOperation::CreateAccessGroup {
+            name: "audit-access_group".to_owned(),
         },
     )
     .await
-    .expect("create audited role");
-    let AdminResponse::Role(role) = created_role else {
-        panic!("role creation returned an unexpected result");
+    .expect("create audited access_group");
+    let AdminResponse::AccessGroup(access_group) = created_access_group else {
+        panic!("access_group creation returned an unexpected result");
     };
     super::admin::apply_operation(
         state,
         actor_id.clone(),
-        AdminOperation::SetUserRoles {
+        AdminOperation::SetUserAccessGroups {
             user_id: user.user_id.clone(),
-            role_ids: vec![role.role_id.clone(), role.role_id.clone()],
+            group_ids: vec![access_group.group_id.clone(), access_group.group_id.clone()],
         },
     )
     .await
-    .expect("assign audited role");
+    .expect("assign audited access_group");
     super::admin::apply_operation(
         state,
         actor_id.clone(),
         AdminOperation::GrantTarget {
-            role_id: role.role_id.clone(),
+            group_id: access_group.group_id.clone(),
             target_id: target.target_id.clone(),
             permission: TargetPermission::SshConnect,
         },
@@ -1028,12 +1059,12 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     super::admin::apply_operation(
         state,
         actor_id.clone(),
-        AdminOperation::DeleteRole {
-            role_id: role.role_id.clone(),
+        AdminOperation::DeleteAccessGroup {
+            group_id: access_group.group_id.clone(),
         },
     )
     .await
-    .expect("delete audited role");
+    .expect("delete audited access_group");
 
     let audit_rows = sqlx::query(
         "SELECT operation, object_id, context_json FROM admin_audit ORDER BY occurred_at, id",
@@ -1045,6 +1076,18 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
         .iter()
         .map(|row| row.try_get::<String, _>("context_json").unwrap())
         .collect::<Vec<_>>();
+    let role_context = audit_rows
+        .iter()
+        .find(|row| row.try_get::<String, _>("operation").unwrap() == "set_user_system_role")
+        .map(|row| {
+            serde_json::from_str::<serde_json::Value>(
+                &row.try_get::<String, _>("context_json").unwrap(),
+            )
+            .expect("decode system role audit context")
+        })
+        .expect("system role audit row");
+    assert_eq!(role_context["previous_system_role"], "member");
+    assert_eq!(role_context["system_role"], "admin");
     let audit_dump = contexts.join("\n");
     assert!(!audit_dump.contains(&token));
     assert!(!audit_dump.contains(&stored_token_hash));
@@ -1053,16 +1096,16 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
 
     let delete_row = audit_rows
         .iter()
-        .find(|row| row.try_get::<String, _>("operation").unwrap() == "delete_role")
-        .expect("deleted role audit row");
+        .find(|row| row.try_get::<String, _>("operation").unwrap() == "delete_access_group")
+        .expect("deleted access_group audit row");
     assert_eq!(
         delete_row.try_get::<String, _>("object_id").unwrap(),
-        role.role_id.clone().to_string()
+        access_group.group_id.clone().to_string()
     );
     let context: serde_json::Value =
         serde_json::from_str(&delete_row.try_get::<String, _>("context_json").unwrap())
-            .expect("decode deleted role context");
-    assert_eq!(context["role_name"], "audit-role");
+            .expect("decode deleted access_group context");
+    assert_eq!(context["access_group_name"], "audit-access_group");
     assert_eq!(context["user_ids"][0], user.user_id.clone().to_string());
     assert_eq!(
         context["grants"][0]["target_id"],
@@ -1070,13 +1113,13 @@ async fn admin_audit_redacts_secrets_and_preserves_deleted_role_relations() {
     );
     assert_eq!(context["grants"][0]["permission"], "ssh_connect");
 
-    let role_exists =
-        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM roles WHERE id = ?1)")
-            .bind(role.role_id.clone().to_string())
+    let access_group_exists =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM access_groups WHERE id = ?1)")
+            .bind(access_group.group_id.clone().to_string())
             .fetch_one(&state.inner.db.pool)
             .await
-            .expect("verify role deletion");
-    assert_eq!(role_exists, 0);
+            .expect("verify access_group deletion");
+    assert_eq!(access_group_exists, 0);
 }
 
 #[tokio::test]
@@ -3327,13 +3370,7 @@ async fn run_self_hosted_https_private_relay_ssh_stream(finish: SelfHostedRelayF
     let (target_id, agent_token) =
         create_enrolled_target(state, "self-hosted-target", &target_secret).await;
     grant_target(state, &target_id).await;
-    let incompatible_version = format!(
-        "{}.0.0",
-        semver::Version::parse(crate::version::VERSION)
-            .expect("package version uses SemVer")
-            .major
-            + 1
-    );
+    let incompatible_version = "0.3.1".to_owned();
     let mut rejected_agent = connect_control_ws_with_version(
         &issuer,
         "agent/control",

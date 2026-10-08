@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
-use crate::protocol::TargetPermission;
+use crate::protocol::{SystemRole, TargetPermission};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -86,7 +86,7 @@ pub enum Command {
     },
     #[command(
         visible_alias = "a",
-        about = "Manage users, roles, targets, API tokens, SSH public keys, and relay traffic"
+        about = "Use user, role, group, target, token, key, and relay commands"
     )]
     Admin(AdminArgs),
 }
@@ -196,34 +196,39 @@ pub struct AdminArgs {
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum AdminCommand {
-    #[command(visible_aliases = ["ls", "status", "o"], about = "Show users, roles, targets, and credential counts")]
+    #[command(visible_aliases = ["ls", "status", "o"], about = "Show users, access groups, targets, and credential counts")]
     Overview,
-    #[command(visible_aliases = ["user", "u"], about = "Manage user accounts and role assignments")]
+    #[command(visible_aliases = ["user", "u"], about = "Use user, platform role, and access group commands")]
     Users {
         #[command(subcommand)]
         action: UserAction,
     },
-    #[command(visible_aliases = ["token", "tk"], about = "Manage API tokens")]
+    #[command(visible_aliases = ["token", "tk"], about = "Use API token commands")]
     Tokens {
         #[command(subcommand)]
         action: ApiTokenAction,
     },
-    #[command(visible_aliases = ["key", "publickey", "pk", "k"], about = "Manage user SSH public keys")]
+    #[command(visible_aliases = ["key", "publickey", "pk", "k"], about = "Use SSH public key commands")]
     Keys {
         #[command(subcommand)]
         action: KeyAction,
     },
-    #[command(visible_aliases = ["role", "r"], about = "Manage authorization roles")]
+    #[command(visible_aliases = ["role", "r"], about = "Show platform roles")]
     Roles {
         #[command(subcommand)]
         action: RoleAction,
     },
-    #[command(visible_aliases = ["grant", "g"], about = "Manage role permissions for targets")]
+    #[command(visible_aliases = ["group", "g"], about = "Use access group commands")]
+    Groups {
+        #[command(subcommand)]
+        action: AccessGroupAction,
+    },
+    #[command(visible_aliases = ["grant", "gr"], about = "Use grant commands for access groups and targets")]
     Grants {
         #[command(subcommand)]
         action: GrantAction,
     },
-    #[command(visible_aliases = ["target", "t"], about = "Manage SSH targets")]
+    #[command(visible_aliases = ["target", "t"], about = "Use SSH target commands")]
     Targets {
         #[command(subcommand)]
         action: TargetAction,
@@ -300,18 +305,25 @@ pub enum UserAction {
         #[arg(help = "Username (user ID) to enable")]
         user_id: String,
     },
-    #[command(
-        visible_alias = "set-roles",
-        about = "Replace all roles for a user; omit roles to clear them"
-    )]
+    #[command(visible_alias = "set-role", about = "Set the platform role for a user")]
     Roles {
         #[arg(help = "Username (user ID) to update")]
         user_id: String,
-        #[arg(help = "Role names (role IDs) to assign")]
-        role_ids: Vec<String>,
+        #[arg(value_enum, help = "Platform role: member or admin")]
+        system_role: SystemRole,
     },
-    #[command(about = "List roles assigned to a user")]
-    ShowRoles {
+    #[command(
+        visible_alias = "set-groups",
+        about = "Set access groups for a user. To remove all groups, use an empty group ID list."
+    )]
+    Groups {
+        #[arg(help = "Username (user ID) to update")]
+        user_id: String,
+        #[arg(help = "Access group IDs to set")]
+        group_ids: Vec<String>,
+    },
+    #[command(about = "Show access groups for a user")]
+    ShowGroups {
         #[arg(help = "Username (user ID)")]
         user_id: String,
     },
@@ -347,51 +359,57 @@ pub enum KeyAction {
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum RoleAction {
+    #[command(visible_aliases = ["ls", "l"], about = "Show platform roles")]
+    List,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum AccessGroupAction {
     #[command(
         visible_alias = "s",
-        about = "Show the role and its access relationships"
+        about = "Show the access group and its access relationships"
     )]
     Show {
-        #[arg(help = "Role ID")]
-        role_id: String,
+        #[arg(help = "Access group ID")]
+        group_id: String,
     },
-    #[command(visible_aliases = ["ls", "l"], about = "List authorization roles")]
+    #[command(visible_aliases = ["ls", "l"], about = "Show access groups")]
     List,
-    #[command(visible_aliases = ["new", "c"], about = "Create an authorization role")]
+    #[command(visible_aliases = ["new", "c"], about = "Create an access group")]
     Create {
-        #[arg(help = "Name of the role")]
+        #[arg(help = "Name of the access group")]
         name: String,
     },
-    #[command(visible_aliases = ["rm"], about = "Delete an authorization role")]
+    #[command(visible_aliases = ["rm"], about = "Delete an access group")]
     Delete {
-        #[arg(help = "Role ID to delete")]
-        role_id: String,
+        #[arg(help = "Access group ID to delete")]
+        group_id: String,
     },
 }
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum GrantAction {
-    #[command(visible_aliases = ["ls", "l"], about = "List permissions granted to a role")]
+    #[command(visible_aliases = ["ls", "l"], about = "Show grants for an access group")]
     List {
-        #[arg(help = "Role ID")]
-        role_id: String,
+        #[arg(help = "Access group ID")]
+        group_id: String,
     },
-    #[command(visible_aliases = ["a"], about = "Grant a role permission to access a target")]
+    #[command(visible_aliases = ["a"], about = "Give an access group permission to connect to a target")]
     Add {
-        #[arg(help = "Role ID")]
-        role_id: String,
+        #[arg(help = "Access group ID")]
+        group_id: String,
         #[arg(help = "Target ID")]
         target_id: String,
-        #[arg(short = 'x', long, value_enum, default_value_t = PermissionArg::SshConnect, help = "Permission to grant")]
+        #[arg(short = 'x', long, value_enum, default_value_t = PermissionArg::SshConnect, help = "Permission")]
         permission: PermissionArg,
     },
-    #[command(visible_aliases = ["rm"], about = "Revoke a role's permission to access a target")]
+    #[command(visible_aliases = ["rm"], about = "Remove an access group grant for a target")]
     Remove {
-        #[arg(help = "Role ID")]
-        role_id: String,
+        #[arg(help = "Access group ID")]
+        group_id: String,
         #[arg(help = "Target ID")]
         target_id: String,
-        #[arg(short = 'x', long, value_enum, default_value_t = PermissionArg::SshConnect, help = "Permission to revoke")]
+        #[arg(short = 'x', long, value_enum, default_value_t = PermissionArg::SshConnect, help = "Permission")]
         permission: PermissionArg,
     },
 }

@@ -28,7 +28,7 @@ use crate::{
         profile::{ProfileStore, SavedCredential, SavedLogin},
     },
     config::{AuthConfig, Config, LoginMethod},
-    protocol::{LoginTokens, MeView, UserView},
+    protocol::{LoginTokens, MeView},
 };
 
 use super::*;
@@ -385,12 +385,11 @@ async fn api_jwt_login_uses_the_token_directly_and_saves_that_credential() {
     let server_port = listener.local_addr().unwrap().port();
     let now = unix_now().unwrap();
     let me = MeView {
-        user: UserView {
-            user_id: "alice".to_owned(),
-            username: "Alice".to_owned(),
-            enabled: true,
-        },
-        roles: Vec::new(),
+        user_id: "alice".to_owned(),
+        username: "Alice".to_owned(),
+        enabled: true,
+        system_role: crate::protocol::SystemRole::Member,
+        access_groups: Vec::new(),
     };
     let claims = crate::protocol::ApiTokenClaims {
         sub: "alice".to_owned(),

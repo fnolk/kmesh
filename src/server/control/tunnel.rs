@@ -635,8 +635,8 @@ pub(super) async fn authorized_for_target(
             sqlx::query_scalar::<_, i64>(
                 "SELECT EXISTS(SELECT 1 FROM users u \
                  JOIN auth_sessions s ON s.user_id = u.id \
-                 JOIN user_roles ur ON ur.user_id = u.id \
-                 JOIN target_permissions tp ON tp.role_id = ur.role_id \
+                 JOIN user_access_groups ug ON ug.user_id = u.id \
+                 JOIN group_target_permissions tp ON tp.group_id = ug.group_id \
                  JOIN targets t ON t.id = tp.target_id \
                  WHERE u.id = ?1 AND u.enabled = 1 AND s.id = ?2 AND s.revoked_at IS NULL \
                    AND s.refresh_expires_at > ?3 AND t.id = ?4 AND t.enabled = 1 \
@@ -655,8 +655,8 @@ pub(super) async fn authorized_for_target(
             sqlx::query_scalar::<_, i64>(
                 "SELECT EXISTS(SELECT 1 FROM users u \
                  JOIN api_tokens token ON token.user_id = u.id \
-                 JOIN user_roles ur ON ur.user_id = u.id \
-                 JOIN target_permissions tp ON tp.role_id = ur.role_id \
+                 JOIN user_access_groups ug ON ug.user_id = u.id \
+                 JOIN group_target_permissions tp ON tp.group_id = ug.group_id \
                  JOIN targets t ON t.id = tp.target_id \
                  WHERE u.id = ?1 AND u.enabled = 1 AND token.id = ?2 \
                    AND token.revoked_at IS NULL AND (token.expires_at IS NULL OR token.expires_at > ?3) \
