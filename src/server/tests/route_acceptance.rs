@@ -999,7 +999,7 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
             connect_control_ws(&server.issuer, "agent/control", &agent_token).await;
         wait_target_online(server.state(), &target_id).await?;
         let has_grant: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM target_permissions WHERE target_id = ?1 \
+            "SELECT EXISTS(SELECT 1 FROM group_target_permissions WHERE target_id = ?1 \
              AND permission = 'ssh_connect')",
         )
         .bind(target_id.to_string())

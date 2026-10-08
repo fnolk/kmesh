@@ -258,7 +258,7 @@ async fn response_failure(response: Response) -> ApiFailure {
     {
         return ApiFailure::IncompatibleVersion(error.message);
     }
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
         ApiFailure::Authentication(message)
     } else {
         ApiFailure::Server {

@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    system_role TEXT NOT NULL CHECK (system_role IN ('member', 'admin')),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -27,19 +28,18 @@ CREATE TABLE IF NOT EXISTS user_keys (
 );
 CREATE INDEX IF NOT EXISTS user_keys_user_id_idx ON user_keys(user_id, enabled);
 
-CREATE TABLE IF NOT EXISTS roles (
+CREATE TABLE IF NOT EXISTS access_groups (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    built_in INTEGER NOT NULL DEFAULT 0 CHECK (built_in IN (0, 1)),
     created_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS user_roles (
+CREATE TABLE IF NOT EXISTS user_access_groups (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-    PRIMARY KEY (user_id, role_id)
+    group_id TEXT NOT NULL REFERENCES access_groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, group_id)
 );
-CREATE INDEX IF NOT EXISTS user_roles_role_id_idx ON user_roles(role_id);
+CREATE INDEX IF NOT EXISTS user_access_groups_group_id_idx ON user_access_groups(group_id);
 
 CREATE TABLE IF NOT EXISTS api_tokens (
     id TEXT PRIMARY KEY,
@@ -51,12 +51,6 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS api_tokens_user_id_idx ON api_tokens(user_id, revoked_at);
-
-CREATE TABLE IF NOT EXISTS role_global_permissions (
-    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-    permission TEXT NOT NULL CHECK (permission = 'admin'),
-    PRIMARY KEY (role_id, permission)
-);
 
 CREATE TABLE IF NOT EXISTS targets (
     id TEXT PRIMARY KEY,
@@ -72,13 +66,13 @@ CREATE TABLE IF NOT EXISTS targets (
     updated_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS target_permissions (
-    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS group_target_permissions (
+    group_id TEXT NOT NULL REFERENCES access_groups(id) ON DELETE CASCADE,
     target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
     permission TEXT NOT NULL CHECK (permission = 'ssh_connect'),
-    PRIMARY KEY (role_id, target_id, permission)
+    PRIMARY KEY (group_id, target_id, permission)
 );
-CREATE INDEX IF NOT EXISTS target_permissions_target_idx ON target_permissions(target_id, permission);
+CREATE INDEX IF NOT EXISTS group_target_permissions_target_idx ON group_target_permissions(target_id, permission);
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
     id TEXT PRIMARY KEY,
@@ -148,4 +142,4 @@ CREATE TABLE IF NOT EXISTS admin_audit (
 CREATE INDEX IF NOT EXISTS admin_audit_actor_time_idx ON admin_audit(actor_user_id, occurred_at);
 CREATE INDEX IF NOT EXISTS admin_audit_object_idx ON admin_audit(object_type, object_id, occurred_at);
 
-INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, unixepoch());
+INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, unixepoch());

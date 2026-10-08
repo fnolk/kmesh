@@ -492,7 +492,7 @@ def print_plan(args: argparse.Namespace) -> None:
         "deploy": [
             "stop the old target agent, then the old public server to release TCP 9443 and UDP 3478",
             "start the new private server with its isolated database",
-            "create a new user, role, target, and grant; enroll the target through a 0600 token file piped to remote Python stdin",
+            "create a new user, access group, target, and grant; enroll the target through a 0600 token file piped to remote Python stdin",
             "start one new target agent and wait for the new target to report online",
         ],
         "verify": [
@@ -1194,7 +1194,7 @@ def deploy(harness: Harness) -> None:
     suffix = harness.report["run_id"].replace("-", "")[-8:]
     target_name = f"target-1-iroh-{suffix}"
     username = f"kmesh-verify-{suffix}"
-    role_name = f"target-1-access-{suffix}"
+    group_name = f"target-1-access-{suffix}"
     target_data = expect_data(
         kmesh_admin_json(
             harness,
@@ -1243,34 +1243,34 @@ def deploy(harness: Harness) -> None:
     harness.protect_secret(user_token)
     user_token_file = args.state_dir / "credentials" / "verification-user-api-token"
     write_private_file(user_token_file, user_token.encode("utf-8") + b"\n")
-    role = expect_data(
+    access_group = expect_data(
         kmesh_admin_json(
             harness,
             "admin",
-            "roles",
+            "groups",
             "create",
-            role_name,
-            label="create-role",
+            group_name,
+            label="create-access-group",
         ),
-        "role",
-        "create-role",
+        "access_group",
+        "create-access-group",
     )
-    role_id = role["role_id"]
+    group_id = access_group["group_id"]
     kmesh_admin_json(
         harness,
         "admin",
         "users",
-        "roles",
+        "groups",
         user_id,
-        role_id,
-        label="bind-user-role",
+        group_id,
+        label="set-user-access-group",
     )
     kmesh_admin_json(
         harness,
         "admin",
         "grants",
         "add",
-        role_id,
+        group_id,
         target_id,
         label="grant-ssh-connect",
     )
@@ -1281,8 +1281,8 @@ def deploy(harness: Harness) -> None:
         "user_id": user_id,
         "username": username,
         "user_token_file": str(user_token_file),
-        "role_id": role_id,
-        "role_name": role_name,
+        "group_id": group_id,
+        "group_name": group_name,
         "server_mode": "private",
         "artifact_revision": args.artifact_revision,
         "server_agent_binary_sha256": hashlib.sha256(args.linux_binary.read_bytes()).hexdigest(),
@@ -1338,7 +1338,7 @@ def deploy(harness: Harness) -> None:
         "target_name": target_name,
         "user_id": user_id,
         "username": username,
-        "role_id": role_id,
+        "group_id": group_id,
         "server_mode": "private",
     }
     harness.write_report()

@@ -554,6 +554,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     };
     assert_eq!(user.user_id, "ssh-user");
     assert_eq!(user.username, "ssh-user");
+    assert_eq!(user.system_role, crate::protocol::SystemRole::Member);
     assert_eq!(
         admin_request(
             state,
@@ -598,25 +599,25 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         AdminResponse::Users(users) if users.iter().any(|candidate| candidate.user_id == user.user_id.clone())
     ));
 
-    let created_role = admin_request(
+    let created_access_group = admin_request(
         state,
         &admin_tokens,
-        AdminOperation::CreateRole {
+        AdminOperation::CreateAccessGroup {
             name: "SSH-Connect-Only".to_owned(),
         },
     )
     .await
-    .expect("create SSH-only role");
-    let AdminResponse::Role(role) = created_role else {
-        panic!("create role returned an unexpected response");
+    .expect("create SSH-only access_group");
+    let AdminResponse::AccessGroup(access_group) = created_access_group else {
+        panic!("create access_group returned an unexpected response");
     };
-    assert_eq!(role.role_id, "ssh-connect-only");
-    assert_eq!(role.name, "SSH-Connect-Only");
+    assert_eq!(access_group.group_id, "ssh-connect-only");
+    assert_eq!(access_group.name, "SSH-Connect-Only");
     assert_eq!(
         admin_request(
             state,
             &admin_tokens,
-            AdminOperation::CreateRole {
+            AdminOperation::CreateAccessGroup {
                 name: "ssh-connect-only".to_owned(),
             },
         )
@@ -628,34 +629,94 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         admin_request(
             state,
             &admin_tokens,
-            AdminOperation::ListRoles,
+            AdminOperation::ListGroups,
         )
         .await
-        .expect("list roles"),
-        AdminResponse::Roles(roles) if roles.iter().any(|candidate| candidate.role_id == role.role_id.clone())
+        .expect("list access_groups"),
+        AdminResponse::AccessGroups(access_groups) if access_groups.iter().any(|candidate| candidate.group_id == access_group.group_id.clone())
     ));
     assert!(matches!(
         admin_request(
             state,
             &admin_tokens,
-            AdminOperation::SetUserRoles {
+            AdminOperation::SetUserAccessGroups {
                 user_id: user.user_id.clone(),
-                role_ids: vec![role.role_id.clone(), role.role_id.clone()],
+                group_ids: vec![access_group.group_id.clone(), access_group.group_id.clone()],
             },
         )
         .await
-        .expect("set user roles"),
-        AdminResponse::UserRoles(roles) if roles.len() == 1 && roles[0].role_id == role.role_id.clone()
+        .expect("set user access_groups"),
+        AdminResponse::UserAccessGroups(access_groups) if access_groups.len() == 1 && access_groups[0].group_id == access_group.group_id.clone()
+    ));
+
+    let identity = admin::me(State(state.clone()), bearer(&user_token))
+        .await
+        .expect("read member identity")
+        .0;
+    assert_eq!(identity.system_role, crate::protocol::SystemRole::Member);
+    assert_eq!(identity.access_groups[0].group_id, access_group.group_id);
+    assert_eq!(
+        admin_request(state, &user_token, AdminOperation::ListUsers)
+            .await
+            .unwrap_err(),
+        StatusCode::FORBIDDEN,
+        "access group membership does not grant platform administration"
+    );
+    admin_request(
+        state,
+        &admin_tokens,
+        AdminOperation::SetUserSystemRole {
+            user_id: user.user_id.clone(),
+            system_role: crate::protocol::SystemRole::Admin,
+        },
+    )
+    .await
+    .expect("promote user to a platform admin");
+    assert!(matches!(
+        admin_request(state, &user_token, AdminOperation::ListUsers)
+            .await
+            .expect("old token uses current system role"),
+        AdminResponse::Users(_)
+    ));
+    admin_request(
+        state,
+        &admin_tokens,
+        AdminOperation::SetUserSystemRole {
+            user_id: user.user_id.clone(),
+            system_role: crate::protocol::SystemRole::Member,
+        },
+    )
+    .await
+    .expect("demote user to a platform member");
+    assert_eq!(
+        admin_request(state, &user_token, AdminOperation::ListUsers)
+            .await
+            .unwrap_err(),
+        StatusCode::FORBIDDEN,
+        "the same token uses the current member role after demotion"
+    );
+    assert!(matches!(
+        admin_request(
+            state,
+            &admin_tokens,
+            AdminOperation::ListUserAccessGroups {
+                user_id: user.user_id.clone(),
+            },
+        )
+        .await
+        .expect("system role changes leave access groups unchanged"),
+        AdminResponse::UserAccessGroups(groups)
+            if groups.len() == 1 && groups[0].group_id == access_group.group_id
     ));
     assert!(matches!(
         admin_request(
             state,
             &admin_tokens,
-            AdminOperation::ListUserRoles { user_id: user.user_id.clone() },
+            AdminOperation::ListUserAccessGroups { user_id: user.user_id.clone() },
         )
         .await
-        .expect("list user roles"),
-        AdminResponse::UserRoles(roles) if roles.len() == 1 && roles[0].role_id == role.role_id.clone()
+        .expect("list user access_groups"),
+        AdminResponse::UserAccessGroups(access_groups) if access_groups.len() == 1 && access_groups[0].group_id == access_group.group_id.clone()
     ));
 
     let key_path = generate_ssh_key(&fixture.data_dir, "id_admin_operation", "ed25519");
@@ -860,7 +921,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         state,
         &admin_tokens,
         AdminOperation::GrantTarget {
-            role_id: role.role_id.clone(),
+            group_id: access_group.group_id.clone(),
             target_id: target.target_id.clone(),
             permission: TargetPermission::SshConnect,
         },
@@ -871,10 +932,10 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         admin_request(
             state,
             &admin_tokens,
-            AdminOperation::ListRoleGrants { role_id: role.role_id.clone() },
+            AdminOperation::ListGroupGrants { group_id: access_group.group_id.clone() },
         )
         .await
-        .expect("list role grants"),
+        .expect("list access_group grants"),
         AdminResponse::Grants(grants) if grants.len() == 1 && grants[0].target_id == target.target_id.clone()
     ));
     assert!(matches!(
@@ -916,8 +977,45 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         .into_response()
         .status(),
         StatusCode::FORBIDDEN,
-        "the administrator role does not imply SSH connect permission"
+        "the admin role does not grant SSH access by itself"
     );
+
+    admin_request(
+        state,
+        &admin_tokens,
+        AdminOperation::SetUserAccessGroups {
+            user_id: "admin".to_owned(),
+            group_ids: vec![access_group.group_id.clone()],
+        },
+    )
+    .await
+    .expect("add admin to the granted access group");
+    let admin_user = authenticate(state, &bearer(&admin_tokens))
+        .await
+        .expect("authenticate admin after group assignment");
+    let admin_session = Uuid::new_v4();
+    control::open_tunnel(
+        state,
+        admin_user,
+        &admin_client_sender,
+        admin_session,
+        &target.target_id,
+        iroh::SecretKey::generate().public().to_string(),
+        RouteMode::PrivateRelay,
+    )
+    .await
+    .expect("admin needs and uses the access group grant for SSH");
+    assert!(matches!(
+        target_receiver.recv().await,
+        Some(crate::protocol::ControlMessage::Prepare { session_id, .. })
+            if session_id == admin_session
+    ));
+    control::close_pending_client_tunnels(state, &admin_client_sender).await;
+    assert!(matches!(
+        target_receiver.recv().await,
+        Some(crate::protocol::ControlMessage::Close { session_id, .. })
+            if session_id == admin_session
+    ));
 
     assert_eq!(
         admin_request(
@@ -968,7 +1066,7 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         state,
         &admin_tokens,
         AdminOperation::RevokeTarget {
-            role_id: role.role_id.clone(),
+            group_id: access_group.group_id.clone(),
             target_id: target.target_id.clone(),
             permission: TargetPermission::SshConnect,
         },
@@ -979,10 +1077,10 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         admin_request(
             state,
             &admin_tokens,
-            AdminOperation::ListRoleGrants { role_id: role.role_id.clone() },
+            AdminOperation::ListGroupGrants { group_id: access_group.group_id.clone() },
         )
         .await
-        .expect("list role grants after revoke"),
+        .expect("list access_group grants after revoke"),
         AdminResponse::Grants(grants) if grants.is_empty()
     ));
     let visible_targets = admin::targets(State(state.clone()), bearer(&user_tokens))
@@ -1048,22 +1146,22 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
     admin_request(
         state,
         &admin_tokens,
-        AdminOperation::SetUserRoles {
+        AdminOperation::SetUserAccessGroups {
             user_id: user.user_id.clone(),
-            role_ids: Vec::new(),
+            group_ids: Vec::new(),
         },
     )
     .await
-    .expect("clear user roles");
+    .expect("clear user access_groups");
     admin_request(
         state,
         &admin_tokens,
-        AdminOperation::DeleteRole {
-            role_id: role.role_id.clone(),
+        AdminOperation::DeleteAccessGroup {
+            group_id: access_group.group_id.clone(),
         },
     )
     .await
-    .expect("delete role");
+    .expect("delete access_group");
     admin_request(
         state,
         &admin_tokens,
@@ -1083,4 +1181,324 @@ async fn admin_crud_and_ssh_connect_grants_are_separate_authorities() {
         .expect("list targets after deletion"),
         AdminResponse::Targets(targets) if targets.is_empty()
     ));
+}
+
+#[tokio::test]
+async fn member_with_admin_named_access_group_is_not_an_admin() {
+    let fixture = fixture().await;
+    let state = &fixture.state;
+    let admin_token = login(state, &fixture.admin_token)
+        .await
+        .expect("login initial admin");
+    let initial_admin = admin::me(State(state.clone()), bearer(&admin_token))
+        .await
+        .expect("read initial admin identity")
+        .0;
+    assert_eq!(
+        initial_admin.system_role,
+        crate::protocol::SystemRole::Admin
+    );
+    assert!(initial_admin.access_groups.is_empty());
+    assert!(matches!(
+        admin_request(state, &admin_token, AdminOperation::ListUsers)
+            .await
+            .expect("admin access remains after an empty group list"),
+        AdminResponse::Users(_)
+    ));
+
+    let member = match admin_request(
+        state,
+        &admin_token,
+        AdminOperation::CreateUser {
+            username: "ordinary".to_owned(),
+        },
+    )
+    .await
+    .expect("create member")
+    {
+        AdminResponse::User(user) => user,
+        _ => panic!("create user returned an unexpected response"),
+    };
+    assert_eq!(member.system_role, crate::protocol::SystemRole::Member);
+    let member_token = match admin_request(
+        state,
+        &admin_token,
+        AdminOperation::CreateApiToken {
+            user_id: member.user_id.clone(),
+            label: "member token".to_owned(),
+            expires_in_secs: None,
+        },
+    )
+    .await
+    .expect("issue member token")
+    {
+        AdminResponse::ApiTokenIssued { token, .. } => token,
+        _ => panic!("token creation returned an unexpected response"),
+    };
+    let admin_named_group = match admin_request(
+        state,
+        &admin_token,
+        AdminOperation::CreateAccessGroup {
+            name: "admin".to_owned(),
+        },
+    )
+    .await
+    .expect("create an access group named admin")
+    {
+        AdminResponse::AccessGroup(group) => group,
+        _ => panic!("group creation returned an unexpected response"),
+    };
+    admin_request(
+        state,
+        &admin_token,
+        AdminOperation::SetUserAccessGroups {
+            user_id: member.user_id.clone(),
+            group_ids: vec![admin_named_group.group_id.clone()],
+        },
+    )
+    .await
+    .expect("add member to the admin-named access group");
+    let identity = admin::me(State(state.clone()), bearer(&member_token))
+        .await
+        .expect("read member identity")
+        .0;
+    assert_eq!(identity.system_role, crate::protocol::SystemRole::Member);
+    assert_eq!(identity.access_groups[0].group_id, "admin");
+    assert_eq!(
+        admin_request(state, &member_token, AdminOperation::ListUsers)
+            .await
+            .unwrap_err(),
+        StatusCode::FORBIDDEN
+    );
+    admin_request(
+        state,
+        &admin_token,
+        AdminOperation::SetUserAccessGroups {
+            user_id: member.user_id.clone(),
+            group_ids: Vec::new(),
+        },
+    )
+    .await
+    .expect("remove all member access groups");
+    let identity = admin::me(State(state.clone()), bearer(&member_token))
+        .await
+        .expect("read member identity after group removal")
+        .0;
+    assert_eq!(identity.system_role, crate::protocol::SystemRole::Member);
+    assert!(identity.access_groups.is_empty());
+    assert_eq!(
+        admin_request(state, &member_token, AdminOperation::ListUsers)
+            .await
+            .unwrap_err(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn every_admin_operation_rejects_a_member() {
+    let fixture = fixture().await;
+    let state = &fixture.state;
+    let admin_token = &fixture.admin_token;
+    let member = match admin_request(
+        state,
+        admin_token,
+        AdminOperation::CreateUser {
+            username: "member".to_owned(),
+        },
+    )
+    .await
+    .expect("create member")
+    {
+        AdminResponse::User(user) => user,
+        _ => panic!("create user returned an unexpected response"),
+    };
+    let member_token = match admin_request(
+        state,
+        admin_token,
+        AdminOperation::CreateApiToken {
+            user_id: member.user_id.clone(),
+            label: "member".to_owned(),
+            expires_in_secs: None,
+        },
+    )
+    .await
+    .expect("issue member token")
+    {
+        AdminResponse::ApiTokenIssued { token, .. } => token,
+        _ => panic!("token creation returned an unexpected response"),
+    };
+    let operations = [
+        AdminOperation::ListUsers,
+        AdminOperation::ListRelayTraffic,
+        AdminOperation::CloseRelaySession {
+            session_id: Uuid::new_v4(),
+        },
+        AdminOperation::CreateUser {
+            username: "blocked".to_owned(),
+        },
+        AdminOperation::SetUserEnabled {
+            user_id: member.user_id.clone(),
+            enabled: false,
+        },
+        AdminOperation::CreateApiToken {
+            user_id: member.user_id.clone(),
+            label: "blocked".to_owned(),
+            expires_in_secs: None,
+        },
+        AdminOperation::ListApiTokens {
+            user_id: member.user_id.clone(),
+        },
+        AdminOperation::RevokeApiToken {
+            token_id: Uuid::new_v4(),
+        },
+        AdminOperation::AddUserKey {
+            user_id: member.user_id.clone(),
+            public_key: "invalid".to_owned(),
+            label: String::new(),
+        },
+        AdminOperation::RemoveUserKey {
+            key_id: Uuid::new_v4(),
+        },
+        AdminOperation::ListKeys {
+            user_id: member.user_id.clone(),
+        },
+        AdminOperation::ListRoles,
+        AdminOperation::SetUserSystemRole {
+            user_id: member.user_id.clone(),
+            system_role: crate::protocol::SystemRole::Admin,
+        },
+        AdminOperation::ListGroups,
+        AdminOperation::CreateAccessGroup {
+            name: "blocked".to_owned(),
+        },
+        AdminOperation::DeleteAccessGroup {
+            group_id: "blocked".to_owned(),
+        },
+        AdminOperation::SetUserAccessGroups {
+            user_id: member.user_id.clone(),
+            group_ids: Vec::new(),
+        },
+        AdminOperation::ListUserAccessGroups {
+            user_id: member.user_id.clone(),
+        },
+        AdminOperation::GrantTarget {
+            group_id: "blocked".to_owned(),
+            target_id: "blocked".to_owned(),
+            permission: TargetPermission::SshConnect,
+        },
+        AdminOperation::RevokeTarget {
+            group_id: "blocked".to_owned(),
+            target_id: "blocked".to_owned(),
+            permission: TargetPermission::SshConnect,
+        },
+        AdminOperation::ListGroupGrants {
+            group_id: "blocked".to_owned(),
+        },
+        AdminOperation::ListTargets,
+        AdminOperation::CreateTarget {
+            name: "blocked".to_owned(),
+        },
+        AdminOperation::RenameTarget {
+            target_id: "blocked".to_owned(),
+            name: "renamed".to_owned(),
+        },
+        AdminOperation::SetTargetEnabled {
+            target_id: "blocked".to_owned(),
+            enabled: false,
+        },
+        AdminOperation::DeleteTarget {
+            target_id: "blocked".to_owned(),
+        },
+        AdminOperation::IssueEnrollment {
+            target_id: "blocked".to_owned(),
+        },
+    ];
+    for operation in operations {
+        assert_eq!(
+            admin_request(state, &member_token, operation)
+                .await
+                .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(state.inner.db.user_count().await.expect("count users"), 2);
+}
+
+#[tokio::test]
+async fn concurrent_role_changes_keep_one_enabled_admin() {
+    let fixture = fixture().await;
+    let state = &fixture.state;
+    let admin_token = &fixture.admin_token;
+    let second_admin = match admin_request(
+        state,
+        admin_token,
+        AdminOperation::CreateUser {
+            username: "second-admin".to_owned(),
+        },
+    )
+    .await
+    .expect("create second user")
+    {
+        AdminResponse::User(user) => user,
+        _ => panic!("create user returned an unexpected response"),
+    };
+    let second_token = match admin_request(
+        state,
+        admin_token,
+        AdminOperation::CreateApiToken {
+            user_id: second_admin.user_id.clone(),
+            label: "second admin".to_owned(),
+            expires_in_secs: None,
+        },
+    )
+    .await
+    .expect("issue second admin token")
+    {
+        AdminResponse::ApiTokenIssued { token, .. } => token,
+        _ => panic!("token creation returned an unexpected response"),
+    };
+    admin_request(
+        state,
+        admin_token,
+        AdminOperation::SetUserSystemRole {
+            user_id: second_admin.user_id.clone(),
+            system_role: crate::protocol::SystemRole::Admin,
+        },
+    )
+    .await
+    .expect("promote second user");
+
+    let (first, second) = tokio::join!(
+        admin_request(
+            state,
+            admin_token,
+            AdminOperation::SetUserSystemRole {
+                user_id: "admin".to_owned(),
+                system_role: crate::protocol::SystemRole::Member,
+            },
+        ),
+        admin_request(
+            state,
+            &second_token,
+            AdminOperation::SetUserSystemRole {
+                user_id: second_admin.user_id.clone(),
+                system_role: crate::protocol::SystemRole::Member,
+            },
+        ),
+    );
+    let results = [first, second];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(
+        results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .all(|status| matches!(*status, StatusCode::FORBIDDEN | StatusCode::CONFLICT))
+    );
+    let admin_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM users WHERE enabled = 1 AND system_role = 'admin'",
+    )
+    .fetch_one(&state.inner.db.pool)
+    .await
+    .expect("count enabled admins");
+    assert_eq!(admin_count, 1);
 }

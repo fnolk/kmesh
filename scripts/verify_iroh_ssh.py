@@ -70,7 +70,7 @@ class Verification:
             "started_utc": self.started.isoformat(),
             "mode": args.mode,
             "alias": args.alias,
-            "role_id": str(args.role_id),
+            "group_id": str(args.group_id),
             "target_id": str(args.target_id),
             "client_binary": str(args.client_binary),
             "steps": [],
@@ -494,11 +494,11 @@ class Verification:
         return response
 
     def grant_exists(self) -> bool:
-        response = self.admin("list-role-grants", "grants", "list", str(self.args.role_id))
+        response = self.admin("list-group-grants", "grants", "list", str(self.args.group_id))
         if response.get("result") != "grants" or not isinstance(response.get("data"), list):
             raise VerificationError("admin grants list returned an unexpected response")
         return any(
-            item.get("role_id") == str(self.args.role_id)
+            item.get("group_id") == str(self.args.group_id)
             and item.get("target_id") == str(self.args.target_id)
             and item.get("permission") == "ssh_connect"
             for item in response["data"]
@@ -755,10 +755,10 @@ class Verification:
 
     def verify_revoke_boundary(self) -> None:
         if not self.grant_exists():
-            raise VerificationError("the supplied role has no ssh_connect grant for the target")
+            raise VerificationError("the supplied access group has no ssh_connect grant for the target")
         self.revocation_attempted = True
         try:
-            self.admin("revoke-target-grant", "grants", "remove", str(self.args.role_id), str(self.args.target_id))
+            self.admin("revoke-target-grant", "grants", "remove", str(self.args.group_id), str(self.args.target_id))
             if self.grant_exists():
                 raise VerificationError("admin revoke command returned but the target grant remains")
             existing = self.run("active-control-master-survives-revoke", self.ssh_base(multiplex=True) + ["hostname"])
@@ -790,7 +790,7 @@ class Verification:
         if not self.revocation_attempted:
             return
         if not self.grant_exists():
-            self.admin("restore-target-grant", "grants", "add", str(self.args.role_id), str(self.args.target_id))
+            self.admin("restore-target-grant", "grants", "add", str(self.args.group_id), str(self.args.target_id))
         if not self.grant_exists():
             raise VerificationError("could not restore the original ssh_connect grant")
         self.revocation_attempted = False
@@ -1002,7 +1002,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ssh-config", required=True, type=Path)
     parser.add_argument("--alias", required=True)
     parser.add_argument("--admin-config", required=True, type=Path)
-    parser.add_argument("--role-id", required=True, type=normalize_id)
+    parser.add_argument("--group-id", required=True, type=normalize_id)
     parser.add_argument("--target-id", required=True, type=normalize_id)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--mode", choices=("private", "public-direct"), required=True)
@@ -1045,7 +1045,7 @@ def main() -> int:
     try:
         verifier.prepare_proxy_shim()
         if not verifier.grant_exists():
-            raise VerificationError("the supplied role has no ssh_connect grant for the target")
+            raise VerificationError("the supplied access group has no ssh_connect grant for the target")
         verifier.verify_basic_ssh()
         verifier.verify_path_probe()
         verifier.verify_control_master()

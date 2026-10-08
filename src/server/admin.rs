@@ -10,9 +10,9 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::protocol::{
-    AdminOperation, AdminRequest, AdminResponse, ApiTokenView, MeView, RelayConnectionMetadata,
-    RelayConnectionView, RelayEndpointSide, RelaySessionPhase, RelayTrafficView, RoleGrantView,
-    RoleView, TargetPermission, TargetView, UserKeyView, UserView,
+    AccessGroupView, AdminOperation, AdminRequest, AdminResponse, ApiTokenView, GroupGrantView,
+    MeView, RelayConnectionMetadata, RelayConnectionView, RelayEndpointSide, RelaySessionPhase,
+    RelayTrafficView, SystemRole, TargetPermission, TargetView, UserKeyView, UserView,
 };
 
 use super::auth::{authenticate, canonical_ssh_key, ssh_fingerprint};
@@ -26,10 +26,13 @@ pub(crate) async fn me(
 ) -> Result<Json<MeView>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     let user_view = get_user(&state, &user.user_id).await?;
-    let roles = list_user_roles(&state, &user.user_id).await?;
+    let access_groups = list_user_access_groups(&state, &user.user_id).await?;
     Ok(Json(MeView {
-        user: user_view,
-        roles,
+        user_id: user_view.user_id,
+        username: user_view.username,
+        enabled: user_view.enabled,
+        system_role: user_view.system_role,
+        access_groups,
     }))
 }
 
@@ -40,8 +43,8 @@ pub(crate) async fn targets(
     let user = authenticate(&state, &headers).await?;
     let rows = sqlx::query(
         "SELECT DISTINCT t.id, t.name FROM targets t \
-         JOIN target_permissions tp ON tp.target_id = t.id \
-         JOIN user_roles ur ON ur.role_id = tp.role_id \
+         JOIN group_target_permissions tp ON tp.target_id = t.id \
+         JOIN user_access_groups ur ON ur.group_id = tp.group_id \
          WHERE ur.user_id = ?1 AND tp.permission = 'ssh_connect' \
            AND t.enabled = 1 AND t.deleted_at IS NULL ORDER BY t.name COLLATE NOCASE",
     )
@@ -92,23 +95,28 @@ pub(crate) async fn apply_operation(
         | Op::ListApiTokens { user_id }
         | Op::AddUserKey { user_id, .. }
         | Op::ListKeys { user_id }
-        | Op::ListUserRoles { user_id } => *user_id = normalize_username(user_id)?,
-        Op::SetUserRoles { user_id, role_ids } => {
+        | Op::ListUserAccessGroups { user_id }
+        | Op::SetUserSystemRole { user_id, .. } => *user_id = normalize_username(user_id)?,
+        Op::SetUserAccessGroups { user_id, group_ids } => {
             *user_id = normalize_username(user_id)?;
-            for role_id in role_ids {
-                *role_id = normalize_role_id(role_id)?;
+            for group_id in group_ids {
+                *group_id = normalize_group_id(group_id)?;
             }
         }
-        Op::DeleteRole { role_id } | Op::ListRoleGrants { role_id } => {
-            *role_id = normalize_role_id(role_id)?;
+        Op::DeleteAccessGroup { group_id } | Op::ListGroupGrants { group_id } => {
+            *group_id = normalize_group_id(group_id)?;
         }
         Op::GrantTarget {
-            role_id, target_id, ..
+            group_id,
+            target_id,
+            ..
         }
         | Op::RevokeTarget {
-            role_id, target_id, ..
+            group_id,
+            target_id,
+            ..
         } => {
-            *role_id = normalize_role_id(role_id)?;
+            *group_id = normalize_group_id(group_id)?;
             *target_id = normalize_target_id(target_id)?;
         }
         Op::RenameTarget { target_id, .. }
@@ -138,15 +146,20 @@ pub(crate) async fn apply_operation(
         Op::ListKeys { user_id } => {
             return Ok(AdminResponse::Keys(list_keys(state, user_id).await?));
         }
-        Op::ListRoles => return Ok(AdminResponse::Roles(list_roles(state).await?)),
-        Op::ListUserRoles { user_id } => {
-            return Ok(AdminResponse::UserRoles(
-                list_user_roles(state, user_id).await?,
+        Op::ListRoles => return Ok(AdminResponse::Roles(SystemRole::ALL.to_vec())),
+        Op::ListGroups => {
+            return Ok(AdminResponse::AccessGroups(
+                list_access_groups(state).await?,
             ));
         }
-        Op::ListRoleGrants { role_id } => {
+        Op::ListUserAccessGroups { user_id } => {
+            return Ok(AdminResponse::UserAccessGroups(
+                list_user_access_groups(state, user_id).await?,
+            ));
+        }
+        Op::ListGroupGrants { group_id } => {
             return Ok(AdminResponse::Grants(
-                list_role_grants(state, role_id).await?,
+                list_access_group_grants(state, group_id).await?,
             ));
         }
         Op::ListTargets => return Ok(AdminResponse::Targets(list_targets(state).await?)),
@@ -154,6 +167,7 @@ pub(crate) async fn apply_operation(
     }
 
     let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    ensure_actor_is_admin(&mut tx, &actor_user_id).await?;
     let mut audit = prepare_audit_event(actor_user_id, &operation, &mut tx).await?;
     let response = apply_operation_write(state, &mut tx, operation).await?;
     complete_audit_event(&mut audit, &response);
@@ -390,6 +404,7 @@ async fn close_relay_session(
         .count() as u64;
 
     let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    ensure_actor_is_admin(&mut tx, &actor_user_id).await?;
     let row = sqlx::query("SELECT status, client_endpoint_id FROM tunnel_sessions WHERE id = ?1")
         .bind(session_id.to_string())
         .fetch_optional(&mut *tx)
@@ -470,8 +485,9 @@ async fn apply_operation_write(
         Op::ListUsers
         | Op::ListKeys { .. }
         | Op::ListRoles
-        | Op::ListUserRoles { .. }
-        | Op::ListRoleGrants { .. }
+        | Op::ListGroups
+        | Op::ListUserAccessGroups { .. }
+        | Op::ListGroupGrants { .. }
         | Op::ListApiTokens { .. }
         | Op::ListTargets
         | Op::ListRelayTraffic
@@ -483,8 +499,8 @@ async fn apply_operation_write(
             let id = username.clone();
             let now = unix_time();
             sqlx::query(
-                "INSERT INTO users(id, username, enabled, created_at, updated_at) \
-                 VALUES (?1, ?2, 1, ?3, ?3)",
+                "INSERT INTO users(id, username, system_role, enabled, created_at, updated_at) \
+                 VALUES (?1, ?2, 'member', 1, ?3, ?3)",
             )
             .bind(&id)
             .bind(&username)
@@ -495,6 +511,7 @@ async fn apply_operation_write(
             Ok(AdminResponse::User(UserView {
                 user_id: id,
                 username,
+                system_role: SystemRole::Member,
                 enabled: true,
             }))
         }
@@ -639,35 +656,49 @@ async fn apply_operation_write(
             }
             Ok(AdminResponse::Ok)
         }
-        Op::CreateRole { name } => {
-            let name = normalize_name(&name, "role")?;
-            let role_id = name.to_ascii_lowercase();
-            sqlx::query("INSERT INTO roles(id, name, built_in, created_at) VALUES (?1, ?2, 0, ?3)")
-                .bind(&role_id)
+        Op::SetUserSystemRole {
+            user_id,
+            system_role,
+        } => {
+            let changed =
+                sqlx::query("UPDATE users SET system_role = ?1, updated_at = ?2 WHERE id = ?3")
+                    .bind(system_role.as_str())
+                    .bind(unix_time())
+                    .bind(&user_id)
+                    .execute(&mut **tx)
+                    .await?;
+            if changed.rows_affected() == 0 {
+                return Err(ApiError::not_found("user does not exist"));
+            }
+            ensure_admin_remains(tx).await?;
+            Ok(AdminResponse::UserSystemRole(system_role))
+        }
+        Op::CreateAccessGroup { name } => {
+            let name = normalize_name(&name, "access group")?;
+            let group_id = name.to_ascii_lowercase();
+            sqlx::query("INSERT INTO access_groups(id, name, created_at) VALUES (?1, ?2, ?3)")
+                .bind(&group_id)
                 .bind(&name)
                 .bind(unix_time())
                 .execute(&mut **tx)
                 .await
                 .map_err(map_constraint)?;
-            Ok(AdminResponse::Role(RoleView { role_id, name }))
+            Ok(AdminResponse::AccessGroup(AccessGroupView {
+                group_id,
+                name,
+            }))
         }
-        Op::DeleteRole { role_id } => {
-            let built_in = sqlx::query_scalar::<_, i64>("SELECT built_in FROM roles WHERE id = ?1")
-                .bind(&role_id)
-                .fetch_optional(&mut **tx)
-                .await?
-                .ok_or_else(|| ApiError::not_found("role does not exist"))?;
-            if built_in != 0 {
-                return Err(ApiError::forbidden());
-            }
-            sqlx::query("DELETE FROM roles WHERE id = ?1")
-                .bind(&role_id)
+        Op::DeleteAccessGroup { group_id } => {
+            let deleted = sqlx::query("DELETE FROM access_groups WHERE id = ?1")
+                .bind(&group_id)
                 .execute(&mut **tx)
                 .await?;
-            ensure_admin_remains(tx).await?;
+            if deleted.rows_affected() == 0 {
+                return Err(ApiError::not_found("access group does not exist"));
+            }
             Ok(AdminResponse::Ok)
         }
-        Op::SetUserRoles { user_id, role_ids } => {
+        Op::SetUserAccessGroups { user_id, group_ids } => {
             let user_exists =
                 sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)")
                     .bind(&user_id)
@@ -676,53 +707,52 @@ async fn apply_operation_write(
             if user_exists == 0 {
                 return Err(ApiError::not_found("user does not exist"));
             }
-            sqlx::query("DELETE FROM user_roles WHERE user_id = ?1")
+            sqlx::query("DELETE FROM user_access_groups WHERE user_id = ?1")
                 .bind(&user_id)
                 .execute(&mut **tx)
                 .await?;
-            for role_id in role_ids.iter().collect::<std::collections::BTreeSet<_>>() {
-                let inserted = sqlx::query("INSERT INTO user_roles(user_id, role_id) SELECT ?1, id FROM roles WHERE id = ?2")
+            for group_id in group_ids.iter().collect::<std::collections::BTreeSet<_>>() {
+                let inserted = sqlx::query("INSERT INTO user_access_groups(user_id, group_id) SELECT ?1, id FROM access_groups WHERE id = ?2")
                     .bind(&user_id)
-                    .bind(role_id)
+                    .bind(group_id)
                     .execute(&mut **tx)
                     .await?;
                 if inserted.rows_affected() != 1 {
-                    return Err(ApiError::not_found("role does not exist"));
+                    return Err(ApiError::not_found("access group does not exist"));
                 }
             }
-            ensure_admin_remains(tx).await?;
-            let roles = list_user_roles_tx(tx, &user_id).await?;
-            Ok(AdminResponse::UserRoles(roles))
+            let access_groups = list_user_access_groups_tx(tx, &user_id).await?;
+            Ok(AdminResponse::UserAccessGroups(access_groups))
         }
         Op::GrantTarget {
-            role_id,
+            group_id,
             target_id,
             permission,
         } => {
             ensure_permission(permission);
             let inserted = sqlx::query(
-                "INSERT INTO target_permissions(role_id, target_id, permission) \
-                 SELECT r.id, t.id, 'ssh_connect' FROM roles r, targets t \
+                "INSERT INTO group_target_permissions(group_id, target_id, permission) \
+                 SELECT r.id, t.id, 'ssh_connect' FROM access_groups r, targets t \
                  WHERE r.id = ?1 AND t.id = ?2 AND t.deleted_at IS NULL",
             )
-            .bind(&role_id)
+            .bind(&group_id)
             .bind(&target_id)
             .execute(&mut **tx)
             .await
             .map_err(map_constraint)?;
             if inserted.rows_affected() != 1 {
-                return Err(ApiError::not_found("role or target does not exist"));
+                return Err(ApiError::not_found("access group or target does not exist"));
             }
             Ok(AdminResponse::Ok)
         }
         Op::RevokeTarget {
-            role_id,
+            group_id,
             target_id,
             permission,
         } => {
             ensure_permission(permission);
-            sqlx::query("DELETE FROM target_permissions WHERE role_id = ?1 AND target_id = ?2 AND permission = 'ssh_connect'")
-                .bind(&role_id)
+            sqlx::query("DELETE FROM group_target_permissions WHERE group_id = ?1 AND target_id = ?2 AND permission = 'ssh_connect'")
+                .bind(&group_id)
                 .bind(&target_id)
                 .execute(&mut **tx)
                 .await?;
@@ -884,6 +914,26 @@ async fn prepare_audit_event(
                 })
             })
         }
+        Op::SetUserSystemRole {
+            user_id,
+            system_role,
+        } => {
+            let previous_role =
+                sqlx::query_scalar::<_, String>("SELECT system_role FROM users WHERE id = ?1")
+                    .bind(user_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+            (
+                "set_user_system_role",
+                "user",
+                Some(user_id.clone()),
+                serde_json::json!({
+                    "user_id": user_id,
+                    "previous_system_role": previous_role,
+                    "system_role": system_role.as_str(),
+                }),
+            )
+        }
         Op::AddUserKey { user_id, label, .. } => (
             "add_user_key",
             "ssh_key",
@@ -910,27 +960,28 @@ async fn prepare_audit_event(
                 details.unwrap_or_else(|| serde_json::json!({ "key_id": key_id })),
             )
         }
-        Op::CreateRole { name } => (
-            "create_role",
-            "role",
+        Op::CreateAccessGroup { name } => (
+            "create_access_group",
+            "access_group",
             None,
             serde_json::json!({ "name": name }),
         ),
-        Op::DeleteRole { role_id } => {
-            let role_name = sqlx::query_scalar::<_, String>("SELECT name FROM roles WHERE id = ?1")
-                .bind(role_id)
-                .fetch_optional(&mut **tx)
-                .await?;
+        Op::DeleteAccessGroup { group_id } => {
+            let access_group_name =
+                sqlx::query_scalar::<_, String>("SELECT name FROM access_groups WHERE id = ?1")
+                    .bind(group_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
             let user_ids = sqlx::query_scalar::<_, String>(
-                "SELECT user_id FROM user_roles WHERE role_id = ?1 ORDER BY user_id",
+                "SELECT user_id FROM user_access_groups WHERE group_id = ?1 ORDER BY user_id",
             )
-            .bind(role_id)
+            .bind(group_id)
             .fetch_all(&mut **tx)
             .await?;
             let grant_rows = sqlx::query(
-                "SELECT target_id, permission FROM target_permissions WHERE role_id = ?1 ORDER BY target_id, permission",
+                "SELECT target_id, permission FROM group_target_permissions WHERE group_id = ?1 ORDER BY target_id, permission",
             )
-            .bind(role_id)
+            .bind(group_id)
             .fetch_all(&mut **tx)
             .await?;
             let grants = grant_rows
@@ -943,60 +994,60 @@ async fn prepare_audit_event(
                 })
                 .collect::<Result<Vec<_>, sqlx::Error>>()?;
             (
-                "delete_role",
-                "role",
-                Some(role_id.clone()),
+                "delete_access_group",
+                "access_group",
+                Some(group_id.clone()),
                 serde_json::json!({
-                    "role_id": role_id,
-                    "role_name": role_name,
+                    "group_id": group_id,
+                    "access_group_name": access_group_name,
                     "user_ids": user_ids,
                     "grants": grants,
                 }),
             )
         }
-        Op::SetUserRoles { user_id, role_ids } => {
-            let previous_role_ids = sqlx::query_scalar::<_, String>(
-                "SELECT role_id FROM user_roles WHERE user_id = ?1 ORDER BY role_id",
+        Op::SetUserAccessGroups { user_id, group_ids } => {
+            let previous_group_ids = sqlx::query_scalar::<_, String>(
+                "SELECT group_id FROM user_access_groups WHERE user_id = ?1 ORDER BY group_id",
             )
             .bind(user_id)
             .fetch_all(&mut **tx)
             .await?;
-            let next_role_ids = role_ids.clone();
+            let next_group_ids = group_ids.clone();
             (
-                "set_user_roles",
+                "set_user_access_groups",
                 "user",
                 Some(user_id.clone()),
                 serde_json::json!({
                     "user_id": user_id,
-                    "previous_role_ids": previous_role_ids,
-                    "requested_role_ids": next_role_ids,
+                    "previous_group_ids": previous_group_ids,
+                    "requested_group_ids": next_group_ids,
                 }),
             )
         }
         Op::GrantTarget {
-            role_id,
+            group_id,
             target_id,
             permission,
         } => (
             "grant_target",
-            "role_target_permission",
+            "access_group_target_permission",
             Some(target_id.clone()),
             serde_json::json!({
-                "role_id": role_id,
+                "group_id": group_id,
                 "target_id": target_id,
                 "permission": permission_name(*permission),
             }),
         ),
         Op::RevokeTarget {
-            role_id,
+            group_id,
             target_id,
             permission,
         } => (
             "revoke_target",
-            "role_target_permission",
+            "access_group_target_permission",
             Some(target_id.clone()),
             serde_json::json!({
-                "role_id": role_id,
+                "group_id": group_id,
                 "target_id": target_id,
                 "permission": permission_name(*permission),
             }),
@@ -1084,8 +1135,9 @@ async fn prepare_audit_event(
         Op::ListUsers
         | Op::ListKeys { .. }
         | Op::ListRoles
-        | Op::ListUserRoles { .. }
-        | Op::ListRoleGrants { .. }
+        | Op::ListGroups
+        | Op::ListUserAccessGroups { .. }
+        | Op::ListGroupGrants { .. }
         | Op::ListApiTokens { .. }
         | Op::ListTargets
         | Op::ListRelayTraffic => {
@@ -1121,19 +1173,22 @@ fn complete_audit_event(event: &mut AuditEvent, response: &AdminResponse) {
             event.object_id = Some(key.key_id.to_string());
             event.context["key_id"] = serde_json::json!(key.key_id);
         }
-        ("create_role", AdminResponse::Role(role)) => {
-            event.object_id = Some(role.role_id.clone());
-            event.context["name"] = serde_json::json!(role.name);
+        ("create_access_group", AdminResponse::AccessGroup(access_group)) => {
+            event.object_id = Some(access_group.group_id.clone());
+            event.context["name"] = serde_json::json!(access_group.name);
+        }
+        ("set_user_system_role", AdminResponse::UserSystemRole(system_role)) => {
+            event.context["system_role"] = serde_json::json!(system_role.as_str());
         }
         ("create_target", AdminResponse::TargetCreated { target, .. }) => {
             event.object_id = Some(target.target_id.clone());
             event.context["name"] = serde_json::json!(target.name);
         }
-        ("set_user_roles", AdminResponse::UserRoles(roles)) => {
-            event.context["role_ids"] = serde_json::json!(
-                roles
+        ("set_user_access_groups", AdminResponse::UserAccessGroups(access_groups)) => {
+            event.context["group_ids"] = serde_json::json!(
+                access_groups
                     .iter()
-                    .map(|role| role.role_id.clone())
+                    .map(|access_group| access_group.group_id.clone())
                     .collect::<Vec<_>>()
             );
         }
@@ -1158,15 +1213,17 @@ fn permission_name(permission: TargetPermission) -> &'static str {
 }
 
 async fn list_users(state: &ServerState) -> Result<Vec<UserView>, ApiError> {
-    let rows =
-        sqlx::query("SELECT id, username, enabled FROM users ORDER BY username COLLATE NOCASE")
-            .fetch_all(&state.inner.db.pool)
-            .await?;
+    let rows = sqlx::query(
+        "SELECT id, username, system_role, enabled FROM users ORDER BY username COLLATE NOCASE",
+    )
+    .fetch_all(&state.inner.db.pool)
+    .await?;
     rows.into_iter()
         .map(|row| {
             Ok(UserView {
                 user_id: row.try_get("id")?,
                 username: row.try_get("username")?,
+                system_role: parse_system_role(row.try_get("system_role")?)?,
                 enabled: row.try_get::<i64, _>("enabled")? == 1,
             })
         })
@@ -1199,7 +1256,7 @@ async fn list_api_tokens(
 }
 
 async fn get_user(state: &ServerState, user_id: &str) -> Result<UserView, ApiError> {
-    let row = sqlx::query("SELECT id, username, enabled FROM users WHERE id = ?1")
+    let row = sqlx::query("SELECT id, username, system_role, enabled FROM users WHERE id = ?1")
         .bind(user_id)
         .fetch_optional(&state.inner.db.pool)
         .await?
@@ -1207,43 +1264,55 @@ async fn get_user(state: &ServerState, user_id: &str) -> Result<UserView, ApiErr
     Ok(UserView {
         user_id: user_id.to_owned(),
         username: row.try_get("username")?,
+        system_role: parse_system_role(row.try_get("system_role")?)?,
         enabled: row.try_get::<i64, _>("enabled")? == 1,
     })
 }
 
-async fn list_roles(state: &ServerState) -> Result<Vec<RoleView>, ApiError> {
-    let rows = sqlx::query("SELECT id, name FROM roles ORDER BY name COLLATE NOCASE")
+fn parse_system_role(value: String) -> Result<SystemRole, ApiError> {
+    match value.as_str() {
+        "member" => Ok(SystemRole::Member),
+        "admin" => Ok(SystemRole::Admin),
+        _ => Err(ApiError::internal("unknown system role stored in database")),
+    }
+}
+
+async fn list_access_groups(state: &ServerState) -> Result<Vec<AccessGroupView>, ApiError> {
+    let rows = sqlx::query("SELECT id, name FROM access_groups ORDER BY name COLLATE NOCASE")
         .fetch_all(&state.inner.db.pool)
         .await?;
     rows.into_iter()
         .map(|row| {
-            Ok(RoleView {
-                role_id: row.try_get("id")?,
+            Ok(AccessGroupView {
+                group_id: row.try_get("id")?,
                 name: row.try_get("name")?,
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()
 }
 
-async fn list_user_roles(state: &ServerState, user_id: &str) -> Result<Vec<RoleView>, ApiError> {
+async fn list_user_access_groups(
+    state: &ServerState,
+    user_id: &str,
+) -> Result<Vec<AccessGroupView>, ApiError> {
     let mut tx = state.inner.db.pool.begin().await?;
-    let roles = list_user_roles_tx(&mut tx, user_id).await?;
+    let access_groups = list_user_access_groups_tx(&mut tx, user_id).await?;
     tx.commit().await?;
-    Ok(roles)
+    Ok(access_groups)
 }
 
-async fn list_user_roles_tx(
+async fn list_user_access_groups_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     user_id: &str,
-) -> Result<Vec<RoleView>, ApiError> {
-    let rows = sqlx::query("SELECT r.id, r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id WHERE ur.user_id = ?1 ORDER BY r.name COLLATE NOCASE")
+) -> Result<Vec<AccessGroupView>, ApiError> {
+    let rows = sqlx::query("SELECT r.id, r.name FROM access_groups r JOIN user_access_groups ur ON ur.group_id = r.id WHERE ur.user_id = ?1 ORDER BY r.name COLLATE NOCASE")
         .bind(user_id)
         .fetch_all(&mut **tx)
         .await?;
     rows.into_iter()
         .map(|row| {
-            Ok(RoleView {
-                role_id: row.try_get("id")?,
+            Ok(AccessGroupView {
+                group_id: row.try_get("id")?,
                 name: row.try_get("name")?,
             })
         })
@@ -1267,12 +1336,12 @@ async fn list_keys(state: &ServerState, user_id: &str) -> Result<Vec<UserKeyView
         .collect::<Result<Vec<_>, ApiError>>()
 }
 
-async fn list_role_grants(
+async fn list_access_group_grants(
     state: &ServerState,
-    role_id: &str,
-) -> Result<Vec<RoleGrantView>, ApiError> {
-    let rows = sqlx::query("SELECT role_id, target_id, permission FROM target_permissions WHERE role_id = ?1 ORDER BY target_id")
-        .bind(role_id)
+    group_id: &str,
+) -> Result<Vec<GroupGrantView>, ApiError> {
+    let rows = sqlx::query("SELECT group_id, target_id, permission FROM group_target_permissions WHERE group_id = ?1 ORDER BY target_id")
+        .bind(group_id)
         .fetch_all(&state.inner.db.pool)
         .await?;
     rows.into_iter()
@@ -1282,8 +1351,8 @@ async fn list_role_grants(
                 "ssh_connect" => TargetPermission::SshConnect,
                 _ => return Err(ApiError::internal("unknown permission stored in database")),
             };
-            Ok(RoleGrantView {
-                role_id: row.try_get("role_id").map_err(ApiError::from)?,
+            Ok(GroupGrantView {
+                group_id: row.try_get("group_id").map_err(ApiError::from)?,
                 target_id: row.try_get("target_id").map_err(ApiError::from)?,
                 permission,
             })
@@ -1336,10 +1405,7 @@ async fn ensure_admin_remains(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), ApiError> {
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(DISTINCT u.id) FROM users u \
-         JOIN user_roles ur ON ur.user_id = u.id \
-         JOIN role_global_permissions gp ON gp.role_id = ur.role_id \
-         WHERE u.enabled = 1 AND gp.permission = 'admin'",
+        "SELECT COUNT(*) FROM users WHERE enabled = 1 AND system_role = 'admin'",
     )
     .fetch_one(&mut **tx)
     .await?;
@@ -1347,6 +1413,23 @@ async fn ensure_admin_remains(
         return Err(ApiError::conflict(
             "at least one enabled administrator must remain",
         ));
+    }
+    Ok(())
+}
+
+async fn ensure_actor_is_admin(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    actor_user_id: &str,
+) -> Result<(), ApiError> {
+    let is_admin = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM users \
+         WHERE id = ?1 AND enabled = 1 AND system_role = 'admin')",
+    )
+    .bind(actor_user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if is_admin == 0 {
+        return Err(ApiError::forbidden());
     }
     Ok(())
 }
@@ -1371,8 +1454,8 @@ fn normalize_username(value: &str) -> Result<String, ApiError> {
     Ok(value.to_ascii_lowercase())
 }
 
-fn normalize_role_id(value: &str) -> Result<String, ApiError> {
-    Ok(normalize_name(value, "role")?.to_ascii_lowercase())
+fn normalize_group_id(value: &str) -> Result<String, ApiError> {
+    Ok(normalize_name(value, "access group")?.to_ascii_lowercase())
 }
 
 pub(super) fn normalize_target_id(value: &str) -> Result<String, ApiError> {
@@ -1414,7 +1497,7 @@ fn map_constraint(error: sqlx::Error) -> ApiError {
             return ApiError::conflict("an item with this name or key already exists");
         }
         if db_error.is_foreign_key_violation() {
-            return ApiError::not_found("referenced user, role or target does not exist");
+            return ApiError::not_found("referenced user, access group or target does not exist");
         }
     }
     ApiError::from(error)

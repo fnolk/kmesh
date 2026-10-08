@@ -48,7 +48,7 @@ impl Database {
                     .await?;
             if let Some(version) = version {
                 anyhow::ensure!(
-                    version == 5,
+                    version == 6,
                     "server database schema version {version} requires a fresh data directory"
                 );
             }
@@ -93,11 +93,10 @@ impl Database {
             let initial_api_token =
                 initial_api_token.context("initial administrator API token is required")?;
             let user_id = initial_api_token.user_id;
-            let role_id = "admin";
             let now = unix_time();
             sqlx::query(
-                "INSERT INTO users(id, username, enabled, created_at, updated_at) \
-                 VALUES (?1, ?2, 1, ?3, ?3)",
+                "INSERT INTO users(id, username, system_role, enabled, created_at, updated_at) \
+                 VALUES (?1, ?2, 'admin', 1, ?3, ?3)",
             )
             .bind(&user_id)
             .bind(admin_username)
@@ -105,23 +104,6 @@ impl Database {
             .execute(&mut *tx)
             .await
             .context("create initial management user")?;
-            sqlx::query(
-                "INSERT INTO roles(id, name, built_in, created_at) VALUES ('admin', 'admin', 1, ?1)",
-            )
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "INSERT INTO role_global_permissions(role_id, permission) VALUES (?1, 'admin')",
-            )
-            .bind(role_id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("INSERT INTO user_roles(user_id, role_id) VALUES (?1, ?2)")
-                .bind(&user_id)
-                .bind(role_id)
-                .execute(&mut *tx)
-                .await?;
             sqlx::query(
                 "INSERT INTO api_tokens(id, user_id, token_hash, label, created_at) \
                  VALUES (?1, ?2, ?3, 'initial administrator token', ?4)",
@@ -155,14 +137,8 @@ impl Database {
 
     pub async fn is_admin(&self, user_id: &str) -> Result<bool> {
         let found = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(\
-                SELECT 1 FROM user_roles ur \
-                JOIN role_global_permissions gp ON gp.role_id = ur.role_id \
-                JOIN users u ON u.id = ur.user_id \
-                JOIN roles r ON r.id = ur.role_id \
-                WHERE ur.user_id = ?1 AND gp.permission = 'admin' \
-                  AND u.enabled = 1 AND r.name = 'admin'\
-            )",
+            "SELECT EXISTS(SELECT 1 FROM users \
+             WHERE id = ?1 AND system_role = 'admin' AND enabled = 1)",
         )
         .bind(user_id)
         .fetch_one(&self.pool)

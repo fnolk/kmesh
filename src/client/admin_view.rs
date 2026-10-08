@@ -13,27 +13,27 @@ use ssh_key::{HashAlg, PublicKey};
 use uuid::Uuid;
 
 use crate::protocol::{
-    AdminOperation, AdminRequest, AdminResponse, ApiTokenView, RoleView, TargetPermission,
-    TargetView, UserKeyView, UserView,
+    AccessGroupView, AdminOperation, AdminRequest, AdminResponse, ApiTokenView, SystemRole,
+    TargetPermission, TargetView, UserKeyView, UserView,
 };
 
 use super::{ClientContext, auth, output};
 
-const CONSISTENCY: &str = "sequential, non-atomic API reads";
+const CONSISTENCY: &str = "sequential API reads";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub(super) enum Selection {
     Overview,
     User(String),
-    Role(String),
+    AccessGroup(String),
     Target(String),
 }
 
 #[derive(Default)]
 struct Snapshot {
     users: BTreeMap<String, UserView>,
-    roles: BTreeMap<String, RoleView>,
+    access_groups: BTreeMap<String, AccessGroupView>,
     targets: BTreeMap<String, TargetView>,
     memberships: BTreeMap<String, BTreeSet<String>>,
     grants: BTreeMap<String, BTreeSet<String>>,
@@ -48,7 +48,7 @@ struct JoinedView {
     collected_at_unix_secs: i64,
     warnings: Vec<String>,
     users: Vec<JoinedUser>,
-    roles: Vec<JoinedRole>,
+    access_groups: Vec<JoinedAccessGroup>,
     targets: Vec<JoinedTarget>,
     access_paths: Vec<AccessPath>,
     tokens: Vec<TokenMetadata>,
@@ -60,7 +60,8 @@ struct JoinedUser {
     user_id: String,
     username: String,
     enabled: bool,
-    role_ids: Vec<String>,
+    system_role: SystemRole,
+    access_groups: Vec<String>,
     configured_target_ids: Vec<String>,
     authorized_target_ids: Vec<String>,
     active_token_count: usize,
@@ -69,8 +70,8 @@ struct JoinedUser {
 }
 
 #[derive(Serialize)]
-struct JoinedRole {
-    role_id: String,
+struct JoinedAccessGroup {
+    group_id: String,
     name: String,
     user_ids: Vec<String>,
     target_ids: Vec<String>,
@@ -83,7 +84,7 @@ struct JoinedTarget {
     available_in_target_list: bool,
     enabled: Option<bool>,
     online: Option<bool>,
-    role_ids: Vec<String>,
+    access_groups: Vec<String>,
     user_ids: Vec<String>,
     authorized_user_ids: Vec<String>,
 }
@@ -92,7 +93,7 @@ struct JoinedTarget {
 struct AccessPath {
     user_id: String,
     target_id: String,
-    role_ids: Vec<String>,
+    access_groups: Vec<String>,
     permission: TargetPermission,
     authorized: bool,
     blockers: Vec<&'static str>,
@@ -120,7 +121,7 @@ struct KeyFingerprint {
 
 struct Scope {
     users: BTreeSet<String>,
-    roles: BTreeSet<String>,
+    access_groups: BTreeSet<String>,
     targets: BTreeSet<String>,
 }
 
@@ -175,12 +176,15 @@ impl Snapshot {
             return Err(unexpected_response("users"));
         };
         snapshot.users = users.into_iter().map(|u| (u.user_id.clone(), u)).collect();
-        let AdminResponse::Roles(roles) =
-            request(context, token, AdminOperation::ListRoles, "roles").await?
+        let AdminResponse::AccessGroups(access_groups) =
+            request(context, token, AdminOperation::ListGroups, "access groups").await?
         else {
-            return Err(unexpected_response("roles"));
+            return Err(unexpected_response("access groups"));
         };
-        snapshot.roles = roles.into_iter().map(|r| (r.role_id.clone(), r)).collect();
+        snapshot.access_groups = access_groups
+            .into_iter()
+            .map(|r| (r.group_id.clone(), r))
+            .collect();
         let AdminResponse::Targets(targets) =
             request(context, token, AdminOperation::ListTargets, "targets").await?
         else {
@@ -194,11 +198,11 @@ impl Snapshot {
 
         // A single in-flight request bounds server load regardless of directory size.
         for user_id in snapshot.users.keys() {
-            let description = format!("roles for user {}", output::cell(user_id));
-            let AdminResponse::UserRoles(roles) = request(
+            let description = format!("access groups for user {}", output::cell(user_id));
+            let AdminResponse::UserAccessGroups(access_groups) = request(
                 context,
                 token,
-                AdminOperation::ListUserRoles {
+                AdminOperation::ListUserAccessGroups {
                     user_id: user_id.clone(),
                 },
                 &description,
@@ -209,16 +213,19 @@ impl Snapshot {
             };
             snapshot.memberships.insert(
                 user_id.clone(),
-                roles.into_iter().map(|role| role.role_id).collect(),
+                access_groups
+                    .into_iter()
+                    .map(|access_group| access_group.group_id)
+                    .collect(),
             );
         }
-        for role_id in snapshot.roles.keys() {
-            let description = format!("grants for role {}", output::cell(role_id));
+        for group_id in snapshot.access_groups.keys() {
+            let description = format!("grants for access group {}", output::cell(group_id));
             let AdminResponse::Grants(grants) = request(
                 context,
                 token,
-                AdminOperation::ListRoleGrants {
-                    role_id: role_id.clone(),
+                AdminOperation::ListGroupGrants {
+                    group_id: group_id.clone(),
                 },
                 &description,
             )
@@ -229,8 +236,8 @@ impl Snapshot {
             let mut target_ids = BTreeSet::new();
             for grant in grants {
                 ensure!(
-                    grant.role_id == *role_id,
-                    "inconsistent role grant metadata; retry the view"
+                    grant.group_id == *group_id,
+                    "Access group grant data changed. Run the view again."
                 );
                 match grant.permission {
                     TargetPermission::SshConnect => {
@@ -238,7 +245,7 @@ impl Snapshot {
                     }
                 }
             }
-            snapshot.grants.insert(role_id.clone(), target_ids);
+            snapshot.grants.insert(group_id.clone(), target_ids);
         }
         snapshot.validate_relationships()?;
         let scope = snapshot.scope(&selection);
@@ -298,10 +305,10 @@ impl Snapshot {
                 self.users
                     .contains_key(id.trim().to_ascii_lowercase().as_str()),
             ),
-            Selection::Role(id) => (
-                "role",
+            Selection::AccessGroup(id) => (
+                "access group",
                 id,
-                self.roles
+                self.access_groups
                     .contains_key(id.trim().to_ascii_lowercase().as_str()),
             ),
             Selection::Target(id) => (
@@ -313,20 +320,20 @@ impl Snapshot {
         };
         if !exists && matches!(selection, Selection::Target(_)) {
             anyhow::bail!(
-                "target ID is absent from the server target list: {}. For retained grants, use admin overview.",
+                "Target ID {} is absent from the target list. Use the admin overview to view retained grants.",
                 output::cell(supplied)
             );
         }
         ensure!(
             exists,
-            "unknown {kind} ID: {}; use an exact ID from admin overview",
+            "Unknown {kind} ID: {}. Use an exact ID from the admin overview.",
             output::cell(supplied)
         );
         let id = supplied.trim().to_ascii_lowercase();
         Ok(match selection {
             Selection::Overview => Selection::Overview,
             Selection::User(_) => Selection::User(id),
-            Selection::Role(_) => Selection::Role(id),
+            Selection::AccessGroup(_) => Selection::AccessGroup(id),
             Selection::Target(_) => Selection::Target(id),
         })
     }
@@ -336,50 +343,54 @@ impl Snapshot {
             self.users
                 .keys()
                 .all(|id| self.memberships.contains_key(id)),
-            "missing user role metadata; retry the view"
+            "User access group data is missing. Use the view again."
         );
         ensure!(
-            self.roles.keys().all(|id| self.grants.contains_key(id)),
-            "missing role grant metadata; retry the view"
+            self.access_groups
+                .keys()
+                .all(|id| self.grants.contains_key(id)),
+            "Access group grant data is missing. Use the view again."
         );
-        for (user_id, roles) in &self.memberships {
+        for (user_id, access_groups) in &self.memberships {
             ensure!(
                 self.users.contains_key(user_id),
-                "user membership changed during reads; retry the view"
+                "The user list changed during the read. Use the view again."
             );
             ensure!(
-                roles.iter().all(|id| self.roles.contains_key(id)),
-                "role membership changed during reads; retry the view"
+                access_groups
+                    .iter()
+                    .all(|id| self.access_groups.contains_key(id)),
+                "The user list changed during the read. Use the view again."
             );
         }
-        for role_id in self.grants.keys() {
+        for group_id in self.grants.keys() {
             ensure!(
-                self.roles.contains_key(role_id),
-                "role grants changed during reads; retry the view"
+                self.access_groups.contains_key(group_id),
+                "Access group grants changed during the read. Use the view again."
             );
-            // Target deletion is soft: ListRoleGrants can retain a target ID that
+            // Target deletion is soft: ListGroupGrants can retain a target ID that
             // ListTargets omits. Preserve that reference as unavailable below.
         }
         Ok(())
     }
 
-    fn user_roles(&self, user_id: &str) -> BTreeSet<String> {
+    fn user_access_groups(&self, user_id: &str) -> BTreeSet<String> {
         self.memberships.get(user_id).cloned().unwrap_or_default()
     }
 
-    fn role_targets(&self, role_id: &str) -> BTreeSet<String> {
-        self.grants.get(role_id).cloned().unwrap_or_default()
+    fn access_group_targets(&self, group_id: &str) -> BTreeSet<String> {
+        self.grants.get(group_id).cloned().unwrap_or_default()
     }
 
-    fn role_users(&self, role_id: &str) -> BTreeSet<String> {
+    fn access_group_users(&self, group_id: &str) -> BTreeSet<String> {
         self.memberships
             .iter()
-            .filter(|(_, roles)| roles.contains(role_id))
+            .filter(|(_, access_groups)| access_groups.contains(group_id))
             .map(|(id, _)| id.clone())
             .collect()
     }
 
-    fn target_roles(&self, target_id: &str) -> BTreeSet<String> {
+    fn target_access_groups(&self, target_id: &str) -> BTreeSet<String> {
         self.grants
             .iter()
             .filter(|(_, targets)| targets.contains(target_id))
@@ -387,19 +398,25 @@ impl Snapshot {
             .collect()
     }
 
-    fn targets_for_roles(&self, roles: &BTreeSet<String>) -> BTreeSet<String> {
-        roles.iter().flat_map(|id| self.role_targets(id)).collect()
+    fn targets_for_access_groups(&self, access_groups: &BTreeSet<String>) -> BTreeSet<String> {
+        access_groups
+            .iter()
+            .flat_map(|id| self.access_group_targets(id))
+            .collect()
     }
 
-    fn users_for_roles(&self, roles: &BTreeSet<String>) -> BTreeSet<String> {
-        roles.iter().flat_map(|id| self.role_users(id)).collect()
+    fn users_for_access_groups(&self, access_groups: &BTreeSet<String>) -> BTreeSet<String> {
+        access_groups
+            .iter()
+            .flat_map(|id| self.access_group_users(id))
+            .collect()
     }
 
     fn scope(&self, selection: &Selection) -> Scope {
         match selection {
             Selection::Overview => Scope {
                 users: self.users.keys().cloned().collect(),
-                roles: self.roles.keys().cloned().collect(),
+                access_groups: self.access_groups.keys().cloned().collect(),
                 targets: self
                     .targets
                     .keys()
@@ -408,23 +425,23 @@ impl Snapshot {
                     .collect(),
             },
             Selection::User(id) => {
-                let roles = self.user_roles(id);
+                let access_groups = self.user_access_groups(id);
                 Scope {
                     users: BTreeSet::from([id.clone()]),
-                    targets: self.targets_for_roles(&roles),
-                    roles,
+                    targets: self.targets_for_access_groups(&access_groups),
+                    access_groups,
                 }
             }
-            Selection::Role(id) => Scope {
-                users: self.role_users(id),
-                roles: BTreeSet::from([id.clone()]),
-                targets: self.role_targets(id),
+            Selection::AccessGroup(id) => Scope {
+                users: self.access_group_users(id),
+                access_groups: BTreeSet::from([id.clone()]),
+                targets: self.access_group_targets(id),
             },
             Selection::Target(id) => {
-                let roles = self.target_roles(id);
+                let access_groups = self.target_access_groups(id);
                 Scope {
-                    users: self.users_for_roles(&roles),
-                    roles,
+                    users: self.users_for_access_groups(&access_groups),
+                    access_groups,
                     targets: BTreeSet::from([id.clone()]),
                 }
             }
@@ -440,8 +457,8 @@ impl Snapshot {
         let mut keys = Vec::new();
         for id in &scope.users {
             let user = &self.users[id];
-            let role_ids = self.user_roles(id);
-            let configured = self.targets_for_roles(&role_ids);
+            let group_ids = self.user_access_groups(id);
+            let configured = self.targets_for_access_groups(&group_ids);
             let authorized = configured
                 .iter()
                 .filter(|id| {
@@ -461,7 +478,8 @@ impl Snapshot {
                 user_id: id.clone(),
                 username: user.username.clone(),
                 enabled: user.enabled,
-                role_ids: role_ids.into_iter().collect(),
+                system_role: user.system_role,
+                access_groups: group_ids.into_iter().collect(),
                 configured_target_ids: configured.into_iter().collect(),
                 authorized_target_ids: authorized,
                 active_token_count: user_tokens
@@ -494,14 +512,14 @@ impl Snapshot {
         }
         tokens.sort_by(|a, b| (&a.user_id, a.token_id).cmp(&(&b.user_id, b.token_id)));
         keys.sort_by(|a, b| (&a.user_id, a.key_id).cmp(&(&b.user_id, b.key_id)));
-        let roles = scope
-            .roles
+        let access_groups = scope
+            .access_groups
             .iter()
-            .map(|id| JoinedRole {
-                role_id: id.clone(),
-                name: self.roles[id].name.clone(),
-                user_ids: self.role_users(id).into_iter().collect(),
-                target_ids: self.role_targets(id).into_iter().collect(),
+            .map(|id| JoinedAccessGroup {
+                group_id: id.clone(),
+                name: self.access_groups[id].name.clone(),
+                user_ids: self.access_group_users(id).into_iter().collect(),
+                target_ids: self.access_group_targets(id).into_iter().collect(),
             })
             .collect();
         let targets = scope
@@ -509,8 +527,8 @@ impl Snapshot {
             .iter()
             .map(|id| {
                 let target = self.targets.get(id);
-                let role_ids = self.target_roles(id);
-                let user_ids = self.users_for_roles(&role_ids);
+                let group_ids = self.target_access_groups(id);
+                let user_ids = self.users_for_access_groups(&group_ids);
                 JoinedTarget {
                     target_id: id.clone(),
                     name: target.map_or_else(|| "-".to_owned(), |target| target.name.clone()),
@@ -524,7 +542,7 @@ impl Snapshot {
                         })
                         .cloned()
                         .collect(),
-                    role_ids: role_ids.into_iter().collect(),
+                    access_groups: group_ids.into_iter().collect(),
                     user_ids: user_ids.into_iter().collect(),
                 }
             })
@@ -533,17 +551,20 @@ impl Snapshot {
         let mut access_paths = Vec::new();
         for user_id in &scope.users {
             let user = &self.users[user_id];
-            let user_roles = self.user_roles(user_id);
+            let user_access_groups = self.user_access_groups(user_id);
             let mut paths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-            for role_id in user_roles.intersection(&scope.roles) {
-                for target_id in self.role_targets(role_id).intersection(&scope.targets) {
+            for group_id in user_access_groups.intersection(&scope.access_groups) {
+                for target_id in self
+                    .access_group_targets(group_id)
+                    .intersection(&scope.targets)
+                {
                     paths
                         .entry(target_id.clone())
                         .or_default()
-                        .insert(role_id.clone());
+                        .insert(group_id.clone());
                 }
             }
-            for (target_id, role_ids) in paths {
+            for (target_id, group_ids) in paths {
                 let target = self.targets.get(&target_id);
                 let mut blockers = Vec::new();
                 if !user.enabled {
@@ -557,7 +578,7 @@ impl Snapshot {
                 access_paths.push(AccessPath {
                     user_id: user_id.clone(),
                     target_id,
-                    role_ids: role_ids.into_iter().collect(),
+                    access_groups: group_ids.into_iter().collect(),
                     permission: TargetPermission::SshConnect,
                     authorized: blockers.is_empty(),
                     blockers,
@@ -574,7 +595,7 @@ impl Snapshot {
             consistency: CONSISTENCY,
             collected_at_unix_secs: now,
             users,
-            roles,
+            access_groups,
             targets,
             access_paths,
             tokens,
@@ -631,7 +652,8 @@ fn tables(view: &JoinedView) -> Vec<Table> {
                 "USER ID",
                 "NAME",
                 "STATE",
-                "ROLES",
+                "PLATFORM ROLE",
+                "GROUP IDS",
                 "AUTHORIZED SSH TARGETS",
                 "TOKENS A/T",
                 "REGISTERED KEYS",
@@ -644,7 +666,8 @@ fn tables(view: &JoinedView) -> Vec<Table> {
                         user.user_id.clone(),
                         user.username.clone(),
                         output::state(user.enabled).to_owned(),
-                        list(&user.role_ids),
+                        user.system_role.as_str().to_owned(),
+                        list(&user.access_groups),
                         list(&user.authorized_target_ids),
                         format!("{}/{}", user.active_token_count, user.total_token_count),
                         user.key_count.to_string(),
@@ -653,17 +676,17 @@ fn tables(view: &JoinedView) -> Vec<Table> {
                 .collect(),
         },
         Table {
-            title: "Roles",
-            headers: &["ROLE ID", "NAME", "USERS", "SSH TARGETS"],
+            title: "Access groups",
+            headers: &["GROUP ID", "NAME", "USERS", "SSH TARGETS"],
             rows: view
-                .roles
+                .access_groups
                 .iter()
-                .map(|role| {
+                .map(|access_group| {
                     vec![
-                        role.role_id.clone(),
-                        role.name.clone(),
-                        list(&role.user_ids),
-                        list(&role.target_ids),
+                        access_group.group_id.clone(),
+                        access_group.name.clone(),
+                        list(&access_group.user_ids),
+                        list(&access_group.target_ids),
                     ]
                 })
                 .collect(),
@@ -675,7 +698,7 @@ fn tables(view: &JoinedView) -> Vec<Table> {
                 "NAME",
                 "STATE",
                 "AVAILABILITY",
-                "ROLES",
+                "GROUP IDS",
                 "ASSIGNED USERS",
                 "AUTHORIZED USERS",
             ],
@@ -688,7 +711,7 @@ fn tables(view: &JoinedView) -> Vec<Table> {
                         target.name.clone(),
                         target_state(target.enabled).to_owned(),
                         availability(target.online).to_owned(),
-                        list(&target.role_ids),
+                        list(&target.access_groups),
                         list(&target.user_ids),
                         list(&target.authorized_user_ids),
                     ]
@@ -703,7 +726,7 @@ fn tables(view: &JoinedView) -> Vec<Table> {
                 headers: &[
                     "USER ID",
                     "TARGET ID",
-                    "VIA ROLES",
+                    "VIA GROUP IDS",
                     "PERMISSION",
                     "AUTHORIZATION",
                     "AVAILABILITY",
@@ -715,7 +738,7 @@ fn tables(view: &JoinedView) -> Vec<Table> {
                         vec![
                             path.user_id.clone(),
                             path.target_id.clone(),
-                            list(&path.role_ids),
+                            list(&path.access_groups),
                             "ssh_connect".to_owned(),
                             if path.authorized {
                                 "allowed".to_owned()
@@ -773,11 +796,11 @@ fn print_view(view: &JoinedView) {
     match &view.selection {
         Selection::Overview => println!("Admin overview"),
         Selection::User(id) => println!("User: {}", output::cell(id)),
-        Selection::Role(id) => println!("Role: {}", output::cell(id)),
+        Selection::AccessGroup(id) => println!("Access group: {}", output::cell(id)),
         Selection::Target(id) => println!("Target: {}", output::cell(id)),
     }
     println!(
-        "Read consistency: {}; collected at {} (Unix seconds).",
+        "Read consistency: {}. Collected at {} (Unix seconds).",
         view.consistency, view.collected_at_unix_secs
     );
     for warning in &view.warnings {
@@ -787,10 +810,10 @@ fn print_view(view: &JoinedView) {
         output::print_table(table.title, table.headers, table.rows);
     }
     println!(
-        "SSH access: user -> role -> ssh_connect grant -> target. Disabled users or targets block authorization; online/offline reports availability separately."
+        "SSH access path: user -> access group -> ssh_connect grant -> target. Disabled users or targets block authorization. Online status reports availability."
     );
     println!(
-        "Admin rights do not imply SSH access. Relationship columns show all assignments; access paths are limited to this selection."
+        "Platform roles control administration. Access groups control SSH access. Access paths are limited to this selection."
     );
     println!(
         "Tokens A/T = active/total by expiry and revocation. Disabled users cannot authenticate. Tokens and keys belong to users, not individual targets."
@@ -813,6 +836,11 @@ mod tests {
                 UserView {
                     user_id: id.to_owned(),
                     username: id.to_owned(),
+                    system_role: if id == "root" {
+                        SystemRole::Admin
+                    } else {
+                        SystemRole::Member
+                    },
                     enabled,
                 },
             );
@@ -820,10 +848,10 @@ mod tests {
             snapshot.keys.insert(id.to_owned(), vec![]);
         }
         for id in ["admin", "dev", "ops"] {
-            snapshot.roles.insert(
+            snapshot.access_groups.insert(
                 id.to_owned(),
-                RoleView {
-                    role_id: id.to_owned(),
+                AccessGroupView {
+                    group_id: id.to_owned(),
                     name: id.to_owned(),
                 },
             );
@@ -882,7 +910,7 @@ mod tests {
         assert!(view.users[2].authorized_target_ids.is_empty());
         assert_eq!(view.access_paths.len(), 4);
         let path = &view.access_paths[0];
-        assert_eq!(path.role_ids, ["dev", "ops"]);
+        assert_eq!(path.access_groups, ["dev", "ops"]);
         assert!(path.authorized, "offline does not remove authorization");
         assert_eq!(path.online, Some(false));
         assert_eq!(view.access_paths[1].blockers, ["target_disabled"]);
@@ -901,23 +929,23 @@ mod tests {
             .join(Selection::User(" ALICE ".to_owned()), 100)
             .unwrap();
         assert_eq!(user.users.len(), 1);
-        assert_eq!(user.roles.len(), 2);
+        assert_eq!(user.access_groups.len(), 2);
         assert_eq!(user.targets.len(), 2);
-        let role = snapshot
-            .join(Selection::Role(" DeV ".to_owned()), 100)
+        let access_group = snapshot
+            .join(Selection::AccessGroup(" DeV ".to_owned()), 100)
             .unwrap();
-        assert_eq!(role.users.len(), 1);
-        assert_eq!(role.targets.len(), 1);
-        assert_eq!(role.access_paths[0].role_ids, ["dev"]);
+        assert_eq!(access_group.users.len(), 1);
+        assert_eq!(access_group.targets.len(), 1);
+        assert_eq!(access_group.access_paths[0].access_groups, ["dev"]);
         let target = snapshot
             .join(Selection::Target(" BUILD ".to_owned()), 100)
             .unwrap();
         assert_eq!(target.users.len(), 2);
-        assert_eq!(target.roles.len(), 2);
+        assert_eq!(target.access_groups.len(), 2);
         assert_eq!(target.targets.len(), 1);
         for selection in [
             Selection::User("ali".to_owned()),
-            Selection::Role("missing".to_owned()),
+            Selection::AccessGroup("missing".to_owned()),
             Selection::Target("missing".to_owned()),
         ] {
             assert!(snapshot.join(selection, 100).is_err());
@@ -989,7 +1017,7 @@ mod tests {
         let mut snapshot = fixture();
         let malicious = "escape\x1b[2J\nforged\r\trow";
         snapshot.users.get_mut("alice").unwrap().username = malicious.to_owned();
-        snapshot.roles.get_mut("dev").unwrap().name = malicious.to_owned();
+        snapshot.access_groups.get_mut("dev").unwrap().name = malicious.to_owned();
         snapshot.targets.get_mut("build").unwrap().name = malicious.to_owned();
         let mut api_token = token(1, None, None);
         api_token.label = malicious.to_owned();
@@ -1019,13 +1047,13 @@ mod tests {
     fn empty_overview_is_complete_and_inconsistent_reads_fail_closed() {
         let view = Snapshot::default().join(Selection::Overview, 100).unwrap();
         assert!(view.users.is_empty());
-        assert!(view.roles.is_empty());
+        assert!(view.access_groups.is_empty());
         assert!(view.targets.is_empty());
         assert!(view.access_paths.is_empty());
         assert_eq!(tables(&view).len(), 3);
-        assert_eq!(view.consistency, "sequential, non-atomic API reads");
+        assert_eq!(view.consistency, CONSISTENCY);
         let mut snapshot = fixture();
-        snapshot.roles.remove("dev");
+        snapshot.access_groups.remove("dev");
         assert!(snapshot.join(Selection::Overview, 100).is_err());
         let mut snapshot = fixture();
         snapshot.users.remove("alice");
@@ -1044,12 +1072,12 @@ mod tests {
     #[test]
     fn retained_grants_to_removed_targets_are_visible_but_never_authorized() {
         let mut snapshot = fixture();
-        // DeleteTarget retains target_permissions, but ListTargets omits the row.
+        // DeleteTarget retains group_target_permissions, but ListTargets omits the row.
         snapshot.targets.remove("build");
         for selection in [
             Selection::Overview,
             Selection::User("alice".to_owned()),
-            Selection::Role("dev".to_owned()),
+            Selection::AccessGroup("dev".to_owned()),
         ] {
             let view = snapshot.join(selection, 100).unwrap();
             let target = view
@@ -1099,20 +1127,20 @@ mod tests {
     }
 
     #[test]
-    fn isolated_roles_and_targets_still_have_useful_empty_detail_views() {
+    fn isolated_access_groups_and_targets_still_have_useful_empty_detail_views() {
         let mut snapshot = fixture();
         snapshot
             .memberships
             .insert("root".to_owned(), BTreeSet::new());
-        let role = snapshot
-            .join(Selection::Role("admin".to_owned()), 100)
+        let access_group = snapshot
+            .join(Selection::AccessGroup("admin".to_owned()), 100)
             .unwrap();
-        assert_eq!(role.roles.len(), 1);
-        assert!(role.users.is_empty());
-        assert!(role.targets.is_empty());
-        assert!(role.tokens.is_empty());
-        assert!(role.keys.is_empty());
-        assert_eq!(tables(&role).len(), 6);
+        assert_eq!(access_group.access_groups.len(), 1);
+        assert!(access_group.users.is_empty());
+        assert!(access_group.targets.is_empty());
+        assert!(access_group.tokens.is_empty());
+        assert!(access_group.keys.is_empty());
+        assert_eq!(tables(&access_group).len(), 6);
         for targets in snapshot.grants.values_mut() {
             targets.clear();
         }
@@ -1121,7 +1149,7 @@ mod tests {
             .unwrap();
         assert_eq!(target.targets.len(), 1);
         assert!(target.users.is_empty());
-        assert!(target.roles.is_empty());
+        assert!(target.access_groups.is_empty());
         assert!(target.access_paths.is_empty());
     }
 

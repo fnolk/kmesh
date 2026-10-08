@@ -31,7 +31,7 @@ pub async fn login(context: &ClientContext, args: &LoginArgs) -> Result<()> {
                 .or(context.config.auth.token.as_deref())
                 .context("API token is required. Use --token, KMESH_TOKEN, or auth.token.")?;
             anyhow::ensure!(!token.trim().is_empty(), "API token is empty");
-            let username = context.api.me(token).await?.user.username;
+            let username = context.api.me(token).await?.username;
             let payload = token.split('.').nth(1).context("API token is not a JWT")?;
             let claims: crate::protocol::ApiTokenClaims = serde_json::from_slice(
                 &URL_SAFE_NO_PAD

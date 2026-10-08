@@ -58,18 +58,41 @@ pub struct TargetView {
 pub struct UserView {
     pub user_id: String,
     pub username: String,
+    pub system_role: SystemRole,
     pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MeView {
-    pub user: UserView,
-    pub roles: Vec<RoleView>,
+    pub user_id: String,
+    pub username: String,
+    pub enabled: bool,
+    pub system_role: SystemRole,
+    pub access_groups: Vec<AccessGroupView>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum SystemRole {
+    Member,
+    Admin,
+}
+
+impl SystemRole {
+    pub const ALL: [Self; 2] = [Self::Member, Self::Admin];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Member => "member",
+            Self::Admin => "admin",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RoleView {
-    pub role_id: String,
+pub struct AccessGroupView {
+    pub group_id: String,
     pub name: String,
 }
 
@@ -88,8 +111,8 @@ pub enum TargetPermission {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RoleGrantView {
-    pub role_id: String,
+pub struct GroupGrantView {
+    pub group_id: String,
     pub target_id: String,
     pub permission: TargetPermission,
 }
@@ -132,31 +155,36 @@ pub enum AdminOperation {
         user_id: String,
     },
     ListRoles,
-    CreateRole {
+    SetUserSystemRole {
+        user_id: String,
+        system_role: SystemRole,
+    },
+    ListGroups,
+    CreateAccessGroup {
         name: String,
     },
-    DeleteRole {
-        role_id: String,
+    DeleteAccessGroup {
+        group_id: String,
     },
-    SetUserRoles {
+    SetUserAccessGroups {
         user_id: String,
-        role_ids: Vec<String>,
+        group_ids: Vec<String>,
     },
-    ListUserRoles {
+    ListUserAccessGroups {
         user_id: String,
     },
     GrantTarget {
-        role_id: String,
+        group_id: String,
         target_id: String,
         permission: TargetPermission,
     },
     RevokeTarget {
-        role_id: String,
+        group_id: String,
         target_id: String,
         permission: TargetPermission,
     },
-    ListRoleGrants {
-        role_id: String,
+    ListGroupGrants {
+        group_id: String,
     },
     ListTargets,
     CreateTarget {
@@ -247,10 +275,12 @@ pub enum AdminResponse {
     },
     ApiTokens(Vec<ApiTokenView>),
     Keys(Vec<UserKeyView>),
-    Role(RoleView),
-    Roles(Vec<RoleView>),
-    UserRoles(Vec<RoleView>),
-    Grants(Vec<RoleGrantView>),
+    Roles(Vec<SystemRole>),
+    UserSystemRole(SystemRole),
+    AccessGroup(AccessGroupView),
+    AccessGroups(Vec<AccessGroupView>),
+    UserAccessGroups(Vec<AccessGroupView>),
+    Grants(Vec<GroupGrantView>),
     TargetCreated {
         target: TargetView,
         enrollment_token: String,

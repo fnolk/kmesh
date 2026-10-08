@@ -12,8 +12,8 @@ use rustyline::{
 };
 
 use crate::protocol::{
-    AdminOperation, AdminRequest, AdminResponse, ApiTokenView, RelayEndpointSide,
-    RelaySessionPhase, RelayTrafficView, RoleGrantView, RoleView, TargetView, UserKeyView,
+    AccessGroupView, AdminOperation, AdminRequest, AdminResponse, ApiTokenView, GroupGrantView,
+    RelayEndpointSide, RelaySessionPhase, RelayTrafficView, SystemRole, TargetView, UserKeyView,
     UserView,
 };
 
@@ -22,8 +22,8 @@ use super::{
     admin_view::{self, Selection},
     auth,
     cli::{
-        AdminArgs, AdminCommand, ApiTokenAction, GrantAction, KeyAction, RelayAction, RoleAction,
-        TargetAction, UserAction,
+        AccessGroupAction, AdminArgs, AdminCommand, ApiTokenAction, GrantAction, KeyAction,
+        RelayAction, RoleAction, TargetAction, UserAction,
     },
     output::{cell, render_table, state},
 };
@@ -31,7 +31,7 @@ use super::{
 #[derive(Debug, Parser)]
 #[command(
     name = "admin",
-    about = "Manage users, roles, targets, API tokens, SSH public keys, and relay traffic",
+    about = "Use user, role, group, target, token, key, and relay commands",
     disable_help_subcommand = true
 )]
 struct AdminLine {
@@ -42,19 +42,30 @@ struct AdminLine {
 }
 
 pub async fn run(context: &ClientContext, args: &AdminArgs) -> Result<()> {
+    let token = auth::valid_access_token(context).await?;
+    let identity = context.api.me(&token).await?;
+    anyhow::ensure!(
+        identity.system_role == SystemRole::Admin,
+        "The current user does not have the admin platform role."
+    );
     if let Some(command) = &args.command {
         execute(context, command.clone(), args.json).await
     } else if args.json {
         admin_view::run(context, Selection::Overview, true).await
     } else {
-        repl(context).await
+        repl(context, &identity.username).await
     }
 }
 
-async fn repl(context: &ClientContext) -> Result<()> {
+async fn repl(context: &ClientContext, username: &str) -> Result<()> {
     let mut editor = Editor::<AdminHelper, rustyline::history::DefaultHistory>::new()?;
     editor.set_helper(Some(AdminHelper));
-    println!("Admin shell. Use ls for the overview. Use help for commands. Use exit to stop.");
+    println!("Server: {}", context.api.issuer());
+    println!("User: {}", cell(username));
+    println!("Platform role: admin");
+    println!(
+        "Use ls to show the overview. Use help to list commands. Use exit to close the shell."
+    );
     loop {
         match editor.readline("admin> ") {
             Ok(line) => {
@@ -83,6 +94,10 @@ async fn repl(context: &ClientContext) -> Result<()> {
                         if let Some(command) = parsed.command
                             && let Err(error) = execute(context, command, parsed.json).await
                         {
+                            if is_forbidden(&error) {
+                                return Err(error)
+                                    .context("Admin access was revoked. The shell is closed.");
+                            }
                             eprintln!("{}", format_error(&error));
                         }
                     }
@@ -100,7 +115,9 @@ async fn repl(context: &ClientContext) -> Result<()> {
 
 async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> Result<()> {
     let mut operation = match command {
-        AdminCommand::Overview => return admin_view::run(context, Selection::Overview, json).await,
+        AdminCommand::Overview => {
+            return admin_view::run(context, Selection::Overview, json).await;
+        }
         AdminCommand::Users { action } => match action {
             UserAction::Show { user_id } => {
                 return admin_view::run(context, Selection::User(user_id), json).await;
@@ -115,10 +132,17 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
                 user_id,
                 enabled: true,
             },
-            UserAction::Roles { user_id, role_ids } => {
-                AdminOperation::SetUserRoles { user_id, role_ids }
+            UserAction::Roles {
+                user_id,
+                system_role,
+            } => AdminOperation::SetUserSystemRole {
+                user_id,
+                system_role,
+            },
+            UserAction::Groups { user_id, group_ids } => {
+                AdminOperation::SetUserAccessGroups { user_id, group_ids }
             }
-            UserAction::ShowRoles { user_id } => AdminOperation::ListUserRoles { user_id },
+            UserAction::ShowGroups { user_id } => AdminOperation::ListUserAccessGroups { user_id },
         },
         AdminCommand::Tokens { action } => match action {
             ApiTokenAction::Create {
@@ -149,30 +173,35 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
             KeyAction::Remove { key_id } => AdminOperation::RemoveUserKey { key_id },
         },
         AdminCommand::Roles { action } => match action {
-            RoleAction::Show { role_id } => {
-                return admin_view::run(context, Selection::Role(role_id), json).await;
-            }
             RoleAction::List => AdminOperation::ListRoles,
-            RoleAction::Create { name } => AdminOperation::CreateRole { name },
-            RoleAction::Delete { role_id } => AdminOperation::DeleteRole { role_id },
+        },
+        AdminCommand::Groups { action } => match action {
+            AccessGroupAction::Show { group_id } => {
+                return admin_view::run(context, Selection::AccessGroup(group_id), json).await;
+            }
+            AccessGroupAction::List => AdminOperation::ListGroups,
+            AccessGroupAction::Create { name } => AdminOperation::CreateAccessGroup { name },
+            AccessGroupAction::Delete { group_id } => {
+                AdminOperation::DeleteAccessGroup { group_id }
+            }
         },
         AdminCommand::Grants { action } => match action {
-            GrantAction::List { role_id } => AdminOperation::ListRoleGrants { role_id },
+            GrantAction::List { group_id } => AdminOperation::ListGroupGrants { group_id },
             GrantAction::Add {
-                role_id,
+                group_id,
                 target_id,
                 permission,
             } => AdminOperation::GrantTarget {
-                role_id,
+                group_id,
                 target_id,
                 permission: permission.into(),
             },
             GrantAction::Remove {
-                role_id,
+                group_id,
                 target_id,
                 permission,
             } => AdminOperation::RevokeTarget {
-                role_id,
+                group_id,
                 target_id,
                 permission: permission.into(),
             },
@@ -206,29 +235,35 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
     };
     match &mut operation {
         AdminOperation::SetUserEnabled { user_id, .. }
+        | AdminOperation::SetUserSystemRole { user_id, .. }
         | AdminOperation::CreateApiToken { user_id, .. }
         | AdminOperation::ListApiTokens { user_id }
         | AdminOperation::AddUserKey { user_id, .. }
         | AdminOperation::ListKeys { user_id }
-        | AdminOperation::ListUserRoles { user_id } => {
+        | AdminOperation::ListUserAccessGroups { user_id } => {
             *user_id = user_id.trim().to_ascii_lowercase();
         }
-        AdminOperation::SetUserRoles { user_id, role_ids } => {
+        AdminOperation::SetUserAccessGroups { user_id, group_ids } => {
             *user_id = user_id.trim().to_ascii_lowercase();
-            for role_id in role_ids {
-                *role_id = role_id.trim().to_ascii_lowercase();
+            for group_id in group_ids {
+                *group_id = group_id.trim().to_ascii_lowercase();
             }
         }
-        AdminOperation::DeleteRole { role_id } | AdminOperation::ListRoleGrants { role_id } => {
-            *role_id = role_id.trim().to_ascii_lowercase();
+        AdminOperation::DeleteAccessGroup { group_id }
+        | AdminOperation::ListGroupGrants { group_id } => {
+            *group_id = group_id.trim().to_ascii_lowercase();
         }
         AdminOperation::GrantTarget {
-            role_id, target_id, ..
+            group_id,
+            target_id,
+            ..
         }
         | AdminOperation::RevokeTarget {
-            role_id, target_id, ..
+            group_id,
+            target_id,
+            ..
         } => {
-            *role_id = role_id.trim().to_ascii_lowercase();
+            *group_id = group_id.trim().to_ascii_lowercase();
             *target_id = target_id.trim().to_ascii_lowercase();
         }
         AdminOperation::RenameTarget { target_id, .. }
@@ -245,6 +280,16 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
         .admin(&token, &AdminRequest { operation })
         .await?;
     print_response(&response, json)
+}
+
+fn is_forbidden(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<super::api::ApiFailure>()
+            .is_some_and(|failure| {
+                matches!(failure, super::api::ApiFailure::Server { status: 403, .. })
+            })
+    })
 }
 
 fn print_response(response: &AdminResponse, json: bool) -> Result<()> {
@@ -277,8 +322,13 @@ fn render_response(response: &AdminResponse) -> String {
         AdminResponse::ApiTokens(tokens) => render_api_tokens(tokens),
         AdminResponse::User(user) => render_users(std::slice::from_ref(user)),
         AdminResponse::Keys(keys) => render_keys(keys),
-        AdminResponse::Role(role) => render_roles(std::slice::from_ref(role)),
-        AdminResponse::Roles(roles) | AdminResponse::UserRoles(roles) => render_roles(roles),
+        AdminResponse::Roles(roles) => render_roles(roles),
+        AdminResponse::UserSystemRole(role) => format!("Platform role: {}\n", role.as_str()),
+        AdminResponse::AccessGroup(access_group) => {
+            render_access_groups(std::slice::from_ref(access_group))
+        }
+        AdminResponse::AccessGroups(access_groups)
+        | AdminResponse::UserAccessGroups(access_groups) => render_access_groups(access_groups),
         AdminResponse::Grants(grants) => render_grants(grants),
         AdminResponse::TargetCreated {
             target,
@@ -305,7 +355,7 @@ fn render_users(users: &[UserView]) -> String {
     users.sort_by_key(|user| &user.user_id);
     render_table(
         "Users",
-        &["USER", "NAME", "STATE"],
+        &["USER", "NAME", "STATE", "PLATFORM ROLE"],
         users
             .into_iter()
             .map(|user| {
@@ -313,21 +363,33 @@ fn render_users(users: &[UserView]) -> String {
                     user.user_id.clone(),
                     user.username.clone(),
                     state(user.enabled).into(),
+                    user.system_role.as_str().into(),
                 ]
             })
             .collect(),
     )
 }
 
-fn render_roles(roles: &[RoleView]) -> String {
-    let mut roles = roles.iter().collect::<Vec<_>>();
-    roles.sort_by_key(|role| &role.role_id);
+fn render_access_groups(access_groups: &[AccessGroupView]) -> String {
+    let mut access_groups = access_groups.iter().collect::<Vec<_>>();
+    access_groups.sort_by_key(|access_group| &access_group.group_id);
+    render_table(
+        "Access groups",
+        &["GROUP ID", "NAME"],
+        access_groups
+            .into_iter()
+            .map(|access_group| vec![access_group.group_id.clone(), access_group.name.clone()])
+            .collect(),
+    )
+}
+
+fn render_roles(roles: &[SystemRole]) -> String {
     render_table(
         "Roles",
-        &["ROLE", "NAME"],
+        &["ROLE"],
         roles
-            .into_iter()
-            .map(|role| vec![role.role_id.clone(), role.name.clone()])
+            .iter()
+            .map(|role| vec![role.as_str().to_owned()])
             .collect(),
     )
 }
@@ -409,17 +471,17 @@ fn render_keys(keys: &[UserKeyView]) -> String {
     )
 }
 
-fn render_grants(grants: &[RoleGrantView]) -> String {
+fn render_grants(grants: &[GroupGrantView]) -> String {
     let mut grants = grants.iter().collect::<Vec<_>>();
-    grants.sort_by_key(|grant| (&grant.role_id, &grant.target_id));
+    grants.sort_by_key(|grant| (&grant.group_id, &grant.target_id));
     render_table(
         "Grants",
-        &["ROLE", "TARGET", "PERMISSION"],
+        &["GROUP ID", "TARGET", "PERMISSION"],
         grants
             .into_iter()
             .map(|grant| {
                 vec![
-                    grant.role_id.clone(),
+                    grant.group_id.clone(),
                     grant.target_id.clone(),
                     "ssh_connect".into(),
                 ]
@@ -656,7 +718,7 @@ mod tests {
     fn all_empty_response_tables_are_explicit() {
         for response in [
             AdminResponse::Users(vec![]),
-            AdminResponse::Roles(vec![]),
+            AdminResponse::AccessGroups(vec![]),
             AdminResponse::Targets(vec![]),
             AdminResponse::Keys(vec![]),
             AdminResponse::ApiTokens(vec![]),
@@ -677,8 +739,8 @@ mod tests {
                 vec!["a", "u", "s", "alice"],
             ),
             (
-                vec!["admin", "roles", "show", "engineers"],
-                vec!["a", "r", "s", "engineers"],
+                vec!["admin", "groups", "show", "engineers"],
+                vec!["a", "g", "s", "engineers"],
             ),
             (
                 vec!["admin", "targets", "show", "build"],
@@ -707,7 +769,7 @@ mod tests {
                     "--permission",
                     "ssh-connect",
                 ],
-                vec!["a", "g", "a", "engineers", "build", "-x", "ssh-connect"],
+                vec!["a", "gr", "a", "engineers", "build", "-x", "ssh-connect"],
             ),
             (
                 vec!["admin", "keys", "list", "alice"],
@@ -779,6 +841,26 @@ mod tests {
         ));
 
         let user_id = "alice";
+        assert!(matches!(
+            crate::client::Cli::try_parse_from([
+                "kmesh", "admin", "users", "roles", user_id, "member",
+            ])
+            .unwrap()
+            .command,
+            crate::client::Command::Admin(AdminArgs {
+                command: Some(AdminCommand::Users {
+                    action: UserAction::Roles {
+                        system_role: SystemRole::Member,
+                        ..
+                    }
+                }),
+                ..
+            })
+        ));
+        assert!(
+            crate::client::Cli::try_parse_from(["kmesh", "admin", "roles", "create", "engineers"])
+                .is_err()
+        );
         let parsed = AdminLine::try_parse_from(["admin", "--json", "users", "disable", user_id])
             .expect("parse one-shot JSON admin operation");
         assert!(parsed.json);
@@ -807,7 +889,7 @@ mod tests {
 
         let help = AdminLine::command().render_help().to_string();
         for group in [
-            "users", "tokens", "keys", "roles", "grants", "targets", "relay",
+            "users", "roles", "groups", "tokens", "keys", "grants", "targets", "relay",
         ] {
             assert!(help.contains(group), "admin help lists {group}");
         }
@@ -822,6 +904,7 @@ mod tests {
             ("", "users"),
             ("", "tokens"),
             ("users ", "roles"),
+            ("users ", "groups"),
             ("u ", "s"),
             ("tk ", "c"),
             ("tk c alice --", "--label"),
@@ -831,7 +914,7 @@ mod tests {
             ("", "ls"),
             ("tokens ", "revoke"),
             ("keys ", "remove"),
-            ("roles ", "delete"),
+            ("groups ", "delete"),
             ("grants ", "remove"),
             ("targets ", "issue-enrollment"),
             ("relay ", "close"),

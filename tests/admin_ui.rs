@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Write,
     net::{TcpListener, TcpStream, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
@@ -140,11 +141,11 @@ impl Drop for Fixture {
 fn short_admin_workflow_joins_credentials_and_access_without_secrets() {
     let fixture = Fixture::start();
     fixture.success(&["a", "u", "c", "alice"]);
-    fixture.success(&["a", "r", "c", "dev"]);
+    fixture.success(&["a", "g", "c", "dev"]);
     let created_target = fixture.json(&["a", "t", "c", "build", "-j"]);
     let enrollment = created_target["data"]["enrollment_token"].as_str().unwrap();
-    fixture.success(&["a", "u", "roles", "alice", "dev"]);
-    fixture.success(&["a", "g", "a", "dev", "build"]);
+    fixture.success(&["a", "u", "groups", "alice", "dev"]);
+    fixture.success(&["a", "gr", "a", "dev", "build"]);
     let created_token = fixture.json(&["a", "tk", "c", "alice", "-l", "laptop", "-e", "600", "-j"]);
     let secret = created_token["data"]["token"].as_str().unwrap();
     let public_key =
@@ -165,7 +166,7 @@ fn short_admin_workflow_joins_credentials_and_access_without_secrets() {
     for heading in [
         "Admin overview",
         "Users (2)",
-        "Roles (2)",
+        "Access groups (1)",
         "Targets (1)",
         "REGISTERED KEYS",
     ] {
@@ -178,6 +179,11 @@ fn short_admin_workflow_joins_credentials_and_access_without_secrets() {
     assert_eq!(
         detail["users"][0]["authorized_target_ids"],
         serde_json::json!(["build"])
+    );
+    assert_eq!(detail["users"][0]["system_role"], "member");
+    assert_eq!(
+        detail["users"][0]["access_groups"],
+        serde_json::json!(["dev"])
     );
     assert_eq!(detail["users"][0]["active_token_count"], 1);
     assert_eq!(detail["users"][0]["key_count"], 1);
@@ -233,4 +239,107 @@ fn short_admin_workflow_joins_credentials_and_access_without_secrets() {
         .find(|user| user["user_id"] == "alice")
         .unwrap();
     assert_eq!(alice["authorized_target_ids"], serde_json::json!([]));
+}
+
+#[test]
+fn member_cannot_enter_any_admin_cli_mode() {
+    let fixture = Fixture::start();
+    fixture.success(&["admin", "users", "create", "member"]);
+    let issued = fixture.json(&[
+        "admin", "tokens", "create", "member", "--label", "cli-test", "--json",
+    ]);
+    let member_token = issued["data"]["token"].as_str().unwrap();
+    let login = fixture
+        .command()
+        .args(["--profile", "member", "login", "--method", "token"])
+        .env("KMESH_TOKEN", member_token)
+        .output()
+        .expect("run member login");
+    assert!(
+        login.status.success(),
+        "member login failed: {}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+
+    for args in [
+        vec!["--profile", "member", "admin"],
+        vec!["--profile", "member", "admin", "users", "list"],
+        vec!["--profile", "member", "admin", "--json"],
+        vec!["--profile", "member", "a", "u", "ls"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success(), "{args:?} entered admin mode");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("does not have the admin platform role"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn admin_shell_shows_identity_and_exits_after_role_revocation() {
+    let fixture = Fixture::start();
+    fixture.success(&["admin", "users", "create", "operator"]);
+    let issued = fixture.json(&[
+        "admin",
+        "tokens",
+        "create",
+        "operator",
+        "--label",
+        "shell-test",
+        "--json",
+    ]);
+    let operator_token = issued["data"]["token"].as_str().unwrap();
+    fixture.success(&["admin", "users", "roles", "operator", "admin"]);
+    let login = fixture
+        .command()
+        .args(["--profile", "operator", "login", "--method", "token"])
+        .env("KMESH_TOKEN", operator_token)
+        .output()
+        .expect("log in as operator");
+    assert!(
+        login.status.success(),
+        "operator login failed: {}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+
+    let mut command = fixture.command();
+    command
+        .args(["admin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut shell = command.spawn().expect("start admin shell");
+    shell
+        .stdin
+        .take()
+        .expect("open admin shell input")
+        .write_all(b"users roles root member\nusers list\nusers create must-not-run\n")
+        .expect("send shell commands");
+    let output = shell.wait_with_output().expect("wait for admin shell");
+    assert!(
+        !output.status.success(),
+        "shell exited with success; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("read shell output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("Server: https://127.0.0.1:"));
+    assert!(stdout.contains("User: root"));
+    assert!(stdout.contains("Platform role: admin"));
+    assert!(stderr.contains("Admin access was revoked. The shell is closed."));
+    assert!(!stdout.contains("must-not-run"));
+
+    let users = fixture.json(&["--profile", "operator", "admin", "users", "list", "--json"]);
+    assert!(
+        !users["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|user| user["user_id"] == "must-not-run")
+    );
 }
