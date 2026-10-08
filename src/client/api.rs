@@ -205,7 +205,7 @@ impl Api {
             .await
             .map_err(|_| {
                 anyhow!(ApiFailure::Network(
-                    "WebSocket connect timed out".to_owned()
+                    "WebSocket connection timed out".to_owned()
                 ))
             })?
             .map_err(|error| match error {

@@ -7,6 +7,33 @@ use tokio::io::AsyncWriteExt;
 
 use crate::transport::{IrohByteStream, IrohPathKind, IrohPathStats, snapshot_iroh_paths};
 
+fn path_status_message(
+    selected: Option<&(IrohPathKind, String)>,
+    reported_initial: bool,
+) -> String {
+    match selected {
+        Some((kind, remote_address)) => {
+            let label = match kind {
+                IrohPathKind::Direct => "direct P2P",
+                IrohPathKind::Relay => "Iroh relay",
+            };
+            let status = if reported_initial {
+                "Connection path changed"
+            } else {
+                "Connection path"
+            };
+            format!(
+                "{status}: {label} ({})",
+                super::super::output::cell(remote_address)
+            )
+        }
+        None if reported_initial => {
+            "No network path is selected. Iroh is selecting a new path.".to_owned()
+        }
+        None => "Connection established. Iroh is selecting a network path.".to_owned(),
+    }
+}
+
 pub(super) async fn copy_stdio(stream: &mut IrohByteStream) -> Result<(u64, u64)> {
     let path_connection = stream.connection().clone();
     let path_task = tokio::spawn(async move {
@@ -35,23 +62,7 @@ pub(super) async fn copy_stdio(stream: &mut IrohByteStream) -> Result<(u64, u64)
                             Some((kind, path.remote_addr().to_string()))
                         });
                     if !reported_initial || selected != previous_selected {
-                        match selected.as_ref() {
-                            Some((kind, remote_address)) => {
-                                let label = match kind {
-                                    IrohPathKind::Direct => "P2P 直连",
-                                    IrohPathKind::Relay => "Iroh 中继",
-                                };
-                                if reported_initial {
-                                    eprintln!("连接路径切换：{label} ({remote_address})");
-                                } else {
-                                    eprintln!("连接路径：{label} ({remote_address})");
-                                }
-                            }
-                            None if reported_initial => {
-                                eprintln!("当前没有已选网络路径；Iroh 正在重新选择。");
-                            }
-                            None => eprintln!("连接已建立；Iroh 正在选择网络路径。"),
-                        }
+                        eprintln!("{}", path_status_message(selected.as_ref(), reported_initial));
                         previous_selected = selected;
                         reported_initial = true;
                     }
@@ -197,4 +208,40 @@ pub(super) async fn copy_stdio(stream: &mut IrohByteStream) -> Result<(u64, u64)
     path_task.abort();
     let _ = path_task.await;
     copy_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_status_uses_english_for_each_connection_state() {
+        let direct = (IrohPathKind::Direct, "192.0.2.1:5000".to_owned());
+        let relay = (IrohPathKind::Relay, "https://relay.example".to_owned());
+        assert_eq!(
+            path_status_message(Some(&direct), false),
+            "Connection path: direct P2P (192.0.2.1:5000)"
+        );
+        assert_eq!(
+            path_status_message(Some(&relay), true),
+            "Connection path changed: Iroh relay (https://relay.example)"
+        );
+        assert_eq!(
+            path_status_message(None, false),
+            "Connection established. Iroh is selecting a network path."
+        );
+        assert_eq!(
+            path_status_message(None, true),
+            "No network path is selected. Iroh is selecting a new path."
+        );
+    }
+
+    #[test]
+    fn path_status_escapes_terminal_controls_in_addresses() {
+        let relay = (IrohPathKind::Relay, "relay\n\x1b[31m".to_owned());
+        assert_eq!(
+            path_status_message(Some(&relay), false),
+            "Connection path: Iroh relay (relay\\n\\u{1b}[31m)"
+        );
+    }
 }

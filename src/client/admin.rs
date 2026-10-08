@@ -13,25 +13,29 @@ use rustyline::{
 
 use crate::protocol::{
     AdminOperation, AdminRequest, AdminResponse, ApiTokenView, RelayEndpointSide,
-    RelaySessionPhase, RelayTrafficView, RoleGrantView, TargetView, UserKeyView, UserView,
+    RelaySessionPhase, RelayTrafficView, RoleGrantView, RoleView, TargetView, UserKeyView,
+    UserView,
 };
 
 use super::{
-    ClientContext, auth,
+    ClientContext,
+    admin_view::{self, Selection},
+    auth,
     cli::{
         AdminArgs, AdminCommand, ApiTokenAction, GrantAction, KeyAction, RelayAction, RoleAction,
         TargetAction, UserAction,
     },
+    output::{cell, render_table, state},
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "admin",
-    about = "Manage users, SSH keys, roles, grants, targets, and relay traffic",
+    about = "Manage users, roles, targets, API tokens, SSH public keys, and relay traffic",
     disable_help_subcommand = true
 )]
 struct AdminLine {
-    #[arg(long, help = "Output the response as JSON")]
+    #[arg(short = 'j', long, global = true, help = "Show the response as JSON")]
     json: bool,
     #[command(subcommand)]
     command: Option<AdminCommand>,
@@ -40,6 +44,8 @@ struct AdminLine {
 pub async fn run(context: &ClientContext, args: &AdminArgs) -> Result<()> {
     if let Some(command) = &args.command {
         execute(context, command.clone(), args.json).await
+    } else if args.json {
+        admin_view::run(context, Selection::Overview, true).await
     } else {
         repl(context).await
     }
@@ -48,6 +54,7 @@ pub async fn run(context: &ClientContext, args: &AdminArgs) -> Result<()> {
 async fn repl(context: &ClientContext) -> Result<()> {
     let mut editor = Editor::<AdminHelper, rustyline::history::DefaultHistory>::new()?;
     editor.set_helper(Some(AdminHelper));
+    println!("Admin shell. Use ls for the overview. Use help for commands. Use exit to stop.");
     loop {
         match editor.readline("admin> ") {
             Ok(line) => {
@@ -64,7 +71,9 @@ async fn repl(context: &ClientContext) -> Result<()> {
                     continue;
                 }
                 let Some(words) = shlex::split(line) else {
-                    eprintln!("命令引号不完整。");
+                    eprintln!(
+                        "Error: The command has an open quote. Close the quote and try again."
+                    );
                     continue;
                 };
                 let mut argv = vec!["admin".to_owned()];
@@ -77,7 +86,10 @@ async fn repl(context: &ClientContext) -> Result<()> {
                             eprintln!("{}", format_error(&error));
                         }
                     }
-                    Err(error) => eprintln!("{}", error.render().to_string().trim()),
+                    Err(error) if error.use_stderr() => {
+                        eprintln!("{}", error.render().to_string().trim())
+                    }
+                    Err(error) => println!("{}", error.render().to_string().trim()),
                 }
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => return Ok(()),
@@ -88,7 +100,11 @@ async fn repl(context: &ClientContext) -> Result<()> {
 
 async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> Result<()> {
     let mut operation = match command {
+        AdminCommand::Overview => return admin_view::run(context, Selection::Overview, json).await,
         AdminCommand::Users { action } => match action {
+            UserAction::Show { user_id } => {
+                return admin_view::run(context, Selection::User(user_id), json).await;
+            }
             UserAction::List => AdminOperation::ListUsers,
             UserAction::Create { username } => AdminOperation::CreateUser { username },
             UserAction::Disable { user_id } => AdminOperation::SetUserEnabled {
@@ -133,6 +149,9 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
             KeyAction::Remove { key_id } => AdminOperation::RemoveUserKey { key_id },
         },
         AdminCommand::Roles { action } => match action {
+            RoleAction::Show { role_id } => {
+                return admin_view::run(context, Selection::Role(role_id), json).await;
+            }
             RoleAction::List => AdminOperation::ListRoles,
             RoleAction::Create { name } => AdminOperation::CreateRole { name },
             RoleAction::Delete { role_id } => AdminOperation::DeleteRole { role_id },
@@ -159,6 +178,9 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
             },
         },
         AdminCommand::Targets { action } => match action {
+            TargetAction::Show { target_id } => {
+                return admin_view::run(context, Selection::Target(target_id), json).await;
+            }
             TargetAction::List => AdminOperation::ListTargets,
             TargetAction::Create { name } => AdminOperation::CreateTarget { name },
             TargetAction::Rename { target_id, name } => {
@@ -228,204 +250,289 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
 fn print_response(response: &AdminResponse, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(response)?);
-        return Ok(());
-    }
-    match response {
-        AdminResponse::Ok => println!("操作完成。"),
-        AdminResponse::Users(users) => print_users(users),
-        AdminResponse::RelayTraffic(traffic) => print_relay_traffic(traffic),
-        AdminResponse::RelaySessionClosed {
-            session_id,
-            disconnected_relay_connections,
-        } => println!(
-            "已关闭 relay SSH session {session_id}，断开 {disconnected_relay_connections} 条 relay endpoint 连接。"
-        ),
-        AdminResponse::ApiTokenIssued { api_token, token } => {
-            println!(
-                "API JWT for user {} ({}) — save it now; it is shown once:\n{token}",
-                api_token.user_id, api_token.label
-            );
-        }
-        AdminResponse::ApiTokens(tokens) => print_api_tokens(tokens),
-        AdminResponse::User(user) => println!(
-            "用户 {}\t{}\t{}",
-            user.user_id,
-            user.username,
-            if user.enabled { "enabled" } else { "disabled" }
-        ),
-        AdminResponse::Keys(keys) => print_keys(keys),
-        AdminResponse::Role(role) => println!("角色 {}\t{}", role.role_id, role.name),
-        AdminResponse::Roles(roles) | AdminResponse::UserRoles(roles) => {
-            println!("角色列表：");
-            for role in roles {
-                println!("{}\t{}", role.role_id, role.name);
-            }
-        }
-        AdminResponse::Grants(grants) => print_grants(grants),
-        AdminResponse::TargetCreated {
-            target,
-            enrollment_token,
-        } => {
-            println!("目标已创建：");
-            print_target(target);
-            println!("一次性 enrollment code：{enrollment_token}");
-        }
-        AdminResponse::Targets(targets) => print_targets(targets),
-        AdminResponse::EnrollmentIssued {
-            target_id,
-            enrollment_token,
-        } => println!("目标 {target_id} 的一次性 enrollment code：{enrollment_token}"),
+    } else {
+        print!("{}", render_response(response));
     }
     Ok(())
 }
 
-fn print_users(users: &[UserView]) {
-    println!("用户列表：");
-    for user in users {
-        print_user(user);
+fn render_response(response: &AdminResponse) -> String {
+    match response {
+        AdminResponse::Ok => "Operation complete.\n".to_owned(),
+        AdminResponse::Users(users) => render_users(users),
+        AdminResponse::RelayTraffic(traffic) => render_relay_traffic(traffic),
+        AdminResponse::RelaySessionClosed {
+            session_id,
+            disconnected_relay_connections,
+        } => format!(
+            "Relay SSH session closed: {session_id}\nRelay connections closed: {disconnected_relay_connections}\n"
+        ),
+        AdminResponse::ApiTokenIssued { api_token, token } => {
+            let mut output = render_api_tokens(std::slice::from_ref(api_token));
+            output.push_str("Save the API token value now. You cannot show this value again.\n");
+            output.push_str(&cell(token));
+            output.push('\n');
+            output
+        }
+        AdminResponse::ApiTokens(tokens) => render_api_tokens(tokens),
+        AdminResponse::User(user) => render_users(std::slice::from_ref(user)),
+        AdminResponse::Keys(keys) => render_keys(keys),
+        AdminResponse::Role(role) => render_roles(std::slice::from_ref(role)),
+        AdminResponse::Roles(roles) | AdminResponse::UserRoles(roles) => render_roles(roles),
+        AdminResponse::Grants(grants) => render_grants(grants),
+        AdminResponse::TargetCreated {
+            target,
+            enrollment_token,
+        } => format!(
+            "{}One-time enrollment code: {}\n",
+            render_targets(std::slice::from_ref(target)),
+            cell(enrollment_token)
+        ),
+        AdminResponse::Targets(targets) => render_targets(targets),
+        AdminResponse::EnrollmentIssued {
+            target_id,
+            enrollment_token,
+        } => format!(
+            "Target: {}\nOne-time enrollment code: {}\n",
+            cell(target_id),
+            cell(enrollment_token)
+        ),
     }
 }
 
-fn print_api_tokens(tokens: &[ApiTokenView]) {
-    println!("API token list:");
-    for token in tokens {
-        println!(
-            "{}\t{}\t{}\t{}\t{}",
-            token.token_id,
-            token.user_id,
-            token.label,
-            token.expires_at.map_or_else(
-                || "never expires".to_owned(),
-                |expires_at| { format!("expires at {expires_at}") }
-            ),
-            if token.revoked_at.is_some() {
-                "revoked"
-            } else {
-                "active"
-            }
-        );
+fn render_users(users: &[UserView]) -> String {
+    let mut users = users.iter().collect::<Vec<_>>();
+    users.sort_by_key(|user| &user.user_id);
+    render_table(
+        "Users",
+        &["USER", "NAME", "STATE"],
+        users
+            .into_iter()
+            .map(|user| {
+                vec![
+                    user.user_id.clone(),
+                    user.username.clone(),
+                    state(user.enabled).into(),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn render_roles(roles: &[RoleView]) -> String {
+    let mut roles = roles.iter().collect::<Vec<_>>();
+    roles.sort_by_key(|role| &role.role_id);
+    render_table(
+        "Roles",
+        &["ROLE", "NAME"],
+        roles
+            .into_iter()
+            .map(|role| vec![role.role_id.clone(), role.name.clone()])
+            .collect(),
+    )
+}
+
+fn unix_time() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_secs().min(i64::MAX as u64) as i64)
+}
+
+fn token_state(token: &ApiTokenView, now: i64) -> &'static str {
+    if token.revoked_at.is_some() {
+        "revoked"
+    } else if token.expires_at.is_some_and(|expiry| expiry <= now) {
+        "expired"
+    } else {
+        "active"
     }
 }
 
-fn print_user(user: &UserView) {
-    println!(
-        "{}\t{}",
-        user.user_id,
-        if user.enabled { "enabled" } else { "disabled" }
+fn render_api_tokens(tokens: &[ApiTokenView]) -> String {
+    let now = unix_time();
+    let mut tokens = tokens.iter().collect::<Vec<_>>();
+    tokens.sort_by_key(|token| (&token.user_id, token.created_at, token.token_id));
+    let mut output = render_table(
+        "API tokens",
+        &[
+            "TOKEN ID",
+            "USER",
+            "LABEL",
+            "STATE",
+            "CREATED (UNIX S)",
+            "EXPIRES (UNIX S)",
+        ],
+        tokens
+            .into_iter()
+            .map(|token| {
+                vec![
+                    token.token_id.to_string(),
+                    token.user_id.clone(),
+                    token.label.clone(),
+                    token_state(token, now).into(),
+                    token.created_at.to_string(),
+                    token
+                        .expires_at
+                        .map_or_else(|| "never".into(), |time| time.to_string()),
+                ]
+            })
+            .collect(),
     );
+    output
+        .push_str("Token state excludes user state. A disabled user cannot use an active token.\n");
+    output
 }
 
-fn print_relay_traffic(traffic: &RelayTrafficView) {
+fn key_fingerprint(key: &str) -> String {
+    ssh_key::PublicKey::from_openssh(key).map_or_else(
+        |_| "invalid key".into(),
+        |key| key.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+    )
+}
+
+fn render_keys(keys: &[UserKeyView]) -> String {
+    let mut keys = keys.iter().collect::<Vec<_>>();
+    keys.sort_by_key(|key| (&key.user_id, key.key_id));
+    render_table(
+        "SSH public keys",
+        &["KEY ID", "USER", "LABEL", "FINGERPRINT (SHA256)"],
+        keys.into_iter()
+            .map(|key| {
+                vec![
+                    key.key_id.to_string(),
+                    key.user_id.clone(),
+                    key.label.clone(),
+                    key_fingerprint(&key.public_key),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn render_grants(grants: &[RoleGrantView]) -> String {
+    let mut grants = grants.iter().collect::<Vec<_>>();
+    grants.sort_by_key(|grant| (&grant.role_id, &grant.target_id));
+    render_table(
+        "Grants",
+        &["ROLE", "TARGET", "PERMISSION"],
+        grants
+            .into_iter()
+            .map(|grant| {
+                vec![
+                    grant.role_id.clone(),
+                    grant.target_id.clone(),
+                    "ssh_connect".into(),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn render_targets(targets: &[TargetView]) -> String {
+    let mut targets = targets.iter().collect::<Vec<_>>();
+    targets.sort_by_key(|target| &target.target_id);
+    render_table(
+        "Targets",
+        &["TARGET", "NAME", "STATE", "CONNECTION"],
+        targets
+            .into_iter()
+            .map(|target| {
+                vec![
+                    target.target_id.clone(),
+                    target.name.clone(),
+                    state(target.enabled).into(),
+                    if target.online { "online" } else { "offline" }.into(),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn render_relay_traffic(traffic: &RelayTrafficView) -> String {
     if !traffic.enabled {
-        println!("Private relay 未启用，当前没有可查询的 relay 流量。");
-        return;
+        return "Private relay: disabled. No traffic data.\n".into();
     }
-    println!(
-        "Relay payload 流量（{} ms 窗口）：ingress {} B ({:.1} B/s)，egress {} B ({:.1} B/s)",
+    let mut output = format!(
+        "Relay traffic\nSample: {} ms  Connections: {}  SSH sessions: {}\nReceived: {} B ({:.1} B/s)  Sent: {} B ({:.1} B/s)\n",
         traffic.sample_duration_ms,
+        traffic.relay_connection_count,
+        traffic.ssh_session_count,
         traffic.bytes_received,
         traffic.bytes_received_per_second,
         traffic.bytes_sent,
-        traffic.bytes_sent_per_second,
+        traffic.bytes_sent_per_second
     );
-    println!(
-        "Relay endpoint 连接 {} 条；映射到 SSH session {} 个。",
-        traffic.relay_connection_count, traffic.ssh_session_count
-    );
-    for connection in &traffic.connections {
-        match &connection.metadata {
-            Some(metadata) => {
-                let side = match metadata.endpoint_side {
-                    RelayEndpointSide::Client => "client",
-                    RelayEndpointSide::Target => "target",
-                };
-                let phase = match metadata.session_phase {
-                    RelaySessionPhase::Pending => "pending",
-                    RelaySessionPhase::Active => "active",
-                    RelaySessionPhase::Closed => "closed",
-                };
-                println!(
-                    "endpoint {} connection {} {side} session={} phase={} user={} target={} active={} ingress={} B ({:.1} B/s) egress={} B ({:.1} B/s)",
-                    connection.endpoint_id,
-                    connection.connection_id,
-                    metadata.session_id,
-                    phase,
-                    metadata.username,
-                    metadata.target_name,
-                    connection.active,
-                    connection.bytes_received,
-                    connection.bytes_received_per_second,
-                    connection.bytes_sent,
-                    connection.bytes_sent_per_second,
-                );
-            }
-            None => println!(
-                "endpoint {} connection {} unknown (unmapped) active={} ingress={} B ({:.1} B/s) egress={} B ({:.1} B/s)",
-                connection.endpoint_id,
-                connection.connection_id,
-                connection.active,
-                connection.bytes_received,
-                connection.bytes_received_per_second,
-                connection.bytes_sent,
-                connection.bytes_sent_per_second,
-            ),
-        }
-    }
-}
-
-fn print_keys(keys: &[UserKeyView]) {
-    println!("SSH 公钥列表：");
-    for key in keys {
-        println!(
-            "{}\t{}\t{}\t{}",
-            key.key_id, key.user_id, key.label, key.public_key
-        );
-    }
-}
-
-fn print_grants(grants: &[RoleGrantView]) {
-    println!("角色授权列表：");
-    for grant in grants {
-        println!(
-            "{}\t{}\t{:?}",
-            grant.role_id, grant.target_id, grant.permission
-        );
-    }
-}
-
-fn print_targets(targets: &[TargetView]) {
-    println!("目标列表：");
-    for target in targets {
-        print_target(target);
-    }
-}
-
-fn print_target(target: &TargetView) {
-    println!(
-        "{}\t{}\t{}\t{}",
-        target.target_id,
-        target.name,
-        if target.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        if target.online { "online" } else { "offline" }
-    );
+    let mut connections = traffic.connections.iter().collect::<Vec<_>>();
+    connections.sort_by_key(|connection| (&connection.endpoint_id, connection.connection_id));
+    output.push_str(&render_table(
+        "Relay connections",
+        &[
+            "ENDPOINT",
+            "CONNECTION",
+            "SSH SESSION",
+            "SIDE",
+            "PHASE",
+            "USER",
+            "TARGET",
+            "ACTIVE",
+            "RX B",
+            "RX B/s",
+            "TX B",
+            "TX B/s",
+        ],
+        connections
+            .into_iter()
+            .map(|connection| {
+                let (session, side, phase, user, target) =
+                    connection.metadata.as_ref().map_or_else(
+                        || ("-".into(), "unknown", "unknown", "-".into(), "-".into()),
+                        |metadata| {
+                            (
+                                metadata.session_id.to_string(),
+                                match metadata.endpoint_side {
+                                    RelayEndpointSide::Client => "client",
+                                    RelayEndpointSide::Target => "target",
+                                },
+                                match metadata.session_phase {
+                                    RelaySessionPhase::Pending => "pending",
+                                    RelaySessionPhase::Active => "active",
+                                    RelaySessionPhase::Closed => "closed",
+                                },
+                                metadata.user_id.clone(),
+                                metadata.target_id.clone(),
+                            )
+                        },
+                    );
+                vec![
+                    connection.endpoint_id.clone(),
+                    connection.connection_id.to_string(),
+                    session,
+                    side.into(),
+                    phase.into(),
+                    user,
+                    target,
+                    if connection.active { "yes" } else { "no" }.into(),
+                    connection.bytes_received.to_string(),
+                    format!("{:.1}", connection.bytes_received_per_second),
+                    connection.bytes_sent.to_string(),
+                    format!("{:.1}", connection.bytes_sent_per_second),
+                ]
+            })
+            .collect(),
+    ));
+    output
 }
 
 fn print_help() {
     let mut command = AdminLine::command();
     let mut help = Vec::new();
     let _ = command.write_help(&mut help);
-    println!("管理命令：\n{}", String::from_utf8_lossy(&help));
-    println!(
-        "输入 users / tokens / keys / roles / grants / targets / relay 后按 Tab 补全，输入 exit 退出。"
-    );
+    println!("{}", String::from_utf8_lossy(&help));
+    println!("Use Tab to complete a command. Use exit to stop.");
 }
 
 fn format_error(error: &anyhow::Error) -> String {
-    error.to_string()
+    format!("Error: {}", cell(&format!("{error:#}")))
 }
 
 struct AdminHelper;
@@ -454,35 +561,52 @@ impl Completer for AdminHelper {
         let start = prefix_line.rfind(' ').map_or(0, |index| index + 1);
         let partial = &prefix_line[start..];
         let words = prefix_line[..start].split_whitespace().collect::<Vec<_>>();
-        let options: &[&str] = match words.as_slice() {
-            [] => &[
-                "users", "tokens", "keys", "roles", "grants", "targets", "relay", "help", "exit",
-            ],
-            ["users"] => &["list", "create", "disable", "enable", "roles", "show-roles"],
-            ["tokens"] => &["create", "list", "revoke"],
-            ["keys"] => &["list", "add", "remove"],
-            ["roles"] => &["list", "create", "delete"],
-            ["grants"] => &["list", "add", "remove"],
-            ["targets"] => &[
-                "list",
-                "create",
-                "rename",
-                "enable",
-                "disable",
-                "delete",
-                "issue-enrollment",
-            ],
-            ["relay"] => &["list", "close"],
-            _ => &[],
-        };
+        let mut command = AdminLine::command();
+        for word in words {
+            if word.starts_with('-') {
+                continue;
+            }
+            let next = command
+                .get_subcommands()
+                .find(|subcommand| {
+                    subcommand.get_name() == word
+                        || subcommand.get_all_aliases().any(|alias| alias == word)
+                })
+                .cloned();
+            let Some(next) = next else {
+                if command.get_subcommands().next().is_none() {
+                    break;
+                }
+                return Ok((start, Vec::new()));
+            };
+            command = next;
+        }
+        let mut options = Vec::new();
+        for subcommand in command.get_subcommands() {
+            options.push(subcommand.get_name().to_owned());
+            options.extend(subcommand.get_visible_aliases().map(str::to_owned));
+        }
+        for argument in command.get_arguments() {
+            if let Some(long) = argument.get_long() {
+                options.push(format!("--{long}"));
+            }
+            if let Some(short) = argument.get_short() {
+                options.push(format!("-{short}"));
+            }
+        }
+        if command.get_name() == "admin" {
+            options.extend(["help", "exit", "quit"].map(str::to_owned));
+        }
+        options.sort();
+        options.dedup();
         Ok((
             start,
             options
                 .iter()
                 .filter(|option| option.starts_with(partial))
                 .map(|option| Pair {
-                    display: (*option).to_owned(),
-                    replacement: (*option).to_owned(),
+                    display: option.clone(),
+                    replacement: option.clone(),
                 })
                 .collect(),
         ))
@@ -492,6 +616,152 @@ impl Completer for AdminHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_states_distinguish_expiry_and_revocation() {
+        let mut token = ApiTokenView {
+            token_id: uuid::Uuid::nil(),
+            user_id: "alice".into(),
+            label: "laptop".into(),
+            created_at: 1,
+            expires_at: Some(100),
+            revoked_at: None,
+        };
+        assert_eq!(token_state(&token, 99), "active");
+        assert_eq!(token_state(&token, 100), "expired");
+        token.revoked_at = Some(90);
+        assert_eq!(token_state(&token, 100), "revoked");
+        token.expires_at = None;
+        token.revoked_at = None;
+        assert_eq!(token_state(&token, 100), "active");
+    }
+
+    #[test]
+    fn output_has_complete_ids_and_no_raw_public_keys() {
+        let key_id = uuid::Uuid::new_v4();
+        let output = render_keys(&[UserKeyView {
+            key_id,
+            user_id: "alice".into(),
+            label: "line\n\x1b[31m".into(),
+            public_key: "untrusted-key-blob".into(),
+        }]);
+        assert!(output.contains(&key_id.to_string()));
+        assert!(output.contains("FINGERPRINT"));
+        assert!(output.contains("invalid key"));
+        assert!(!output.contains("untrusted-key-blob"));
+        assert!(!output.contains('\x1b'));
+    }
+
+    #[test]
+    fn all_empty_response_tables_are_explicit() {
+        for response in [
+            AdminResponse::Users(vec![]),
+            AdminResponse::Roles(vec![]),
+            AdminResponse::Targets(vec![]),
+            AdminResponse::Keys(vec![]),
+            AdminResponse::ApiTokens(vec![]),
+            AdminResponse::Grants(vec![]),
+        ] {
+            let output = render_response(&response);
+            assert!(output.contains("(0)\nNo records.\n"));
+            assert!(!output.contains('\t'));
+        }
+    }
+
+    #[test]
+    fn explicit_short_commands_match_canonical_commands() {
+        for (long, short) in [
+            (vec!["admin", "overview"], vec!["a", "ls"]),
+            (
+                vec!["admin", "users", "show", "alice"],
+                vec!["a", "u", "s", "alice"],
+            ),
+            (
+                vec!["admin", "roles", "show", "engineers"],
+                vec!["a", "r", "s", "engineers"],
+            ),
+            (
+                vec!["admin", "targets", "show", "build"],
+                vec!["a", "t", "s", "build"],
+            ),
+            (
+                vec![
+                    "admin",
+                    "tokens",
+                    "create",
+                    "alice",
+                    "--label",
+                    "laptop",
+                    "--expires-in",
+                    "60",
+                ],
+                vec!["a", "tk", "c", "alice", "-l", "laptop", "-e", "60"],
+            ),
+            (
+                vec![
+                    "admin",
+                    "grants",
+                    "add",
+                    "engineers",
+                    "build",
+                    "--permission",
+                    "ssh-connect",
+                ],
+                vec!["a", "g", "a", "engineers", "build", "-x", "ssh-connect"],
+            ),
+            (
+                vec!["admin", "keys", "list", "alice"],
+                vec!["a", "pk", "ls", "alice"],
+            ),
+        ] {
+            let long =
+                crate::client::Cli::try_parse_from(std::iter::once("kmesh").chain(long)).unwrap();
+            let short =
+                crate::client::Cli::try_parse_from(std::iter::once("kmesh").chain(short)).unwrap();
+            assert_eq!(
+                format!("{:?}", long.command),
+                format!("{:?}", short.command)
+            );
+        }
+        assert!(crate::client::Cli::try_parse_from(["kmesh", "a", "us", "list"]).is_err());
+        crate::client::Cli::command().debug_assert();
+        AdminLine::command().debug_assert();
+        assert!(
+            AdminLine::try_parse_from(["admin", "u", "ls", "-j"])
+                .unwrap()
+                .json
+        );
+    }
+
+    #[test]
+    fn global_short_flags_do_not_conflict_with_admin_flags() {
+        let parsed = crate::client::Cli::try_parse_from([
+            "kmesh",
+            "a",
+            "tk",
+            "c",
+            "alice",
+            "-l",
+            "laptop",
+            "-e",
+            "60",
+            "-p",
+            "work",
+            "-s",
+            "example.test",
+            "-P",
+            "9555",
+            "-d",
+            "/tmp/data",
+            "-c",
+            "/tmp/config",
+            "-j",
+        ])
+        .unwrap();
+        assert_eq!(parsed.profile.as_deref(), Some("work"));
+        assert_eq!(parsed.server_addr.as_deref(), Some("example.test"));
+        assert_eq!(parsed.server_port, Some(9555));
+    }
 
     #[test]
     fn admin_parser_accepts_one_shot_json_operations_and_help_lists_groups() {
@@ -552,6 +822,13 @@ mod tests {
             ("", "users"),
             ("", "tokens"),
             ("users ", "roles"),
+            ("u ", "s"),
+            ("tk ", "c"),
+            ("tk c alice --", "--label"),
+            ("tk c alice -", "-e"),
+            ("pk ", "rm"),
+            ("t ", "en"),
+            ("", "ls"),
             ("tokens ", "revoke"),
             ("keys ", "remove"),
             ("roles ", "delete"),

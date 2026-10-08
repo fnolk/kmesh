@@ -1,8 +1,10 @@
 mod admin;
+mod admin_view;
 mod agent;
 mod api;
 mod auth;
 mod cli;
+mod output;
 mod profile;
 mod proxy;
 mod route;
@@ -23,6 +25,11 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + ?Sized> AsyncReadWrite fo
 
 pub use crate::config::canonical_origin;
 pub use cli::{Cli, Command};
+
+/// Format an error chain as one safe terminal line.
+pub fn format_error(error: &anyhow::Error) -> String {
+    output::cell(&format!("{error:#}"))
+}
 
 #[derive(Clone)]
 pub struct ClientContext {
@@ -106,9 +113,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let issuer = config.server_origin()?;
                 let initial_token =
                     server::initialize(&config.data_dir, &args.admin, &issuer).await?;
-                println!("服务端已初始化。issuer={issuer}");
+                println!("Server initialized. issuer={issuer}");
                 if let Some(token) = initial_token {
-                    println!("初始管理员 API JWT（仅显示一次）：{token}");
+                    println!("Initial administrator API token (shown once): {token}");
                 }
             }
             cli::ServerCommand::Run(args) => {
@@ -135,7 +142,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 cli::AgentCommand::Enroll(args) => {
                     let target_id = args.target_id.trim().to_ascii_lowercase();
                     agent::enroll(&context, target_id.clone(), &args.enrollment_code).await?;
-                    println!("目标 {target_id} 已注册。");
+                    println!("Target {} enrolled.", output::cell(&target_id));
                 }
                 cli::AgentCommand::Run(args) => {
                     agent::run(&context, args.target_id.trim().to_ascii_lowercase()).await?;
@@ -146,15 +153,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             let context = ClientContext::new(&config).await?;
             auth::login(&context, args).await?;
             println!(
-                "登录成功。server={} profile={}",
+                "Login complete. server={} profile={}",
                 context.api.issuer(),
-                context.config.profile
+                output::cell(&context.config.profile)
             );
         }
         cli::Command::Logout => {
             let context = ClientContext::new(&config).await?;
             auth::logout(&context).await?;
-            println!("已退出当前登录。");
+            println!("Logout complete.");
         }
         cli::Command::Targets { command } => {
             let context = ClientContext::new(&config).await?;
@@ -162,20 +169,27 @@ pub async fn run(cli: Cli) -> Result<()> {
                 cli::TargetsCommand::List => {
                     let token = auth::valid_access_token(&context).await?;
                     let targets = context.api.targets(&token).await?;
-                    println!("目标列表：");
-                    for target in targets {
-                        println!(
-                            "{}\t{}\t{}\t{}",
-                            target.target_id,
-                            target.name,
-                            if target.enabled {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            },
-                            if target.online { "online" } else { "offline" }
-                        );
-                    }
+                    let rows = targets
+                        .into_iter()
+                        .map(|target| {
+                            vec![
+                                target.target_id,
+                                target.name,
+                                if target.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                }
+                                .to_owned(),
+                                if target.online { "online" } else { "offline" }.to_owned(),
+                            ]
+                        })
+                        .collect();
+                    output::print_table(
+                        "Targets",
+                        &["TARGET", "NAME", "STATE", "CONNECTION"],
+                        rows,
+                    );
                 }
             }
         }

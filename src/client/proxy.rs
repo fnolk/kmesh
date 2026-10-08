@@ -27,7 +27,7 @@ const ENDPOINT_CLOSE_BUDGET: Duration = Duration::from_secs(4);
 pub(super) struct SshAuthenticationFailure(String);
 
 #[derive(Debug, thiserror::Error)]
-#[error("route network path failed: {0}")]
+#[error("SSH network path failed: {0}")]
 pub(super) struct RouteNetworkFailure(#[source] anyhow::Error);
 
 #[derive(Debug, thiserror::Error)]
@@ -50,7 +50,9 @@ pub(super) fn is_retryable_route_failure(error: &anyhow::Error) -> bool {
 pub(super) fn server_setup_error(code: String, message: String) -> anyhow::Error {
     match code.as_str() {
         "authentication" | "authorization" => anyhow!(SshAuthenticationFailure(message)),
-        "incompatible_version" => anyhow!("kmesh client/server version incompatibility: {message}"),
+        "incompatible_version" => {
+            anyhow!("kmesh client and server versions are incompatible: {message}")
+        }
         "network" => anyhow::Error::new(RouteNetworkFailure(anyhow!(message))),
         _ => anyhow!("server could not prepare SSH access: {message}"),
     }
@@ -61,10 +63,10 @@ pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
     let setup_deadline = tokio::time::Instant::now() + SSH_SETUP_TIMEOUT;
     let access_token = tokio::time::timeout_at(setup_deadline, auth::valid_access_token(context))
         .await
-        .context("SSH setup expired during kmesh authentication")??;
+        .context("SSH setup timed out during kmesh authentication")??;
     let transport_info = tokio::time::timeout_at(setup_deadline, context.api.transport_info())
         .await
-        .context("SSH setup expired while reading route configuration")??;
+        .context("SSH setup timed out while reading the route configuration")??;
     let route_modes = if transport_info.private_relay_url.is_some() {
         vec![
             RouteMode::PrivateDirect,
@@ -88,7 +90,7 @@ pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
         } else {
             tokio::time::timeout_at(attempt_deadline, auth::valid_access_token(context))
                 .await
-                .context("SSH setup expired while refreshing kmesh authentication")??
+                .context("SSH setup timed out while refreshing kmesh authentication")??
         };
         let mut control = connect_control(context, &access_token, attempt_deadline)
             .await
@@ -128,8 +130,10 @@ pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
                     "SSH route attempt failed"
                 );
                 eprintln!(
-                    "SSH route {:?} failed after {} ms: {:#}",
-                    route_mode, elapsed_ms, error,
+                    "SSH route {:?} failed after {} ms: {}",
+                    route_mode,
+                    elapsed_ms,
+                    super::format_error(&error),
                 );
                 failures.push(format!(
                     "{route_mode:?} session={session_id} elapsed_ms={elapsed_ms}: {error:#}"
@@ -205,7 +209,7 @@ pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
     let (ssh_upload_bytes, ssh_download_bytes) =
         transfer.context("copy local SSH stdio over Iroh")?;
     eprintln!(
-        "SSH 流量统计：本地→目标={} bytes；目标→本地={} bytes",
+        "SSH traffic: local to target={} bytes; target to local={} bytes",
         ssh_upload_bytes, ssh_download_bytes,
     );
     Ok(())
@@ -222,7 +226,7 @@ async fn connect_control(
     );
     tokio::time::timeout_at(deadline, context.api.connect_control(access_token))
         .await
-        .context("connecting to kmesh control channel timed out")?
+        .context("kmesh control connection timed out")?
 }
 
 async fn close_session(control: &mut WsStream, session_id: Uuid, reason: &str) -> Result<()> {
