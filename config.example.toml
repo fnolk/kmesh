@@ -19,10 +19,6 @@ profile = "default"
 # username = "your-account"
 # key = "~/.ssh/id_ed25519"
 
-[ssh]
-address = "127.0.0.1:22"
-connect_timeout_secs = 10
-
 [server]
 # Address used by the server's HTTPS and QAD listeners.
 bind_addr = "0.0.0.0"

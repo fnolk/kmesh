@@ -52,9 +52,12 @@ Use the same term for the same object in help, output, errors, and documentation
 | API token | A bearer credential used to authenticate API requests. |
 | token ID | The identifier used to list or revoke an API token. It is not the credential. |
 | token value | The secret JWT returned when an API token is issued. |
+| data directory | The base path for local or server data. |
+| agent state | The saved server address, credentials, device identity, and SSH settings for a target agent. |
 | SSH public key | The public key registered for a user's public-key login. |
 | key fingerprint | A digest used to compare public keys. It is not the key ID. |
 | enrollment code | A one-time credential used to enroll a target agent. |
+| enroll | Verb: enrolls, enrolled, enrolled. Use a one-time enrollment code to create agent credentials for a target on a server. |
 | relay connection | One endpoint transport handled by the private relay. |
 | SSH session | The session that can map to multiple relay connections. |
 

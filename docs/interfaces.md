@@ -58,7 +58,7 @@ The client JWT establishes the user identity; it does not cache target permissio
 3. For direct modes, client and target independently report `CandidatesReady`. The server either sends `ContinueNative { plan: Standard }` or pairs the two QAD result sets for bounded punching. The peers report `PunchReady` before `StartPunch`; a confirmed socket winner is handed off only after the server sends matching `ContinueNative { plan: Handoff { ... } }` messages.
 4. Each peer binds its Iroh endpoint using the route policy and reports `ClientReady` or `AgentReady`. The server sends `DialOffer` to the target agent; the target initiates the Iroh connection to the client.
 5. Each peer reports `PathReady { session_id, route_mode, path }` from Iroh's actual selected path. Direct modes accept only `SelectedPath::Direct`; `PrivateRelay` accepts only the configured `SelectedPath::PrivateRelay`. The target sends `IrohReady` after peer identity and the stream ticket are verified.
-6. The server activates only after both path reports and target Iroh readiness match the pending session and a transactional RBAC recheck succeeds. Only then does the target connect to its locally configured `ssh.address` and start byte forwarding.
+6. The server activates only after both path reports and target Iroh readiness match the pending session and a transactional RBAC recheck succeeds. Only then does the target connect to the local SSH address saved in agent state and start byte forwarding.
 
 The target agent's shared device-control WSS outlives each SSH session mailbox. Finishing or closing one session mailbox ends only that session and leaves the device control channel available for later sessions.
 
@@ -74,7 +74,7 @@ One local SSH TCP connection maps to one QUIC bidirectional stream. The adapter 
 
 SQLite WAL stores users, SSH public keys, access groups, group membership, grants, registered API JWTs, public-key login sessions, tunnel-session state, and `admin_audit` records. Version 0.4.0 uses the 0.4 API and schema version 6. It requires a fresh data directory. Earlier databases are not migrated. Version 0.3 clients cannot use a 0.4.0 server. See the root README for login, enrollment, service setup, and OpenSSH examples.
 
-Local agent credentials are stored under hashes of the canonical server origin and target ID. Generated SSH `HostKeyAlias` values include the same origin scope and readable target ID, so two servers with equal target IDs keep separate credentials and known-host entries.
+Local agent state is stored at `<data-dir>/agents/<target-id>/agent.json`. The selected data directory is the base, and it can contain one server binding for each target ID. Use a separate data directory for each server when target IDs are equal. Generated SSH `HostKeyAlias` values remain scoped by canonical server origin and target ID.
 
 ## Admin relay traffic
 

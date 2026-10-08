@@ -7,6 +7,8 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/local/bin/kmesh</string>
+		<string>--data-dir</string>
+		<string>/Users/REPLACE_WITH_USER/Library/Application Support/kmesh</string>
 		<string>agent</string>
 		<string>run</string>
 		<string>--target-id</string>

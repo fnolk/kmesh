@@ -28,7 +28,7 @@ use crate::{
 };
 
 use super::{
-    AgentAuthenticationFailure, ClientContext, MAX_TICKET_FRAME, TunnelOffer, ensure_auth,
+    AgentAuthenticationFailure, AgentContext, MAX_TICKET_FRAME, TunnelOffer, ensure_auth,
     route::endpoint_options, server_session_error, transport_error,
 };
 use super::{
@@ -89,7 +89,7 @@ where
 }
 
 pub(super) async fn run_agent_session(
-    context: &ClientContext,
+    context: &AgentContext,
     credentials: &AgentCredentials,
     stable_device_key: SecretKey,
     transport_info: TransportInfo,
@@ -373,7 +373,7 @@ pub(super) async fn run_agent_session(
 }
 
 pub(super) async fn handle_dial_offer(
-    context: &ClientContext,
+    context: &AgentContext,
     offer: TunnelOffer,
     endpoint: &Endpoint,
     relay_choice: RelayChoice,
@@ -479,12 +479,12 @@ pub(super) async fn handle_dial_offer(
     }
 
     let mut ssh = tokio::time::timeout(
-        Duration::from_secs(context.config.ssh.connect_timeout_secs),
-        TcpStream::connect(context.config.ssh.address),
+        Duration::from_secs(context.ssh_connect_timeout_secs),
+        TcpStream::connect(context.ssh_address),
     )
     .await
     .context("connecting to local sshd timed out")?
-    .with_context(|| format!("connect to local sshd at {}", context.config.ssh.address))?;
+    .with_context(|| format!("connect to local sshd at {}", context.ssh_address))?;
     ssh.set_nodelay(true)
         .context("set local sshd TCP_NODELAY")?;
     let paths_before_ssh = snapshot_iroh_paths(stream.connection());

@@ -2313,6 +2313,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "jsonwebtoken",
+ "nix",
  "noq",
  "rand 0.10.3",
  "rcgen",

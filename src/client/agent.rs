@@ -1,17 +1,18 @@
 use std::{
-    fs,
+    net::SocketAddr,
+    path::Path,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use iroh::{EndpointAddr, SecretKey};
 use tokio::{task::JoinSet, time::sleep};
 use uuid::Uuid;
 
-use super::{ClientContext, profile, profile::write_json_atomic};
+use super::api::Api;
 use crate::{
-    protocol::{AgentCredentials, AgentEnrollmentRequest, RouteMode, TransportInfo},
+    protocol::{AgentEnrollmentRequest, RouteMode, TransportInfo},
     transport::TransportError,
 };
 
@@ -20,6 +21,7 @@ mod identity;
 mod punch;
 mod route;
 mod session;
+mod state;
 #[cfg(test)]
 mod tests;
 
@@ -27,9 +29,13 @@ const CONTROL_RETRY_MAX: Duration = Duration::from_secs(30);
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_TICKET_FRAME: usize = 8 * 1024;
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct PendingAgentIdentity {
-    endpoint_secret_key: String,
+pub(super) use state::{data_dir, prepare_data_dir};
+
+#[derive(Clone)]
+pub(super) struct AgentContext {
+    pub(super) api: Api,
+    pub(super) ssh_address: SocketAddr,
+    pub(super) ssh_connect_timeout_secs: u64,
 }
 
 pub(super) struct AgentRuntime {
@@ -62,39 +68,50 @@ pub(super) struct ServerAuthenticationFailure(pub(super) String);
 pub(super) struct AgentVersionIncompatibility(pub(super) String);
 
 pub async fn enroll(
-    context: &ClientContext,
+    server_addr: &str,
+    server_port: u16,
+    data_dir: &Path,
     target_id: String,
     enrollment_code: &str,
-) -> Result<()> {
-    let target_id = target_id.trim().to_ascii_lowercase();
-    let server_origin = context.api.issuer();
-    profile::ensure_agent_credentials_dir(&context.config.data_dir, server_origin)?;
-    let credential_path =
-        profile::agent_credentials_path(&context.config.data_dir, server_origin, &target_id);
-    let pending_path = credential_path.with_extension("pending.json");
-    let identity = if credential_path.exists() {
-        let saved =
-            profile::load_agent_credentials(&context.config.data_dir, server_origin, &target_id)?;
-        PendingAgentIdentity {
+    ssh_address: SocketAddr,
+    ssh_connect_timeout_secs: u64,
+) -> Result<String> {
+    let target_id = state::normalize_target_id(&target_id)?;
+    let api = Api::new_for_server(server_addr, server_port).await?;
+    let origin = api.issuer();
+    state::ensure_target_dir(data_dir, &target_id)?;
+
+    let existing = state::load_optional(data_dir, &target_id)?;
+    if let Some(saved) = &existing {
+        anyhow::ensure!(
+            saved.server_origin()? == origin,
+            "This target ID already has state for another server. Use a different data directory."
+        );
+    }
+
+    let identity = if let Some(saved) = existing {
+        state::PendingAgentIdentity {
+            server_addr: saved.server_addr,
+            server_port: saved.server_port,
             endpoint_secret_key: saved.endpoint_secret_key,
         }
+    } else if let Some(pending) = state::load_pending(data_dir, &target_id)? {
+        anyhow::ensure!(
+            crate::config::server_origin(&pending.server_addr, pending.server_port)? == origin,
+            "An enrollment attempt for this target ID uses another server. Use a different data directory."
+        );
+        pending
     } else {
-        match fs::read(&pending_path) {
-            Ok(bytes) => serde_json::from_slice::<PendingAgentIdentity>(&bytes)
-                .context("read pending target Iroh identity")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let identity = PendingAgentIdentity {
-                    endpoint_secret_key: identity::encode_secret_key(&SecretKey::generate()),
-                };
-                write_json_atomic(&pending_path, &identity)?;
-                identity
-            }
-            Err(error) => return Err(error).context("read pending target Iroh identity"),
-        }
+        let identity = state::PendingAgentIdentity {
+            server_addr: server_addr.to_owned(),
+            server_port,
+            endpoint_secret_key: identity::encode_secret_key(&SecretKey::generate()),
+        };
+        state::save_pending(data_dir, &target_id, &identity)?;
+        identity
     };
     let endpoint_secret_key = identity::decode_secret_key(&identity.endpoint_secret_key)?;
-    let response = context
-        .api
+    let response = api
         .agent_enroll(&AgentEnrollmentRequest {
             target_id: target_id.clone(),
             enrollment_token: enrollment_code.to_owned(),
@@ -103,31 +120,37 @@ pub async fn enroll(
         .await?;
     anyhow::ensure!(
         response.target_id == target_id,
-        "server enrolled a different target ID"
+        "The server returned a different target ID."
     );
-    profile::save_agent_credentials(
-        &context.config.data_dir,
-        server_origin,
-        &AgentCredentials {
-            target_id,
-            agent_token: response.agent_token,
-            ticket_public_key_pem: response.ticket_public_key_pem,
-            endpoint_secret_key: identity.endpoint_secret_key,
-        },
-    )?;
-    if pending_path.exists() {
-        fs::remove_file(pending_path).context("remove completed pending Iroh identity")?;
-    }
-    Ok(())
+    let state = state::AgentState {
+        target_id,
+        server_addr: server_addr.to_owned(),
+        server_port,
+        agent_token: response.agent_token,
+        ticket_public_key_pem: response.ticket_public_key_pem,
+        endpoint_secret_key: identity.endpoint_secret_key,
+        ssh_address,
+        ssh_connect_timeout_secs,
+    };
+    state::save(data_dir, &state)?;
+    state::clear_pending(data_dir, &state.target_id)?;
+    Ok(state.target_id)
 }
 
-pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
-    let target_id = target_id.trim().to_ascii_lowercase();
-    let credentials = profile::load_agent_credentials(
-        &context.config.data_dir,
-        context.api.issuer(),
-        &target_id,
-    )?;
+pub async fn run(data_dir: &Path, target_id: String) -> Result<()> {
+    let target_id = state::normalize_target_id(&target_id)?;
+    let saved = state::load(data_dir, &target_id)?;
+    anyhow::ensure!(
+        saved.target_id == target_id,
+        "The state file has a different target ID."
+    );
+    let api = Api::new_for_server(&saved.server_addr, saved.server_port).await?;
+    let context = AgentContext {
+        api,
+        ssh_address: saved.ssh_address,
+        ssh_connect_timeout_secs: saved.ssh_connect_timeout_secs,
+    };
+    let credentials = saved.credentials();
     let mut runtime = AgentRuntime {
         stable_device_secret_key: identity::decode_secret_key(&credentials.endpoint_secret_key)?,
         transport_info: context.api.transport_info().await?,
@@ -136,7 +159,7 @@ pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
     };
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        match control::control_session(context, &credentials, &mut runtime).await {
+        match control::control_session(&context, &credentials, &mut runtime).await {
             Ok(()) => bail!("agent control connection closed"),
             Err(error) if is_terminal_connection_error(&error) => {
                 let reason = if is_authentication_error(&error) {
