@@ -4088,3 +4088,171 @@ XQAAAAtzc2gtZWQyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYg
 AAAEC2BsIi0QwW2uFscKTUUXNHLsYX4FxlaSDSblbAj7WR7bM+rvN+ot98qgEN796jTiQf
 ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==
 -----END OPENSSH PRIVATE KEY-----"#;
+
+#[tokio::test]
+async fn group_changes_are_atomic_audited_and_reject_stale_previews() {
+    use crate::protocol::{GroupChange, GroupChangeMode};
+    let f = fixture("https://kmesh.test:9443").await;
+    for group in ["dev", "ops"] {
+        admin_request(
+            &f.state,
+            &f.admin_token,
+            AdminOperation::CreateAccessGroup { name: group.into() },
+        )
+        .await
+        .unwrap();
+    }
+    let operation = |groups: &[&str], dry_run, expected: Option<GroupChange>| {
+        AdminOperation::ChangeUserAccessGroups {
+            user_id: "admin".into(),
+            group_ids: groups.iter().map(|s| (*s).into()).collect(),
+            mode: GroupChangeMode::Add,
+            dry_run,
+            expected,
+        }
+    };
+    let count = || {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM admin_audit")
+            .fetch_one(&f.state.inner.db.pool)
+    };
+    let before = count().await.unwrap();
+    let AdminResponse::GroupChange {
+        change: preview, ..
+    } = admin_request(&f.state, &f.admin_token, operation(&["dev"], true, None))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(count().await.unwrap(), before);
+    // Two independent incremental writes retain both assignments.
+    let (a, b) = tokio::join!(
+        admin_request(&f.state, &f.admin_token, operation(&["dev"], false, None)),
+        admin_request(&f.state, &f.admin_token, operation(&["ops"], false, None)),
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(count().await.unwrap(), before + 2);
+    assert_eq!(
+        admin_request(
+            &f.state,
+            &f.admin_token,
+            operation(&["dev"], false, Some(preview))
+        )
+        .await
+        .unwrap_err(),
+        axum::http::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        admin_request(
+            &f.state,
+            &f.admin_token,
+            operation(&["missing"], false, None)
+        )
+        .await
+        .unwrap_err(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(count().await.unwrap(), before + 2);
+    let AdminResponse::UserAccessGroups(groups) = admin_request(
+        &f.state,
+        &f.admin_token,
+        AdminOperation::ListUserAccessGroups {
+            user_id: "admin".into(),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        groups
+            .iter()
+            .map(|g| g.group_id.as_str())
+            .collect::<Vec<_>>(),
+        ["dev", "ops"]
+    );
+}
+
+#[tokio::test]
+async fn group_preview_detects_grant_changes_and_audit_failure_rolls_back() {
+    use crate::protocol::GroupChangeMode;
+    let f = fixture("https://kmesh.test:9443").await;
+    for operation in [
+        AdminOperation::CreateAccessGroup { name: "dev".into() },
+        AdminOperation::CreateTarget {
+            name: "build".into(),
+        },
+        AdminOperation::SetUserAccessGroups {
+            user_id: "admin".into(),
+            group_ids: vec!["dev".into()],
+        },
+    ] {
+        admin_request(&f.state, &f.admin_token, operation)
+            .await
+            .unwrap();
+    }
+    let mut operation = AdminOperation::ChangeUserAccessGroups {
+        user_id: "admin".into(),
+        group_ids: vec![],
+        mode: GroupChangeMode::Replace,
+        dry_run: true,
+        expected: None,
+    };
+    let AdminResponse::GroupChange { change, .. } =
+        admin_request(&f.state, &f.admin_token, operation.clone())
+            .await
+            .unwrap()
+    else {
+        panic!()
+    };
+    assert!(change.lost_target_ids.is_empty());
+    admin_request(
+        &f.state,
+        &f.admin_token,
+        AdminOperation::GrantTarget {
+            group_id: "dev".into(),
+            target_id: "build".into(),
+            permission: TargetPermission::SshConnect,
+        },
+    )
+    .await
+    .unwrap();
+    if let AdminOperation::ChangeUserAccessGroups {
+        dry_run, expected, ..
+    } = &mut operation
+    {
+        *dry_run = false;
+        *expected = Some(change);
+    }
+    assert_eq!(
+        admin_request(&f.state, &f.admin_token, operation.clone())
+            .await
+            .unwrap_err(),
+        axum::http::StatusCode::CONFLICT
+    );
+    if let AdminOperation::ChangeUserAccessGroups { expected, .. } = &mut operation {
+        *expected = None;
+    }
+    sqlx::query("CREATE TRIGGER reject_group_audit BEFORE INSERT ON admin_audit WHEN NEW.operation = 'change_user_access_groups' BEGIN SELECT RAISE(ABORT, 'test audit failure'); END")
+        .execute(&f.state.inner.db.pool).await.unwrap();
+    assert_eq!(
+        admin_request(&f.state, &f.admin_token, operation)
+            .await
+            .unwrap_err(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let AdminResponse::UserAccessGroups(groups) = admin_request(
+        &f.state,
+        &f.admin_token,
+        AdminOperation::ListUserAccessGroups {
+            user_id: "admin".into(),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id, "dev");
+}

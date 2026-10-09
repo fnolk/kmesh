@@ -1,3 +1,5 @@
+mod access;
+
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant, UNIX_EPOCH},
@@ -98,11 +100,18 @@ pub(crate) async fn apply_operation(
         | Op::ListKeys { user_id }
         | Op::ListUserAccessGroups { user_id }
         | Op::SetUserSystemRole { user_id, .. } => *user_id = normalize_username(user_id)?,
-        Op::SetUserAccessGroups { user_id, group_ids } => {
+        Op::SetUserAccessGroups { user_id, group_ids }
+        | Op::ChangeUserAccessGroups {
+            user_id, group_ids, ..
+        } => {
             *user_id = normalize_username(user_id)?;
             for group_id in group_ids {
                 *group_id = normalize_group_id(group_id)?;
             }
+        }
+        Op::ExplainAccess { user_id, target_id } => {
+            *user_id = normalize_username(user_id)?;
+            *target_id = normalize_target_id(target_id)?;
         }
         Op::DeleteAccessGroup { group_id } | Op::ListGroupGrants { group_id } => {
             *group_id = normalize_group_id(group_id)?;
@@ -130,6 +139,29 @@ pub(crate) async fn apply_operation(
     }
 
     match &operation {
+        Op::ChangeUserAccessGroups {
+            user_id,
+            group_ids,
+            mode,
+            dry_run,
+            expected,
+        } => {
+            return access::change_groups(
+                state,
+                actor_user_id,
+                user_id,
+                group_ids,
+                *mode,
+                *dry_run,
+                expected.as_ref(),
+            )
+            .await;
+        }
+        Op::ExplainAccess { user_id, target_id } => {
+            return Ok(AdminResponse::AccessExplanation(
+                access::explain(state, user_id, target_id).await?,
+            ));
+        }
         Op::ListUsers => return Ok(AdminResponse::Users(list_users(state).await?)),
         Op::ListRelayTraffic => {
             return Ok(AdminResponse::RelayTraffic(
@@ -483,7 +515,9 @@ async fn apply_operation_write(
 ) -> Result<AdminResponse, ApiError> {
     use AdminOperation as Op;
     match operation {
-        Op::ListUsers
+        Op::ChangeUserAccessGroups { .. }
+        | Op::ExplainAccess { .. }
+        | Op::ListUsers
         | Op::ListKeys { .. }
         | Op::ListRoles
         | Op::ListGroups
@@ -1133,7 +1167,9 @@ async fn prepare_audit_event(
                 }),
             )
         }
-        Op::ListUsers
+        Op::ChangeUserAccessGroups { .. }
+        | Op::ExplainAccess { .. }
+        | Op::ListUsers
         | Op::ListKeys { .. }
         | Op::ListRoles
         | Op::ListGroups

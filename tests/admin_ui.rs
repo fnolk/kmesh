@@ -53,6 +53,10 @@ impl Fixture {
     }
 
     fn start() -> Self {
+        Self::start_with_relay(false)
+    }
+
+    fn start_with_relay(private_relay: bool) -> Self {
         let directory = std::env::temp_dir().join(format!("kmesh-admin-ui-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("config.toml"), "").unwrap();
@@ -84,8 +88,12 @@ impl Fixture {
                 "127.0.0.1",
                 "--udp-port",
                 &udp_port.to_string(),
-                "--disable-private-relay",
             ])
+            .args(if private_relay {
+                vec![]
+            } else {
+                vec!["--disable-private-relay"]
+            })
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -261,11 +269,36 @@ fn member_cannot_enter_any_admin_cli_mode() {
         String::from_utf8_lossy(&login.stderr)
     );
 
+    let status = fixture.success(&["--profile", "member", "status", "-j"]);
+    assert!(!status.contains(member_token));
+    let status: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(status["user"], "member");
+    let hidden = fixture.run(&["--profile", "member", "doctor", "hidden", "-j"]);
+    assert!(!hidden.status.success());
+    let hidden: Value = serde_json::from_slice(&hidden.stdout).unwrap();
+    assert!(
+        hidden["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["stage"] == "access" && c["status"] == "failed")
+    );
+
     for args in [
         vec!["--profile", "member", "admin"],
         vec!["--profile", "member", "admin", "users", "list"],
         vec!["--profile", "member", "admin", "--json"],
         vec!["--profile", "member", "a", "u", "ls"],
+        vec!["--profile", "member", "access", "explain", "root", "hidden"],
+        vec![
+            "--profile",
+            "member",
+            "a",
+            "u",
+            "add-groups",
+            "member",
+            "dev",
+        ],
     ] {
         let output = fixture.run(&args);
         assert!(!output.status.success(), "{args:?} entered admin mode");
@@ -342,4 +375,240 @@ fn admin_shell_shows_identity_and_exits_after_role_revocation() {
             .iter()
             .any(|user| user["user_id"] == "must-not-run")
     );
+}
+
+#[test]
+fn group_changes_preview_impacts_and_require_explicit_clear() {
+    let f = Fixture::start();
+    f.success(&["a", "u", "c", "alice"]);
+    for group in ["dev", "ops"] {
+        f.success(&["a", "g", "c", group]);
+    }
+    f.success(&["a", "t", "c", "build"]);
+    for group in ["dev", "ops"] {
+        f.success(&["a", "gr", "a", group, "build"]);
+    }
+    let set = f.json(&["a", "u", "groups", "alice", "dev", "-j"]);
+    assert_eq!(set["result"], "user_access_groups");
+    assert_eq!(set["data"][0]["group_id"], "dev");
+    let add = f.json(&["a", "u", "add-groups", " ALICE ", " OPS ", "ops", "-j"]);
+    assert_eq!(
+        add["data"]["change"]["after"],
+        serde_json::json!(["dev", "ops"])
+    );
+    let remove = f.json(&["a", "u", "remove-groups", "alice", "dev", "-j"]);
+    assert_eq!(
+        remove["data"]["change"]["lost_target_ids"],
+        serde_json::json!([])
+    );
+    let preview = f.json(&["a", "u", "groups", "alice", "--dry-run", "-j"]);
+    assert_eq!(preview["data"]["applied"], false);
+    assert_eq!(
+        preview["data"]["change"]["lost_target_ids"],
+        serde_json::json!(["build"])
+    );
+    for args in [
+        vec!["a", "u", "groups", "alice"],
+        vec!["a", "u", "remove-groups", "alice", "ops", "-j"],
+    ] {
+        let output = f.run(&args);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--yes"));
+    }
+    assert_eq!(
+        f.json(&["a", "u", "show-groups", "alice", "-j"])["data"][0]["group_id"],
+        "ops"
+    );
+    let invalid = f.run(&["a", "u", "add-groups", "alice", "missing"]);
+    assert!(!invalid.status.success());
+    let clear = f.json(&["a", "u", "groups", "alice", "--yes", "-j"]);
+    assert_eq!(clear["data"], serde_json::json!([]));
+    assert_eq!(
+        clear["change"]["lost_target_ids"],
+        serde_json::json!(["build"])
+    );
+}
+
+#[test]
+fn diagnostics_distinguish_authorization_offline_and_login_failures() {
+    let f = Fixture::start();
+    let status = f.json(&["status", "-j"]);
+    assert_eq!(status["user"], "root");
+    assert!(
+        status["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["status"] == "passed")
+    );
+    f.success(&["a", "t", "c", "build"]);
+    let denied = f.json(&["access", "explain", "root", "build", "-j"]);
+    assert_eq!(denied["authorized"], false);
+    assert_eq!(
+        denied["blockers"],
+        serde_json::json!(["no_access_groups", "no_ssh_connect_grant"])
+    );
+    f.success(&["a", "g", "c", "dev"]);
+    f.success(&["a", "u", "add-groups", "root", "dev"]);
+    f.success(&["a", "gr", "a", "dev", "build"]);
+    let granted = f.json(&["access", "explain", "ROOT", "BUILD", "-j"]);
+    assert_eq!(granted["authorized"], true);
+    assert_eq!(granted["online"], false);
+    let offline = f.run(&["doctor", "build", "-j"]);
+    assert!(!offline.status.success());
+    let report: Value = serde_json::from_slice(&offline.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["stage"] == "agent" && c["status"] == "failed")
+    );
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["stage"] == "sshd" && c["status"] == "not_checked")
+    );
+    f.success(&["a", "t", "off", "build"]);
+    let disabled = f.json(&["access", "explain", "root", "build", "-j"]);
+    assert_eq!(disabled["blockers"], serde_json::json!(["target_disabled"]));
+    f.success(&["a", "t", "rm", "build"]);
+    let missing = f.json(&["access", "explain", "root", "build", "-j"]);
+    assert_eq!(
+        missing["blockers"],
+        serde_json::json!(["target_unavailable"])
+    );
+    f.success(&["logout"]);
+    let logged_out = f.run(&["status", "-j"]);
+    assert!(!logged_out.status.success());
+    let report: Value = serde_json::from_slice(&logged_out.stdout).unwrap();
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["stage"] == "login" && c["status"] == "failed")
+    );
+}
+
+struct AgentProcess(Child);
+impl Drop for AgentProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn doctor_checks_a_real_agent_and_ssh_identification_without_authentication() {
+    use std::io::Read;
+    let f = Fixture::start_with_relay(true);
+    let ssh = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ssh_address = ssh.local_addr().unwrap();
+    ssh.set_nonblocking(true).unwrap();
+    let stub = thread::spawn(move || {
+        for banner in ["SSH-2.0-kmesh-test\r\n", "HTTP/1.1 200 OK\r\n"] {
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let mut connection = loop {
+                match ssh.accept() {
+                    Ok((connection, _)) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "doctor did not reach the SSH stub"
+                        );
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("SSH stub failed: {error}"),
+                }
+            };
+            connection.write_all(banner.as_bytes()).unwrap();
+            connection.shutdown(std::net::Shutdown::Write).unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let mut received = Vec::new();
+            let _ = connection.read_to_end(&mut received);
+            assert!(
+                received.is_empty(),
+                "doctor must not send SSH authentication or commands"
+            );
+        }
+    });
+    let created = f.json(&["a", "t", "c", "probe", "-j"]);
+    let enrollment = created["data"]["enrollment_token"].as_str().unwrap();
+    let agent_command = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_kmesh"));
+        c.args(["-s", "127.0.0.1", "-P", &f.port.to_string(), "-d"])
+            .arg(f.directory.join("agent"))
+            .env_remove("KMESH_TOKEN")
+            .env_remove("RUST_LOG");
+        c
+    };
+    let enroll = agent_command()
+        .args([
+            "agent",
+            "enroll",
+            "-t",
+            "probe",
+            "-e",
+            enrollment,
+            "--ssh-address",
+            &ssh_address.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        enroll.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enroll.stderr)
+    );
+    let mut agent = AgentProcess(
+        Command::new(env!("CARGO_BIN_EXE_kmesh"))
+            .arg("-d")
+            .arg(f.directory.join("agent"))
+            .args(["agent", "run", "-t", "probe"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    f.success(&["a", "g", "c", "probe"]);
+    f.success(&["a", "u", "add-groups", "root", "probe"]);
+    f.success(&["a", "gr", "a", "probe", "probe"]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let view = f.json(&["access", "explain", "root", "probe", "-j"]);
+        if view["online"] == true {
+            break;
+        }
+        assert!(agent.0.try_wait().unwrap().is_none(), "agent stopped");
+        assert!(Instant::now() < deadline, "agent did not connect");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let healthy = f.json(&["doctor", "probe", "-j"]);
+    assert!(
+        healthy["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["stage"] == "sshd" && c["status"] == "passed")
+    );
+    let invalid = f.run(&["doctor", "probe", "-j"]);
+    assert!(!invalid.status.success());
+    let report: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["stage"] == "network" && c["status"] == "passed")
+    );
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["stage"] == "sshd" && c["status"] == "failed")
+    );
+    stub.join().unwrap();
 }

@@ -105,7 +105,8 @@ Resource aliases are `u` (users), `r` (roles), `g` (groups), `gr` (grants), `t` 
 Aliases are explicit; arbitrary command prefixes are not accepted. Use the
 canonical commands in this release. `users roles` sets one platform role: `member` or
 `admin`. `users groups` replaces all access groups. Use an empty group ID list to
-remove every access group. `grants add` adds the named permission.
+remove every access group. Confirm this change at the prompt, or pass `--yes` in scripts.
+`grants add` adds the named permission.
 
 Global short options work before or after subcommands: `-c` config, `-d` data
 directory, `-p` profile, `-s` server address, and `-P` server port. Admin accepts
@@ -121,6 +122,84 @@ Use `--json` for scripts. Runtime messages and help use English with the
 [CLI language and display guide](docs/cli-style.md). The guide sets the ASD-STE100
 Issue 9 vocabulary, sentence length, and project term rules. User data, exact
 identifiers, and dependency diagnostics retain their original meanings.
+
+## Change access groups safely
+
+Use incremental commands to retain the user's other groups:
+
+```sh
+kmesh admin users add-groups alice engineers support
+kmesh admin users remove-groups alice support
+kmesh admin users groups alice engineers --dry-run
+kmesh admin users groups alice --yes
+```
+
+`users groups` (also `users set-groups`) replaces all assignments. `add-groups`
+adds only the specified groups. `remove-groups` removes only the specified groups.
+Both incremental commands require at least one group ID. Repeated IDs have no
+additional effect. All specified groups must exist.
+
+Each command shows the groups before and after the change. It also shows target
+access that the user gains or loses. Disabled users and disabled or removed targets
+have no effective target access. An offline target can still be authorized. Access
+through a retained group is not reported as lost.
+
+Use `--dry-run` to inspect a change without writing assignments or audit records.
+The server applies group changes in one transaction. Before a write, it checks
+that the preview still matches the current assignments and effective access changes.
+If the preview changed, the command stops. Run it again to obtain a new preview.
+
+When a change removes all existing groups, the terminal asks you to type `yes`.
+Any other response cancels the change. Scripts and JSON commands require `--yes`
+for this operation. `--yes` does not bypass the preview check. Existing SSH
+connections, including connections reused by OpenSSH, can continue after a change.
+
+All group commands accept `--json`. The existing replacement command retains its
+`result: "user_access_groups"` and `data` fields. It adds `change` and `applied`.
+Incremental commands and previews use `result: "group_change"`. Human-readable
+previews go to stderr before a write. JSON results go only to stdout.
+
+## Check login, access, and connections
+
+```sh
+kmesh status
+kmesh status --json
+kmesh access explain alice build-machine
+kmesh doctor build-machine
+kmesh doctor build-machine --json
+```
+
+`status` checks the HTTPS service, version compatibility, available route settings,
+and the current login. It shows the server, profile, client version, user, and
+platform role. It never prints tokens or private keys. A public-key session can
+refresh through the normal login mechanism.
+
+`access explain <user-id> <target-id>` requires the admin platform role. It shows
+access groups, granting groups, permission blockers, and agent availability.
+Authorization is evaluated from one database snapshot. Online state is read
+separately. Missing grants, disabled accounts, and disabled or removed targets are
+reported separately. Platform admin status does not grant SSH access. This command
+returns success when it produces an explanation, including an access denial.
+
+`doctor <target-id>` works for administrators and ordinary users. It checks the
+server, version, login, target access, agent availability, network path, and SSH
+service. Ordinary users receive no details about targets they cannot access.
+Checks after a failure are marked `not_checked`. Failed checks include a next
+action and return a nonzero exit status. `status` uses the same failure convention.
+With `--json`, the report remains one JSON object on stdout. Errors go to stderr.
+
+The connection check opens a temporary authorized session through the normal
+route plan. It can take up to the normal 60-second setup budget, plus 12 seconds
+for the SSH identification and connection cleanup. It reads a bounded SSH
+identification, then closes the stream and session. This produces connection
+activity and can appear in server or SSH logs. It does not send an SSH login or
+execute a command. A successful check does not verify the SSH host key or account
+credentials. Use OpenSSH to verify those separately. A failed SSH identification
+check requires inspection of the agent's local SSH address, service, and logs.
+
+These commands require a server that supports the new group-change and
+access-explanation operations. Upgrade the server before using these operations.
+Existing API operations and database schemas are unchanged.
 
 ## Configure a target and access
 
