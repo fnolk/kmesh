@@ -157,20 +157,6 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         },
         cli::Command::Agent { .. } => unreachable!("agent commands run before config loading"),
-        cli::Command::Login(args) => {
-            let context = ClientContext::new(&config).await?;
-            auth::login(&context, args).await?;
-            println!(
-                "Login complete. server={} profile={}",
-                context.api.issuer(),
-                output::cell(&context.config.profile)
-            );
-        }
-        cli::Command::Logout => {
-            let context = ClientContext::new(&config).await?;
-            auth::logout(&context).await?;
-            println!("Logout complete.");
-        }
         cli::Command::Targets { command } => {
             let context = ClientContext::new(&config).await?;
             match command {
@@ -327,7 +313,7 @@ mod tests {
         assert_eq!(config.profile, "ops");
         assert_eq!(
             config.auth.method,
-            Some(crate::config::LoginMethod::PublicKey)
+            Some(crate::config::AuthMethod::PublicKey)
         );
         assert_eq!(config.auth.username.as_deref(), Some("toml-user"));
         assert_eq!(config.auth.key, Some(directory.join("keys/id_ed25519")));
@@ -344,23 +330,28 @@ mod tests {
     #[test]
     fn explicit_config_path_is_required_to_exist() {
         let directory = std::env::temp_dir().join(format!("kmesh-config-{}", Uuid::new_v4()));
-        let cli = Cli::try_parse_from(["kmesh", "--config", directory.to_str().unwrap(), "logout"])
+        let cli = Cli::try_parse_from(["kmesh", "--config", directory.to_str().unwrap(), "status"])
             .expect("parse explicit config argument");
         assert!(load_config_at(&cli, &PathBuf::from("unused-config.toml")).is_err());
     }
 
     #[test]
-    fn non_login_commands_load_config_without_complete_auth_settings() {
+    fn client_commands_load_config_without_complete_auth_settings() {
         let directory = std::env::temp_dir().join(format!("kmesh-config-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).expect("create temporary config directory");
         let config_path = directory.join("config.toml");
         fs::write(&config_path, "server_addr = \"example.test\"\n")
             .expect("write config without login settings");
-        let cli =
-            Cli::try_parse_from(["kmesh", "--config", config_path.to_str().unwrap(), "logout"])
-                .expect("parse non-login command");
+        let cli = Cli::try_parse_from([
+            "kmesh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "targets",
+            "list",
+        ])
+        .expect("parse client command");
 
-        let config = load_config_at(&cli, &config_path).expect("load non-login config");
+        let config = load_config_at(&cli, &config_path).expect("load config without credentials");
         assert!(config.auth.method.is_none());
         assert!(config.auth.token.is_none());
         fs::remove_dir_all(directory).expect("remove temporary config directory");
@@ -375,7 +366,7 @@ mod tests {
             .expect("write config");
 
         let client_cli =
-            Cli::try_parse_from(["kmesh", "--config", config_path.to_str().unwrap(), "logout"])
+            Cli::try_parse_from(["kmesh", "--config", config_path.to_str().unwrap(), "status"])
                 .expect("parse client command");
         assert_eq!(
             load_config_at(&client_cli, &config_path)

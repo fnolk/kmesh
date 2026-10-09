@@ -111,11 +111,11 @@ fn failure_action(error: &anyhow::Error) -> (&'static str, &'static str) {
         ),
         Some(ApiFailure::Authentication(_)) => (
             "Server authentication failed.",
-            "Check the certificates and saved credentials.",
+            "Check the certificates and configured credentials.",
         ),
         Some(ApiFailure::Server { status: 401, .. }) => (
-            "The login is not valid.",
-            "Run kmesh login with a valid credential.",
+            "The server rejected the configured credential.",
+            "Check the configured API token or SSH key.",
         ),
         Some(ApiFailure::Server { status: 403, .. }) => (
             "Access is not permitted.",
@@ -123,7 +123,7 @@ fn failure_action(error: &anyhow::Error) -> (&'static str, &'static str) {
         ),
         _ => (
             "The check could not complete.",
-            "Check the configuration and credentials. Run kmesh login if necessary.",
+            "Check the server configuration and credentials.",
         ),
     }
 }
@@ -174,16 +174,16 @@ async fn identity(context: &ClientContext, report: &mut Report) -> Option<(Strin
             report.user = Some(me.user_id.clone());
             report.platform_role = Some(me.system_role);
             report.add(
-                "login",
+                "credentials",
                 "passed",
-                "The server accepted the current login.",
+                "The server accepted the configured credentials.",
                 "",
             );
             Some((token, me))
         }
         Err(error) => {
             let (detail, next) = failure_action(&error);
-            report.add("login", "failed", detail, next);
+            report.add("credentials", "failed", detail, next);
             None
         }
     }
@@ -192,7 +192,7 @@ async fn identity(context: &ClientContext, report: &mut Report) -> Option<(Strin
 pub(super) async fn status(context: &ClientContext, json: bool) -> Result<()> {
     let mut report = Report::new(context, None);
     identity(context, &mut report).await;
-    report.finish(json, &["server", "version", "routes", "login"])
+    report.finish(json, &["server", "version", "routes", "credentials"])
 }
 
 fn blocker_action(blocker: &str) -> &'static str {
@@ -288,7 +288,14 @@ pub(super) async fn doctor(context: &ClientContext, target: &str, json: bool) ->
     let target = target.trim().to_ascii_lowercase();
     let mut report = Report::new(context, Some(target.clone()));
     let stages = &[
-        "server", "version", "routes", "login", "access", "agent", "network", "sshd",
+        "server",
+        "version",
+        "routes",
+        "credentials",
+        "access",
+        "agent",
+        "network",
+        "sshd",
     ];
     let Some((token, me)) = identity(context, &mut report).await else {
         return report.finish(json, stages);

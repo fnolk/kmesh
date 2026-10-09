@@ -67,11 +67,6 @@ impl Api {
         self.post("auth/refresh", request, None).await
     }
 
-    pub async fn logout(&self, access_token: &str) -> Result<()> {
-        self.request_empty(Method::POST, "auth/logout", None, Some(access_token))
-            .await
-    }
-
     pub async fn me(&self, access_token: &str) -> Result<crate::protocol::MeView> {
         self.get("me", Some(access_token)).await
     }
@@ -150,21 +145,6 @@ impl Api {
     ) -> Result<R> {
         let response = self.request(Method::POST, path, Some(body), bearer).await?;
         decode_response(response).await
-    }
-
-    async fn request_empty(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<serde_json::Value>,
-        bearer: Option<&str>,
-    ) -> Result<()> {
-        let response = self.request(method, path, body.as_ref(), bearer).await?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(response_failure(response).await.into())
-        }
     }
 
     async fn request<T: Serialize>(

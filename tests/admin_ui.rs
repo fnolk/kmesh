@@ -16,6 +16,7 @@ use uuid::Uuid;
 struct Fixture {
     directory: PathBuf,
     port: u16,
+    api_token: Option<String>,
     server: Option<Child>,
 }
 
@@ -28,8 +29,18 @@ impl Fixture {
             .arg("-d")
             .arg(self.directory.join("state"))
             .args(["-s", "127.0.0.1", "-P", &self.port.to_string()])
-            .env_remove("KMESH_TOKEN")
             .env_remove("RUST_LOG");
+        if let Some(token) = &self.api_token {
+            command.env("KMESH_TOKEN", token);
+        } else {
+            command.env_remove("KMESH_TOKEN");
+        }
+        command
+    }
+
+    fn command_with_token(&self, token: &str) -> Command {
+        let mut command = self.command();
+        command.env("KMESH_TOKEN", token);
         command
     }
 
@@ -48,6 +59,23 @@ impl Fixture {
         String::from_utf8(output.stdout).expect("UTF-8 CLI output")
     }
 
+    fn success_with_token(&self, token: &str, args: &[&str]) -> String {
+        let output = self.command_with_token(token).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("UTF-8 CLI output")
+    }
+
+    fn run_with_token(&self, token: &str, args: &[&str]) -> Output {
+        self.command_with_token(token)
+            .args(args)
+            .output()
+            .expect("run test CLI with token")
+    }
+
     fn json(&self, args: &[&str]) -> Value {
         serde_json::from_str(&self.success(args)).expect("one JSON response without a banner")
     }
@@ -59,7 +87,11 @@ impl Fixture {
     fn start_with_relay(private_relay: bool) -> Self {
         let directory = std::env::temp_dir().join(format!("kmesh-admin-ui-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
-        fs::write(directory.join("config.toml"), "").unwrap();
+        fs::write(
+            directory.join("config.toml"),
+            "[auth]\nmethod = \"token\"\n",
+        )
+        .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -69,6 +101,7 @@ impl Fixture {
         let mut fixture = Self {
             directory,
             port,
+            api_token: None,
             server: None,
         };
         let initialized = fixture.success(&["server", "init", "-a", "root"]);
@@ -79,6 +112,7 @@ impl Fixture {
             .split_once(": ")
             .unwrap()
             .1;
+        fixture.api_token = Some(token.to_owned());
         let child = fixture
             .command()
             .args([
@@ -120,17 +154,6 @@ impl Fixture {
             );
             thread::sleep(Duration::from_millis(25));
         }
-        let login = fixture
-            .command()
-            .args(["login", "-m", "token"])
-            .env("KMESH_TOKEN", token)
-            .output()
-            .unwrap();
-        assert!(
-            login.status.success(),
-            "local login failed: {}",
-            String::from_utf8_lossy(&login.stderr)
-        );
         fixture
     }
 }
@@ -257,23 +280,14 @@ fn member_cannot_enter_any_admin_cli_mode() {
         "admin", "tokens", "create", "member", "--label", "cli-test", "--json",
     ]);
     let member_token = issued["data"]["token"].as_str().unwrap();
-    let login = fixture
-        .command()
-        .args(["--profile", "member", "login", "--method", "token"])
-        .env("KMESH_TOKEN", member_token)
-        .output()
-        .expect("run member login");
-    assert!(
-        login.status.success(),
-        "member login failed: {}",
-        String::from_utf8_lossy(&login.stderr)
-    );
-
-    let status = fixture.success(&["--profile", "member", "status", "-j"]);
+    let status = fixture.success_with_token(member_token, &["--profile", "member", "status", "-j"]);
     assert!(!status.contains(member_token));
     let status: Value = serde_json::from_str(&status).unwrap();
     assert_eq!(status["user"], "member");
-    let hidden = fixture.run(&["--profile", "member", "doctor", "hidden", "-j"]);
+    let hidden = fixture.run_with_token(
+        member_token,
+        &["--profile", "member", "doctor", "hidden", "-j"],
+    );
     assert!(!hidden.status.success());
     let hidden: Value = serde_json::from_slice(&hidden.stdout).unwrap();
     assert!(
@@ -300,7 +314,7 @@ fn member_cannot_enter_any_admin_cli_mode() {
             "dev",
         ],
     ] {
-        let output = fixture.run(&args);
+        let output = fixture.run_with_token(member_token, &args);
         assert!(!output.status.success(), "{args:?} entered admin mode");
         assert!(output.stdout.is_empty());
         assert!(
@@ -327,19 +341,7 @@ fn admin_shell_shows_identity_and_exits_after_role_revocation() {
     ]);
     let operator_token = issued["data"]["token"].as_str().unwrap();
     fixture.success(&["admin", "users", "roles", "operator", "admin"]);
-    let login = fixture
-        .command()
-        .args(["--profile", "operator", "login", "--method", "token"])
-        .env("KMESH_TOKEN", operator_token)
-        .output()
-        .expect("log in as operator");
-    assert!(
-        login.status.success(),
-        "operator login failed: {}",
-        String::from_utf8_lossy(&login.stderr)
-    );
-
-    let mut command = fixture.command();
+    let mut command = fixture.command_with_token(operator_token);
     command
         .args(["admin"])
         .stdin(Stdio::piped())
@@ -350,7 +352,7 @@ fn admin_shell_shows_identity_and_exits_after_role_revocation() {
         .stdin
         .take()
         .expect("open admin shell input")
-        .write_all(b"users roles root member\nusers list\nusers create must-not-run\n")
+        .write_all(b"users roles operator member\nusers list\nusers create must-not-run\n")
         .expect("send shell commands");
     let output = shell.wait_with_output().expect("wait for admin shell");
     assert!(
@@ -362,12 +364,12 @@ fn admin_shell_shows_identity_and_exits_after_role_revocation() {
     let stdout = String::from_utf8(output.stdout).expect("read shell output");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stdout.contains("Server: https://127.0.0.1:"));
-    assert!(stdout.contains("User: root"));
+    assert!(stdout.contains("User: operator"));
     assert!(stdout.contains("Platform role: admin"));
     assert!(stderr.contains("Admin access was revoked. The shell is closed."));
     assert!(!stdout.contains("must-not-run"));
 
-    let users = fixture.json(&["--profile", "operator", "admin", "users", "list", "--json"]);
+    let users = fixture.json(&["admin", "users", "list", "--json"]);
     assert!(
         !users["data"]
             .as_array()
@@ -430,7 +432,7 @@ fn group_changes_preview_impacts_and_require_explicit_clear() {
 }
 
 #[test]
-fn diagnostics_distinguish_authorization_offline_and_login_failures() {
+fn diagnostics_distinguish_authorization_offline_and_credential_failures() {
     let f = Fixture::start();
     let status = f.json(&["status", "-j"]);
     assert_eq!(status["user"], "root");
@@ -477,16 +479,19 @@ fn diagnostics_distinguish_authorization_offline_and_login_failures() {
         missing["blockers"],
         serde_json::json!(["target_unavailable"])
     );
-    f.success(&["logout"]);
-    let logged_out = f.run(&["status", "-j"]);
-    assert!(!logged_out.status.success());
-    let report: Value = serde_json::from_slice(&logged_out.stdout).unwrap();
+    let invalid = f
+        .command_with_token("invalid-api-token")
+        .args(["status", "-j"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    let report: Value = serde_json::from_slice(&invalid.stdout).unwrap();
     assert!(
         report["checks"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["stage"] == "login" && c["status"] == "failed")
+            .any(|c| c["stage"] == "credentials" && c["status"] == "failed")
     );
 }
 

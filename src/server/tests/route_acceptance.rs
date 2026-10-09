@@ -12,12 +12,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use iroh::endpoint::VarInt;
 use iroh::{EndpointAddr, SecretKey};
 use iroh_relay::server::{Access, AccessControl, ClientRequest, DynAccessControl};
-use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -47,7 +45,6 @@ use super::{
 };
 
 const LOCAL_PRIVATE_QAD: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3478);
-const ADMIN_USERNAME: &str = "admin";
 const SSH_BANNER: &[u8] = b"SSH-2.0-kmesh-route-fixture\r\n";
 const SSH_REQUEST: &[u8] = b"kmesh fixture command\n";
 const SSH_RESPONSE: &[u8] = b"fixture command output\n";
@@ -157,7 +154,7 @@ impl LocalServer {
                 .context("issuer has no port")?,
             data_dir,
             auth: crate::config::AuthConfig {
-                method: Some(crate::config::LoginMethod::Token),
+                method: Some(crate::config::AuthMethod::Token),
                 token: Some(self.fixture.admin_token.clone()),
                 ..crate::config::AuthConfig::default()
             },
@@ -810,9 +807,8 @@ fn client_binary() -> Result<PathBuf> {
 }
 
 async fn run_client_cli(
-    mode: &str,
     config_path: &Path,
-    target_id: Option<String>,
+    target_id: &str,
     stdin: &[u8],
     budget: Duration,
 ) -> Result<Output> {
@@ -824,17 +820,7 @@ async fn run_client_cli(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    match mode {
-        "login" => {
-            command.args(["login", "--method", "token"]);
-        }
-        "proxy" => {
-            command
-                .arg("proxy")
-                .arg(target_id.context("proxy CLI requires a target ID")?);
-        }
-        other => bail!("unknown route acceptance CLI operation {other}"),
-    }
+    command.arg("proxy").arg(target_id);
     let mut child = command.spawn().context("spawn kmesh client CLI")?;
     if !stdin.is_empty() {
         child
@@ -851,16 +837,6 @@ async fn run_client_cli(
         .await
         .context("client CLI child deadline elapsed")?
         .context("wait for client CLI child")
-}
-
-async fn login_client(config_path: &Path) -> Result<()> {
-    let output = run_client_cli("login", config_path, None, &[], Duration::from_secs(15)).await?;
-    ensure!(
-        output.status.success(),
-        "client CLI token login failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
 }
 
 async fn enroll_and_grant_target(server: &LocalServer) -> Result<(String, String, SecretKey)> {
@@ -887,14 +863,7 @@ async fn start_ssh_fixture() -> Result<(SocketAddr, JoinHandle<Result<Vec<u8>>>)
 }
 
 async fn run_proxy(config_path: &Path, target_id: &str, stdin: &[u8]) -> Result<Output> {
-    run_client_cli(
-        "proxy",
-        config_path,
-        Some(target_id.to_owned()),
-        stdin,
-        Duration::from_secs(70),
-    )
-    .await
+    run_client_cli(config_path, target_id, stdin, Duration::from_secs(70)).await
 }
 
 fn assert_proxy_response(output: &Output) -> Result<()> {
@@ -949,52 +918,6 @@ async fn client_auth_failure_is_terminal_for_online_ungranted_target() {
         let (target_id, agent_token) =
             create_enrolled_target(server.state(), "route-auth-denied-target", &device_key).await;
         let config_path = server.client_config()?;
-        let client_data_dir = server.fixture.data_dir.join("route-client-state");
-        let profiles_dir = client_data_dir.join("profiles");
-        let hash_component = |value: &str| URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()));
-        let profile_dir = profiles_dir
-            .join(hash_component(&server.issuer))
-            .join(hash_component("route-acceptance"));
-        fs::create_dir_all(&profile_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for directory in [
-                client_data_dir.as_path(),
-                profiles_dir.as_path(),
-                profile_dir.as_path(),
-            ] {
-                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-            }
-        }
-        let saved_login = serde_json::json!({
-            "server_url": server.issuer.clone(),
-            "profile": "route-acceptance",
-            "username": ADMIN_USERNAME,
-            "credential": {
-                "kind": "api_token",
-                "credential": {
-                    "token": server.fixture.admin_token.clone(),
-                    "expires_at": null,
-                },
-            },
-        });
-        let login_path = profile_dir.join(format!("{}.json", hash_component(ADMIN_USERNAME)));
-        fs::write(login_path, serde_json::to_vec(&saved_login)?)?;
-        fs::write(profile_dir.join("active-user"), ADMIN_USERNAME)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                profile_dir.join(format!("{}.json", hash_component(ADMIN_USERNAME))),
-                fs::Permissions::from_mode(0o600),
-            )?;
-            fs::set_permissions(
-                profile_dir.join("active-user"),
-                fs::Permissions::from_mode(0o600),
-            )?;
-        }
-
         let _agent_control =
             connect_control_ws(&server.issuer, "agent/control", &agent_token).await;
         wait_target_online(server.state(), &target_id).await?;
@@ -1061,8 +984,6 @@ async fn client_routes_real_direct_timeouts_to_private_relay_ssh_stream() {
         let server = LocalServer::start().await?;
         let (target_id, agent_token, device_key) = enroll_and_grant_target(&server).await?;
         let config_path = server.client_config()?;
-        login_client(&config_path).await?;
-
         let (ssh_addr, ssh_task) = start_ssh_fixture().await?;
         let (output, target_evidence) = tokio::join!(
             run_proxy(&config_path, &target_id, SSH_REQUEST),
@@ -1175,7 +1096,6 @@ async fn client_reports_real_private_relay_refusal_after_direct_timeouts() {
         let server = LocalServer::start().await?;
         let (target_id, agent_token, device_key) = enroll_and_grant_target(&server).await?;
         let config_path = server.client_config()?;
-        login_client(&config_path).await?;
         let (output, target_evidence) = tokio::join!(
             run_proxy(&config_path, &target_id, &[]),
             drive_target(&server, &target_id, agent_token, device_key, true, None)

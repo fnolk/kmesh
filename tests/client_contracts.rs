@@ -175,46 +175,9 @@ fn cli_splits_server_address_and_ports_and_removes_server_url() {
 }
 
 #[test]
-fn cli_accepts_token_and_public_key_login_inputs() {
-    let cli = Cli::try_parse_from([
-        "kmesh",
-        "login",
-        "--method",
-        "public-key",
-        "--username",
-        "alice",
-        "--key",
-        "~/.ssh/id_ed25519",
-    ])
-    .expect("parse public-key login overrides");
-    let kmesh::client::Command::Login(args) = cli.command else {
-        panic!("expected login command");
-    };
-    assert_eq!(args.method, Some(kmesh::config::LoginMethod::PublicKey));
-    assert_eq!(args.username.as_deref(), Some("alice"));
-    assert_eq!(
-        args.key.as_deref(),
-        Some(std::path::Path::new("~/.ssh/id_ed25519"))
-    );
-
-    let cli = Cli::try_parse_from([
-        "kmesh",
-        "login",
-        "--method",
-        "token",
-        "--token",
-        "eyJhbGciOiJFZERTQSJ9.eyJhdWQiOiJrbWVzaC1hcGktdG9rZW4ifQ.signature",
-    ])
-    .expect("parse token login override");
-    let kmesh::client::Command::Login(args) = cli.command else {
-        panic!("expected login command");
-    };
-    assert_eq!(args.method, Some(kmesh::config::LoginMethod::Token));
-    assert_eq!(
-        args.token.as_deref(),
-        Some("eyJhbGciOiJFZERTQSJ9.eyJhdWQiOiJrbWVzaC1hcGktdG9rZW4ifQ.signature")
-    );
-    assert!(Cli::try_parse_from(["kmesh", "login", "--password-stdin"]).is_err());
+fn cli_has_no_separate_login_or_logout_commands() {
+    assert!(Cli::try_parse_from(["kmesh", "login"]).is_err());
+    assert!(Cli::try_parse_from(["kmesh", "logout"]).is_err());
 }
 
 #[test]
@@ -281,6 +244,7 @@ fn ssh_config_uses_stable_alias_and_shell_safe_proxy_arguments() {
     assert!(!rendered.contains("--config"));
     assert!(!rendered.contains("--data-dir"));
     assert!(!rendered.contains("--profile"));
+    assert!(!rendered.contains("--token"));
     let host_key_alias = rendered
         .lines()
         .find_map(|line| line.strip_prefix("    HostKeyAlias "))

@@ -32,7 +32,9 @@ Copy [`config.example.toml`](config.example.toml) to `~/.kmesh/config.toml` and 
 kmesh server init --admin admin
 ```
 
-The first initialization prints the initial administrator API JWT once. Store it in `KMESH_TOKEN` or in the local `[auth] token` setting. Start the service; its mTLS server identity is embedded in the binary:
+The first initialization prints the initial administrator API JWT once. Set
+`[auth].method = "token"` and store the value in `KMESH_TOKEN` or `[auth].token`.
+Start the service; its mTLS server identity is embedded in the binary:
 
 ```sh
 kmesh server run
@@ -159,7 +161,7 @@ All group commands accept `--json`. The existing replacement command retains its
 Incremental commands and previews use `result: "group_change"`. Human-readable
 previews go to stderr before a write. JSON results go only to stdout.
 
-## Check login, access, and connections
+## Check credentials, access, and connections
 
 ```sh
 kmesh status
@@ -170,9 +172,9 @@ kmesh doctor build-machine --json
 ```
 
 `status` checks the HTTPS service, version compatibility, available route settings,
-and the current login. It shows the server, profile, client version, user, and
-platform role. It never prints tokens or private keys. A public-key session can
-refresh through the normal login mechanism.
+and the configured credentials. It shows the server, profile, client version,
+user, and platform role. It never prints tokens or private keys. A public-key
+session is created or refreshed when a command needs it.
 
 `access explain <user-id> <target-id>` requires the admin platform role. It shows
 access groups, granting groups, permission blockers, and agent availability.
@@ -182,8 +184,8 @@ reported separately. Platform admin status does not grant SSH access. This comma
 returns success when it produces an explanation, including an access denial.
 
 `doctor <target-id>` works for administrators and ordinary users. It checks the
-server, version, login, target access, agent availability, network path, and SSH
-service. Ordinary users receive no details about targets they cannot access.
+server, version, credentials, target access, agent availability, network path,
+and SSH service. Ordinary users receive no details about targets they cannot access.
 Checks after a failure are marked `not_checked`. Failed checks include a next
 action and return a nonzero exit status. `status` uses the same failure convention.
 With `--json`, the report remains one JSON object on stdout. Errors go to stderr.
@@ -192,8 +194,8 @@ The connection check opens a temporary authorized session through the normal
 route plan. It can take up to the normal 60-second setup budget, plus 12 seconds
 for the SSH identification and connection cleanup. It reads a bounded SSH
 identification, then closes the stream and session. This produces connection
-activity and can appear in server or SSH logs. It does not send an SSH login or
-execute a command. A successful check does not verify the SSH host key or account
+activity and can appear in server or SSH logs. It does not authenticate to the
+SSH account or execute a command. A successful check does not verify the SSH host key or account
 credentials. Use OpenSSH to verify those separately. A failed SSH identification
 check requires inspection of the agent's local SSH address, service, and logs.
 
@@ -203,14 +205,23 @@ Existing API operations and database schemas are unchanged.
 
 ## Configure a target and access
 
-On an administrator workstation, log in and create the target, user, access group, and grant. New users have the `member` platform role and no access groups. The fixed platform roles are `member` and `admin`. Access group IDs are the trimmed names with ASCII letters lowercased. Target names at creation and rename use a 1–64 character ASCII slug (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`; the first character is alphanumeric). On creation, the lowercase name becomes the fixed target ID while its casing remains the display name. Rename changes the name and OpenSSH alias while preserving the ID. Admin commands refer to users, access groups, and targets by ID. Platform roles use the fixed values `member` and `admin`.
+On an administrator workstation, configure credentials and create the target, user, access group, and grant. New users have the `member` platform role and no access groups. The fixed platform roles are `member` and `admin`. Access group IDs are the trimmed names with ASCII letters lowercased. Target names at creation and rename use a 1–64 character ASCII slug (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`; the first character is alphanumeric). On creation, the lowercase name becomes the fixed target ID while its casing remains the display name. Rename changes the name and OpenSSH alias while preserving the ID. Admin commands refer to users, access groups, and targets by ID. Platform roles use the fixed values `member` and `admin`.
 
 Target creation and enrollment issue commands show a complete enrollment command. The command includes `--server-port` only when the server uses a port other than `9443`.
 
 `ssh-config` scopes `HostKeyAlias` by the canonical server origin and target ID. Agent state uses the selected data directory and target ID. Use a separate data directory for each server when target IDs are equal.
 
+To use API token authentication, set `[auth].method = "token"` in
+`~/.kmesh/config.toml`. Set `KMESH_TOKEN` or store the token in `[auth].token`.
+The environment variable takes priority.
+
+```toml
+[auth]
+method = "token"
+token = "<signed API JWT>"
+```
+
 ```sh
-kmesh login --method token
 kmesh admin targets create build-machine
 kmesh admin users create alice
 kmesh admin tokens create alice --label laptop
@@ -228,13 +239,9 @@ targets, credentials, or relay traffic:
 kmesh admin users roles alice admin
 ```
 
-API JWTs created by `server init` and `admin tokens create` are shown once. They act as Bearer credentials directly. Omitting `--expires-in` creates a long-lived JWT; `--expires-in <seconds>` sets its lifetime. With `KMESH_TOKEN` set, run `kmesh login --method token`; when `[auth].method = "token"` is in the config, you can run `kmesh login`. A command-line `--token` takes priority over `KMESH_TOKEN`, which takes priority over `[auth].token`. Login validates the JWT with the server and saves that same JWT for later API and control requests. An expired JWT requires a replacement token and another `kmesh login`; token authentication does not use refresh tokens. Public-key login keeps its separate access and refresh session. Start the interactive shell with the same server origin:
+API JWTs created by `server init` and `admin tokens create` are shown once. They act as Bearer credentials directly. Omitting `--expires-in` creates a long-lived JWT; `--expires-in <seconds>` sets its lifetime. Each command sends the configured token directly to the server. Replace an expired token in its source. Token authentication does not use refresh tokens. Public-key authentication uses a separate access and refresh session.
 
-```toml
-[auth]
-method = "token"
-token = "<signed API JWT>"
-```
+Start the interactive shell with the same server origin:
 
 ```sh
 kmesh admin
@@ -249,17 +256,15 @@ kmesh admin tokens revoke <token-id>
 
 Inside the shell, `help` and Tab completion are available. One-shot admin commands accept `--json` for machine-readable output. Use `--server-addr` and `--server-port` to override the configured server for one command.
 
-For public-key kmesh login, register the user's SSH public key and use `ssh-keygen` for the SSHSIG challenge:
+For public-key authentication, register the user's SSH public key and configure the SSH private key for the SSHSIG challenge:
 
 ```sh
 kmesh admin keys add <alice-user-id> ~/.ssh/id_ed25519.pub --label laptop
-kmesh login \
-  --method public-key --username alice --key ~/.ssh/id_ed25519
 ```
 
 The challenge signature binds the server-provided payload and uses the `kmesh-login` namespace. kmesh sends the public key and signature; the private key stays with OpenSSH or ssh-agent.
 
-Set `[auth] method = "public-key"`, `username`, and `key` in `~/.kmesh/config.toml` to omit those options from future logins:
+Set `[auth] method = "public-key"`, `username`, and `key` in `~/.kmesh/config.toml`. Commands then authenticate with this SSH key when required:
 
 ```toml
 [auth]
@@ -268,7 +273,8 @@ username = "alice"
 key = "~/.ssh/id_ed25519"
 ```
 
-Login settings from CLI options override TOML. Choose an explicit login method: `token` or `public-key`.
+For an encrypted key held by `ssh-agent`, set `key` to its `.pub` file. Keep the
+private key loaded in the agent when kmesh needs to sign a challenge.
 
 On the target machine, enroll the target agent and start it:
 
@@ -282,23 +288,24 @@ The agent stores its server address, credentials, device identity, and SSH setti
 
 The default local SSH address is `127.0.0.1:22`, and the default time limit is 10 seconds. Use `--ssh-address` and `--ssh-connect-timeout-secs` during enrollment to change these values. The `agent run` command reads its run settings from the agent state in this data directory. If you set `--data-dir` during enrollment, use the same value with `agent run`. The enrollment result prints the full run command.
 
-`profile` selects a separate local credential namespace. For example, `kmesh --profile work login ...` saves tokens separately from the `default` profile, so the same server and username can have independent sign-ins. Saved credentials are scoped by server, profile, and normalized username; the profile does not affect routing or server-side access permissions.
+`profile` selects a separate local public-key session cache. For example, `kmesh --profile work targets list` keeps its cached session separate from the `default` profile. The cache is scoped by server, profile, username, and SSH public-key fingerprint. The profile does not affect routing or server-side access permissions.
 
 Client config contains the server address. Enrollment stores the target's local SSH address and time limit in agent state. Remove the old `[ssh]` section from existing `config.toml` files. Set the target's SSH values during agent enrollment. There are no client-side STUN server or UDP bind overrides. The proxy and agent discover the private relay URL and QAD port from the server's authenticated `/v1/transport` response. `PrivateDirect` observes B's QAD at the configured server UDP port and an official reflector; `PublicDirect` observes official Iroh QAD reflectors only.
 
 ## Connect with OpenSSH
 
-On the client, log in and write an OpenSSH host block:
+On the client, configure credentials and write an OpenSSH host block:
 
 ```sh
-kmesh login --method token
 kmesh ssh-config build-machine >> ~/.ssh/config
 ssh build-machine
 ```
 
 The generated block sets `ProxyCommand`, a stable `HostKeyAlias`, and OpenSSH `ControlMaster` reuse. The first SSH connection establishes its path; subsequent SSH/SCP/SFTP commands can reuse the OpenSSH control connection. Each underlying transport has one session ID and fresh client/target data EndpointIds. The server checks current RBAC when opening the session and again during activation, after both peers report the selected route and the target reports Iroh readiness. Once activated, the stream runs to completion after permission changes or control-plane disconnection; kmesh does not retry or switch routes mid-SSH. Standard SSH host-key checks remain active. Add the target's verified SSH host key to the client's `known_hosts` before connecting.
 
-The kmesh login state is separated by server origin, profile, and normalized username. Login credentials and agent state files use mode `0600`; their directories use mode `0700`. Public-key session refresh tokens rotate under a cross-process file lock. A refresh with an uncertain network result clears the local login and asks the user to sign in again. Enroll each existing agent again to create state in the new directory layout.
+The generated `ProxyCommand` receives the selected config path and server options. It inherits `KMESH_TOKEN` from the `ssh` process. Set the same token source or public-key settings in that config file.
+
+The public-key session cache is separated by server, profile, username, and configured key fingerprint. Cached sessions and agent state files use mode `0600`; their directories use mode `0700`. Public-key session refresh tokens rotate under a cross-process file lock. If refresh has an uncertain result, kmesh clears the cache and reports the error. Run the command again to authenticate with the configured SSH key. Enroll each existing agent again to create state in the new directory layout.
 
 ## Build-time mTLS certificates
 

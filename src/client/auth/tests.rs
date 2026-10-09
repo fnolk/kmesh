@@ -10,10 +10,10 @@ use std::{
     time::Duration,
 };
 
-use clap::Parser;
+use serde::{Serialize, de::DeserializeOwned};
 use ssh_key::{PublicKey, SshSig};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
     sync::oneshot,
     time::{sleep, timeout},
@@ -23,21 +23,21 @@ use uuid::Uuid;
 
 use crate::{
     client::{
-        Cli, ClientContext, Command as ClientCommand,
+        ClientContext,
         api::Api,
-        profile::{ProfileStore, SavedCredential, SavedLogin},
+        profile::{ProfileStore, SavedSession},
     },
-    config::{AuthConfig, Config, LoginMethod},
-    protocol::{LoginTokens, MeView},
+    config::{AuthConfig, AuthMethod, Config},
+    protocol::{LoginTokens, PublicKeyChallenge, PublicKeyChallengeRequest, PublicKeyLoginRequest},
 };
 
 use super::*;
 
 const REFRESH_CHILD_ENV: &str = "KMESH_TEST_REFRESH_CHILD";
+const TOKEN_CHILD_ENV: &str = "KMESH_TEST_TOKEN_CHILD";
 const SSH_AGENT_CHILD_PUBLIC_KEY_ENV: &str = "KMESH_TEST_SSH_AGENT_PUBLIC_KEY";
 const SSH_AGENT_CHILD_INPUT_ENV: &str = "KMESH_TEST_SSH_AGENT_INPUT";
 const SSH_AGENT_CHILD_OUTPUT_ENV: &str = "KMESH_TEST_SSH_AGENT_OUTPUT";
-const TOKEN_ENV_CHILD: &str = "KMESH_TEST_TOKEN_ENV_CHILD";
 
 struct TestDirectory(PathBuf);
 
@@ -79,153 +79,6 @@ async fn auth_context(config: Config) -> ClientContext {
         config,
         api,
         profiles,
-    }
-}
-
-#[tokio::test]
-async fn login_reports_missing_method_token_username_and_key_before_network() {
-    let context = auth_context(Config::default()).await;
-    let error = super::login(&context, &LoginArgs::default())
-        .await
-        .expect_err("login requires an explicit method");
-    assert!(format!("{error:#}").contains("Login method is required"));
-
-    let context = auth_context(Config {
-        auth: AuthConfig {
-            method: Some(LoginMethod::Token),
-            ..AuthConfig::default()
-        },
-        ..Config::default()
-    })
-    .await;
-    let error = super::login(&context, &LoginArgs::default())
-        .await
-        .expect_err("token login requires a token");
-    assert!(format!("{error:#}").contains("API token is required"));
-
-    let context = auth_context(Config {
-        auth: AuthConfig {
-            method: Some(LoginMethod::PublicKey),
-            key: Some("/tmp/id_ed25519".into()),
-            ..AuthConfig::default()
-        },
-        ..Config::default()
-    })
-    .await;
-    let error = super::login(&context, &LoginArgs::default())
-        .await
-        .expect_err("public-key login requires a username");
-    assert!(format!("{error:#}").contains("--username or auth.username"));
-
-    let context = auth_context(Config {
-        auth: AuthConfig {
-            method: Some(LoginMethod::PublicKey),
-            username: Some("alice".to_owned()),
-            ..AuthConfig::default()
-        },
-        ..Config::default()
-    })
-    .await;
-    let error = super::login(&context, &LoginArgs::default())
-        .await
-        .expect_err("public-key login requires a key");
-    assert!(format!("{error:#}").contains("--key or auth.key"));
-}
-
-#[tokio::test]
-async fn cli_public_key_settings_override_toml_and_expand_home_key_path() {
-    let cli = Cli::try_parse_from([
-        "kmesh",
-        "login",
-        "--method",
-        "public-key",
-        "--username",
-        "cli-user",
-        "--key",
-        "~/kmesh-login-test-missing-key",
-    ])
-    .expect("parse public-key login overrides");
-    let ClientCommand::Login(args) = cli.command else {
-        panic!("expected login command");
-    };
-    let context = auth_context(Config {
-        auth: AuthConfig {
-            method: Some(LoginMethod::Token),
-            key: Some("/config-only-key".into()),
-            token: Some("toml-token".to_owned()),
-            ..AuthConfig::default()
-        },
-        ..Config::default()
-    })
-    .await;
-    let error = super::login(&context, &args)
-        .await
-        .expect_err("CLI public-key method overrides TOML and reads CLI key");
-    let expected_key = dirs::home_dir()
-        .expect("home directory")
-        .join("kmesh-login-test-missing-key");
-    assert!(format!("{error:#}").contains(&expected_key.display().to_string()));
-}
-
-#[tokio::test]
-async fn token_env_precedence_child() {
-    let Ok(mode) = std::env::var(TOKEN_ENV_CHILD) else {
-        return;
-    };
-    let cli = if mode == "cli" {
-        Cli::try_parse_from(["kmesh", "login", "--method", "token", "--token", ""])
-    } else {
-        Cli::try_parse_from(["kmesh", "login"])
-    }
-    .expect("parse child login command");
-    let ClientCommand::Login(args) = cli.command else {
-        panic!("expected login command");
-    };
-    let context = auth_context(Config {
-        auth: AuthConfig {
-            method: Some(LoginMethod::Token),
-            token: Some("toml-token".to_owned()),
-            ..AuthConfig::default()
-        },
-        ..Config::default()
-    })
-    .await;
-    let error = super::login(&context, &args)
-        .await
-        .expect_err("empty CLI/environment token overrides TOML");
-    assert!(format!("{error:#}").contains("API token is empty"));
-}
-
-#[tokio::test]
-async fn cli_token_and_environment_override_toml_in_isolated_processes() {
-    let executable = std::env::current_exe().expect("resolve auth test executable");
-    for (mode, environment_token) in [("cli", "environment-token"), ("environment", "")] {
-        let output = Command::new(&executable)
-            .args([
-                "--exact",
-                "client::auth::tests::token_env_precedence_child",
-                "--nocapture",
-            ])
-            .env(TOKEN_ENV_CHILD, mode)
-            .env("KMESH_TOKEN", environment_token)
-            .output()
-            .expect("run token precedence child process");
-        assert!(output.status.success(), "token precedence child passed");
-    }
-}
-
-struct SshAgent {
-    socket: String,
-    pid: String,
-}
-
-impl Drop for SshAgent {
-    fn drop(&mut self) {
-        let _ = Command::new("ssh-agent")
-            .arg("-k")
-            .env("SSH_AUTH_SOCK", &self.socket)
-            .env("SSH_AGENT_PID", &self.pid)
-            .output();
     }
 }
 
@@ -274,6 +127,92 @@ async fn read_http_request(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
     request
 }
 
+fn request_json<T: DeserializeOwned>(request: &[u8]) -> T {
+    let body_offset = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("HTTP request headers end")
+        + 4;
+    serde_json::from_slice(&request[body_offset..]).expect("decode HTTP request body")
+}
+
+async fn respond_json(stream: &mut (impl AsyncWrite + Unpin), value: &impl Serialize) {
+    let body = serde_json::to_vec(value).expect("encode HTTP response");
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .await
+        .expect("write HTTP response headers");
+    stream
+        .write_all(&body)
+        .await
+        .expect("write HTTP response body");
+    stream.shutdown().await.expect("close HTTP response");
+}
+
+async fn one_public_key_authentication(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    expected_public_key: String,
+    tokens: LoginTokens,
+) {
+    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("challenge request arrives")
+        .expect("accept challenge request");
+    let mut stream = timeout(Duration::from_secs(5), acceptor.accept(socket))
+        .await
+        .expect("challenge HTTPS handshake completes")
+        .expect("accept challenge HTTPS");
+    let request = timeout(Duration::from_secs(5), read_http_request(&mut stream))
+        .await
+        .expect("challenge request completes");
+    let request_text = String::from_utf8_lossy(&request);
+    assert!(request_text.starts_with("POST /v1/auth/challenge "));
+    let challenge_request: PublicKeyChallengeRequest = request_json(&request);
+    assert_eq!(challenge_request.username, "alice");
+    assert_eq!(challenge_request.public_key, expected_public_key);
+
+    let challenge_bytes = b"server challenge payload";
+    let challenge_id = Uuid::new_v4();
+    respond_json(
+        &mut stream,
+        &PublicKeyChallenge {
+            challenge_id,
+            challenge: URL_SAFE_NO_PAD.encode(challenge_bytes),
+            expires_at: unix_now().expect("current time") + 60,
+        },
+    )
+    .await;
+
+    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("signature request arrives")
+        .expect("accept signature request");
+    let mut stream = timeout(Duration::from_secs(5), acceptor.accept(socket))
+        .await
+        .expect("signature HTTPS handshake completes")
+        .expect("accept signature HTTPS");
+    let request = timeout(Duration::from_secs(5), read_http_request(&mut stream))
+        .await
+        .expect("signature request completes");
+    let request_text = String::from_utf8_lossy(&request);
+    assert!(request_text.starts_with("POST /v1/auth/public-key "));
+    let login_request: PublicKeyLoginRequest = request_json(&request);
+    assert_eq!(login_request.username, "alice");
+    assert_eq!(login_request.challenge_id, challenge_id);
+    let signature = SshSig::from_pem(login_request.signature.as_bytes())
+        .expect("parse SSHSIG challenge signature");
+    PublicKey::from_openssh(&expected_public_key)
+        .expect("parse SSH public key")
+        .verify("kmesh-login", challenge_bytes, &signature)
+        .expect("verify configured SSH key signed the challenge");
+    respond_json(&mut stream, &tokens).await;
+}
+
 async fn one_refresh_request(
     listener_and_acceptor: (TcpListener, TlsAcceptor),
     expected_refresh_token: &'static str,
@@ -295,11 +234,9 @@ async fn one_refresh_request(
     let request = timeout(Duration::from_secs(5), read_http_request(&mut stream))
         .await
         .expect("refresh HTTP request completes");
-    assert!(
-        request
-            .windows(expected_refresh_token.len())
-            .any(|window| window == expected_refresh_token.as_bytes()),
-        "request contains the saved refresh credential"
+    assert_eq!(
+        request_json::<crate::protocol::RefreshRequest>(&request).refresh_token,
+        expected_refresh_token
     );
     request_count.fetch_add(1, Ordering::SeqCst);
     if let Some(request_seen) = request_seen {
@@ -314,228 +251,171 @@ async fn one_refresh_request(
         sleep(delay).await;
     }
     if let Some(reply) = reply {
-        let body = serde_json::to_vec(&reply).expect("encode refresh response");
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream
-            .write_all(headers.as_bytes())
-            .await
-            .expect("write refresh response headers");
-        stream
-            .write_all(&body)
-            .await
-            .expect("write refresh response body");
-        stream.shutdown().await.expect("close refresh response");
+        respond_json(&mut stream, &reply).await;
     }
 }
 
-async fn one_api_jwt_me_request(
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
-    expected_token: String,
-    me: MeView,
-) {
-    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .expect("API JWT validation request arrives")
-        .expect("accept API JWT validation request");
-    let mut stream = timeout(Duration::from_secs(5), acceptor.accept(socket))
-        .await
-        .expect("HTTPS handshake completes")
-        .expect("accept HTTPS validation request");
-    let request = timeout(Duration::from_secs(5), read_http_request(&mut stream))
-        .await
-        .expect("validation HTTP request completes");
-    let request_text = String::from_utf8_lossy(&request);
-    assert!(request_text.to_ascii_lowercase().starts_with("get /v1/me "));
-    let authorization = request_text
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("authorization")
-                .then(|| value.trim().to_owned())
-        })
-        .expect("API JWT validation request includes Authorization");
-    assert_eq!(authorization, format!("Bearer {expected_token}"));
-    let response = serde_json::to_vec(&me).expect("encode current user");
-    let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.len()
-    );
-    stream
-        .write_all(headers.as_bytes())
-        .await
-        .expect("write validation response headers");
-    stream
-        .write_all(&response)
-        .await
-        .expect("write validation response body");
-    stream.shutdown().await.expect("close validation response");
+#[tokio::test]
+async fn token_environment_overrides_config_and_token_is_returned_directly() {
+    let executable = std::env::current_exe().expect("resolve auth test executable");
+    for (mode, environment_token) in [
+        ("config", None),
+        ("environment", Some("environment-token")),
+        ("empty", Some("")),
+    ] {
+        let mut command = Command::new(&executable);
+        command
+            .args([
+                "--exact",
+                "client::auth::tests::token_environment_child",
+                "--nocapture",
+            ])
+            .env(TOKEN_CHILD_ENV, mode);
+        if let Some(token) = environment_token {
+            command.env("KMESH_TOKEN", token);
+        } else {
+            command.env_remove("KMESH_TOKEN");
+        }
+        let output = command.output().expect("run isolated token test process");
+        assert!(
+            output.status.success(),
+            "isolated token process succeeds: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[tokio::test]
-async fn api_jwt_login_uses_the_token_directly_and_saves_that_credential() {
-    let directory = TestDirectory::new("token-login-test");
+async fn token_environment_child() {
+    let Ok(mode) = std::env::var(TOKEN_CHILD_ENV) else {
+        return;
+    };
+    let directory = TestDirectory::new("token-source-test");
+    let context = auth_context(Config {
+        data_dir: directory.0.clone(),
+        auth: AuthConfig {
+            method: Some(AuthMethod::Token),
+            token: Some("config-token".to_owned()),
+            ..AuthConfig::default()
+        },
+        ..Config::default()
+    })
+    .await;
+    match mode.as_str() {
+        "config" => assert_eq!(
+            super::valid_access_token(&context).await.unwrap(),
+            "config-token"
+        ),
+        "environment" => assert_eq!(
+            super::valid_access_token(&context).await.unwrap(),
+            "environment-token"
+        ),
+        "empty" => assert_eq!(
+            super::valid_access_token(&context)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "API token is empty"
+        ),
+        mode => panic!("unexpected token test mode {mode}"),
+    }
+    assert!(!context.profiles.session_path("alice").exists());
+}
+
+#[tokio::test]
+async fn missing_auth_method_reports_the_required_config_setting() {
+    let context = auth_context(Config::default()).await;
+    let error = super::valid_access_token(&context)
+        .await
+        .expect_err("authentication requires a configured method");
+    assert_eq!(
+        error.to_string(),
+        "Set [auth].method to token or public-key in the configuration."
+    );
+}
+
+#[tokio::test]
+async fn configured_ssh_key_authenticates_on_demand_and_session_matches_key_identity() {
+    let directory = TestDirectory::new("on-demand-public-key-test");
+    let old_key_path = generate_ssh_key(&directory.0, "old_id_ed25519");
+    let key_path = generate_ssh_key(&directory.0, "id_ed25519");
+    let expected_public_key = public_key(&key_path).expect("extract configured public key");
+    let expected_fingerprint = public_key_fingerprint(&expected_public_key).unwrap();
+    let old_fingerprint = public_key_fingerprint(&public_key(&old_key_path).unwrap()).unwrap();
     let acceptor = test_tls_acceptor();
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
-        .expect("bind local token login server");
+        .expect("bind local public-key auth server");
     let server_port = listener.local_addr().unwrap().port();
     let now = unix_now().unwrap();
-    let me = MeView {
-        user_id: "alice".to_owned(),
-        username: "Alice".to_owned(),
-        enabled: true,
-        system_role: crate::protocol::SystemRole::Member,
-        access_groups: Vec::new(),
+    let tokens = LoginTokens {
+        access_token: "fresh-access-token".to_owned(),
+        refresh_token: "fresh-refresh-token".to_owned(),
+        access_expires_at: now + 900,
+        refresh_expires_at: now + 30 * 24 * 60 * 60,
     };
-    let claims = crate::protocol::ApiTokenClaims {
-        sub: "alice".to_owned(),
-        jti: Uuid::new_v4(),
-        iss: "https://test.invalid".to_owned(),
-        aud: crate::identity::API_TOKEN_AUDIENCE.to_owned(),
-        iat: now,
-        exp: Some(now + 3600),
-    };
-    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-    let expected_token = format!("e30.{payload}.signature");
-    let server = tokio::spawn(one_api_jwt_me_request(
+    let server = tokio::spawn(one_public_key_authentication(
         listener,
         acceptor,
-        expected_token.clone(),
-        me,
+        expected_public_key.clone(),
+        tokens.clone(),
     ));
-    let config = Config {
+    let context = auth_context(Config {
         server_addr: "127.0.0.1".to_owned(),
         server_port,
         data_dir: directory.0.clone(),
         auth: AuthConfig {
-            method: Some(LoginMethod::Token),
-            token: Some(expected_token.clone()),
+            method: Some(AuthMethod::PublicKey),
+            username: Some("Alice".to_owned()),
+            key: Some(key_path),
             ..AuthConfig::default()
         },
         ..Config::default()
-    };
-    let context = auth_context(config).await;
-
-    super::login(&context, &LoginArgs::default())
-        .await
-        .expect("login with configured API JWT");
-    server.await.expect("token login server completes");
-
-    assert_eq!(context.profiles.active_user().unwrap(), "alice");
-    let saved = context.profiles.load("alice").unwrap().unwrap();
-    assert_eq!(saved.username, "alice");
-    assert!(matches!(saved.credential,
-        SavedCredential::ApiToken { token, expires_at: Some(exp) }
-            if token == expected_token && exp == now + 3600));
-}
-
-#[tokio::test]
-async fn expired_api_jwt_requires_a_replacement_without_refreshing() {
-    let directory = TestDirectory::new("expired-api-jwt-test");
-    let config = Config {
-        data_dir: directory.0.clone(),
-        ..Config::default()
-    };
-    let context = auth_context(config).await;
-    context
-        .profiles
-        .save(&SavedLogin {
-            server_url: context.api.issuer().to_owned(),
-            profile: context.config.profile.clone(),
-            username: "alice".to_owned(),
-            credential: SavedCredential::ApiToken {
-                token: "expired.jwt.signature".to_owned(),
-                expires_at: Some(unix_now().unwrap() - 1),
-            },
-        })
-        .expect("save expired API JWT");
-    context
-        .profiles
-        .set_active_user("alice")
-        .expect("select expired API JWT");
-
-    let error = super::valid_access_token(&context).await.unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "API token expired. Set a new token and run kmesh login."
-    );
-    assert!(context.profiles.load("alice").unwrap().is_none());
-    assert!(context.profiles.active_user().is_err());
-}
-
-#[tokio::test]
-async fn missing_saved_login_reports_the_login_command() {
-    let directory = TestDirectory::new("missing-saved-login-test");
-    let context = auth_context(Config {
-        data_dir: directory.0.clone(),
-        ..Config::default()
     })
     .await;
-    let error = super::valid_access_token_for_user(&context, "alice")
-        .await
-        .expect_err("missing login requires authentication");
-    assert_eq!(error.to_string(), "No saved login. Run kmesh login.");
-}
-
-#[tokio::test]
-async fn expired_public_key_session_reports_the_login_command_and_clears_credentials() {
-    let directory = TestDirectory::new("expired-public-key-session-test");
-    let context = auth_context(Config {
-        data_dir: directory.0.clone(),
-        ..Config::default()
-    })
-    .await;
-    let now = unix_now().unwrap();
     context
         .profiles
-        .save(&SavedLogin {
-            server_url: context.api.issuer().to_owned(),
-            profile: context.config.profile.clone(),
-            username: "alice".to_owned(),
-            credential: SavedCredential::PublicKeySession {
+        .save(
+            "alice",
+            &SavedSession {
+                public_key_fingerprint: old_fingerprint,
                 tokens: LoginTokens {
-                    access_token: "expired-access-token".to_owned(),
-                    refresh_token: "expired-refresh-token".to_owned(),
-                    access_expires_at: now - 1,
-                    refresh_expires_at: now - 1,
+                    access_token: "wrong-key-access-token".to_owned(),
+                    refresh_token: "wrong-key-refresh-token".to_owned(),
+                    access_expires_at: now + 900,
+                    refresh_expires_at: now + 30 * 24 * 60 * 60,
                 },
             },
-        })
-        .expect("save expired public-key session");
-    context
-        .profiles
-        .set_active_user("alice")
-        .expect("select expired public-key session");
+        )
+        .expect("save session for a different SSH key");
 
-    let error = super::valid_access_token(&context)
+    let access_token = super::valid_access_token(&context)
         .await
-        .expect_err("expired public-key session requires authentication");
-    assert_eq!(error.to_string(), "Login expired. Run kmesh login.");
-    assert!(context.profiles.load("alice").unwrap().is_none());
-    assert!(context.profiles.active_user().is_err());
+        .expect("authenticate with the configured SSH key");
+    server.await.expect("public-key auth server completes");
+    assert_eq!(access_token, "fresh-access-token");
+    let saved = context.profiles.load("alice").unwrap().unwrap();
+    assert_eq!(saved.public_key_fingerprint, expected_fingerprint);
+    assert_eq!(saved.tokens.refresh_token, "fresh-refresh-token");
+    assert_eq!(
+        super::valid_access_token(&context).await.unwrap(),
+        "fresh-access-token"
+    );
 }
 
-#[test]
-fn private_key_and_public_key_paths_use_the_same_ssh_signature() {
-    let directory = TestDirectory::new("ssh-signing-test");
-    let private_key = generate_ssh_key(&directory.0, "id_ed25519");
-    let public_key_path = private_key.with_extension("pub");
-    let private_public_key =
-        public_key(&private_key).expect("extract public key from private file");
-    let public_public_key = public_key(&public_key_path).expect("read public key file");
-    assert_eq!(private_public_key, public_public_key);
+struct SshAgent {
+    socket: String,
+    pid: String,
+}
 
-    let payload = b"kmesh SSHSIG signing test payload";
-    let signature = sign_sshsig(&private_key, payload).expect("sign challenge with private key");
-    let signature = SshSig::from_pem(signature.as_bytes()).expect("parse SSHSIG output");
-    let public_key = PublicKey::from_openssh(&public_public_key).expect("parse SSH public key");
-    public_key
-        .verify("kmesh-login", payload, &signature)
-        .expect("verify client SSHSIG output");
+impl Drop for SshAgent {
+    fn drop(&mut self) {
+        let _ = Command::new("ssh-agent")
+            .arg("-k")
+            .env("SSH_AUTH_SOCK", &self.socket)
+            .env("SSH_AGENT_PID", &self.pid)
+            .output();
+    }
 }
 
 #[tokio::test]
@@ -607,9 +487,12 @@ async fn sshsig_signing_uses_loaded_agent_key_from_public_key_path() {
         &fs::read_to_string(&public_key_path).expect("read SSH agent public key"),
     )
     .expect("parse SSH agent public key");
-    let signature =
-        SshSig::from_pem(fs::read_to_string(&output_path).expect("read SSH agent signature"))
-            .expect("parse SSH agent signature");
+    let signature = SshSig::from_pem(
+        fs::read_to_string(&output_path)
+            .expect("read SSH agent signature")
+            .as_bytes(),
+    )
+    .expect("parse SSH agent signature");
     public_key
         .verify("kmesh-login", payload, &signature)
         .expect("verify SSH agent signature");
@@ -623,6 +506,7 @@ async fn refresh_process_child() {
     }
     let server_url = std::env::var("KMESH_TEST_REFRESH_SERVER").expect("refresh test server URL");
     let data_dir = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_DATA").expect("data dir"));
+    let key_path = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_KEY").expect("key path"));
     let output = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_OUTPUT").expect("output file"));
     let ready = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_READY").expect("ready file"));
     let go = PathBuf::from(std::env::var_os("KMESH_TEST_REFRESH_GO").expect("start gate"));
@@ -632,6 +516,12 @@ async fn refresh_process_child() {
         server_port,
         data_dir: data_dir.clone(),
         profile: "shared-profile".to_owned(),
+        auth: AuthConfig {
+            method: Some(AuthMethod::PublicKey),
+            username: Some("alice".to_owned()),
+            key: Some(key_path),
+            ..AuthConfig::default()
+        },
         ..Config::default()
     };
     let api = Api::new(&config).await.expect("build API client");
@@ -653,15 +543,17 @@ async fn refresh_process_child() {
     })
     .await
     .expect("parent releases refresh processes");
-    let token = super::valid_access_token_for_user(&context, "alice")
+    let token = super::valid_access_token(&context)
         .await
         .expect("obtain concurrently refreshed access token");
     fs::write(output, token).expect("write child refresh result");
 }
 
 #[tokio::test]
-async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() {
+async fn concurrent_process_refreshes_rotate_once_and_share_saved_session() {
     let directory = TestDirectory::new("refresh-process-test");
+    let key_path = generate_ssh_key(&directory.0, "id_ed25519");
+    let fingerprint = public_key_fingerprint(&public_key(&key_path).unwrap()).unwrap();
     let acceptor = test_tls_acceptor();
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -673,11 +565,10 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
     let now = unix_now().unwrap();
     let profiles = ProfileStore::new(&directory.0, &server_url, "shared-profile");
     profiles
-        .save(&SavedLogin {
-            server_url: server_url.clone(),
-            profile: "shared-profile".to_owned(),
-            username: "alice".to_owned(),
-            credential: SavedCredential::PublicKeySession {
+        .save(
+            "alice",
+            &SavedSession {
+                public_key_fingerprint: fingerprint,
                 tokens: LoginTokens {
                     access_token: "expired-access-token".to_owned(),
                     refresh_token: "old-refresh-token".to_owned(),
@@ -685,9 +576,8 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
                     refresh_expires_at: now + 3600,
                 },
             },
-        })
-        .expect("save expired test login");
-    profiles.set_active_user("alice").expect("set active user");
+        )
+        .expect("save expired test session");
 
     let new_tokens = LoginTokens {
         access_token: "rotated-access-token".to_owned(),
@@ -725,6 +615,7 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
         .env(REFRESH_CHILD_ENV, "1")
         .env("KMESH_TEST_REFRESH_SERVER", &server_url)
         .env("KMESH_TEST_REFRESH_DATA", &directory.0)
+        .env("KMESH_TEST_REFRESH_KEY", &key_path)
         .env("KMESH_TEST_REFRESH_OUTPUT", &first_output)
         .env("KMESH_TEST_REFRESH_READY", &first_ready)
         .env("KMESH_TEST_REFRESH_GO", &go)
@@ -736,6 +627,7 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
         .env(REFRESH_CHILD_ENV, "1")
         .env("KMESH_TEST_REFRESH_SERVER", &server_url)
         .env("KMESH_TEST_REFRESH_DATA", &directory.0)
+        .env("KMESH_TEST_REFRESH_KEY", &key_path)
         .env("KMESH_TEST_REFRESH_OUTPUT", &second_output)
         .env("KMESH_TEST_REFRESH_READY", &second_ready)
         .env("KMESH_TEST_REFRESH_GO", &go)
@@ -778,14 +670,14 @@ async fn concurrent_process_refreshes_rotate_once_and_share_saved_credentials() 
         "rotated-access-token"
     );
     let saved = profiles.load("alice").unwrap().unwrap();
-    assert!(matches!(saved.credential,
-        SavedCredential::PublicKeySession { tokens }
-            if tokens.refresh_token == "rotated-refresh-token"));
+    assert_eq!(saved.tokens.refresh_token, "rotated-refresh-token");
 }
 
 #[tokio::test]
-async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
+async fn uncertain_refresh_clears_cached_session() {
     let directory = TestDirectory::new("uncertain-refresh-test");
+    let key_path = generate_ssh_key(&directory.0, "id_ed25519");
+    let fingerprint = public_key_fingerprint(&public_key(&key_path).unwrap()).unwrap();
     let acceptor = test_tls_acceptor();
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -797,11 +689,10 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
     let now = unix_now().unwrap();
     let profiles = ProfileStore::new(&directory.0, &server_url, "uncertain-profile");
     profiles
-        .save(&SavedLogin {
-            server_url: server_url.clone(),
-            profile: "uncertain-profile".to_owned(),
-            username: "alice".to_owned(),
-            credential: SavedCredential::PublicKeySession {
+        .save(
+            "alice",
+            &SavedSession {
+                public_key_fingerprint: fingerprint,
                 tokens: LoginTokens {
                     access_token: "expired-access-token".to_owned(),
                     refresh_token: "unknown-result-refresh-token".to_owned(),
@@ -809,11 +700,8 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
                     refresh_expires_at: now + 3600,
                 },
             },
-        })
-        .expect("save login before uncertain refresh");
-    profiles
-        .set_active_user("alice")
-        .expect("set active user before uncertain refresh");
+        )
+        .expect("save session before uncertain refresh");
     let request_count = Arc::new(AtomicUsize::new(0));
     let server = tokio::spawn(one_refresh_request(
         (listener, acceptor),
@@ -826,34 +714,27 @@ async fn uncertain_refresh_response_clears_saved_login_and_active_user() {
     ));
 
     let (server_addr, server_port) = server_address_and_port(&server_url);
-    let config = Config {
+    let context = auth_context(Config {
         server_addr,
         server_port,
         data_dir: directory.0.clone(),
         profile: "uncertain-profile".to_owned(),
+        auth: AuthConfig {
+            method: Some(AuthMethod::PublicKey),
+            username: Some("alice".to_owned()),
+            key: Some(key_path),
+            ..AuthConfig::default()
+        },
         ..Config::default()
-    };
-    let api = Api::new(&config).await.expect("build API client");
-    let context = ClientContext {
-        profiles: ProfileStore::new(
-            &config.data_dir,
-            &config.server_origin().expect("test server origin"),
-            &config.profile,
-        ),
-        config,
-        api,
-    };
-    let error = super::valid_access_token_for_user(&context, "alice")
+    })
+    .await;
+    let error = super::valid_access_token(&context)
         .await
-        .expect_err("an uncertain refresh requires authentication");
-    assert!(
-        format!("{error:#}")
-            .contains("Cannot confirm the credential refresh. Run kmesh login again.")
-    );
+        .expect_err("an uncertain refresh fails clearly");
+    assert!(format!("{error:#}").contains("authenticate with the configured SSH key"));
     server
         .await
         .expect("uncertain refresh server task completes");
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
     assert!(context.profiles.load("alice").unwrap().is_none());
-    assert!(context.profiles.active_user().is_err());
 }
