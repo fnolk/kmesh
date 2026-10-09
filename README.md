@@ -44,7 +44,7 @@ For a server deployment, set `data_dir` to its persistent state location. `serve
 
 The deployment used for the current acceptance work listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for QAD. Direct peer paths also need outbound UDP between client and target. When UDP direct paths fail, the last route uses the private relay over the same HTTPS origin; HTTPS control remains required in every route. Official relay services provide QAD for `PublicDirect` and never carry its SSH stream. In public-direct-only mode, set `server.disable_private_relay = true` or pass `--disable-private-relay`; the server then omits its private relay URL from `GET /v1/transport`.
 
-Version 0.4.1 uses the 0.4 API and schema version 6. It separates platform roles from access groups. Upgrades from 0.3.x or earlier require a separate, empty `data_dir`; earlier schemas are not migrated. Existing 0.4.0 databases remain compatible. Version 0.3 clients cannot use a 0.4 server. Upgrade the server, clients, and agents together when moving from 0.3.x.
+Version 0.4.2 uses the 0.4 API and schema version 6. It separates platform roles from access groups. Upgrades from 0.3.x or earlier require a separate, empty `data_dir`; earlier schemas are not migrated. Existing 0.4.0 and 0.4.1 databases remain compatible. Version 0.3 clients cannot use a 0.4 server. Upgrade the server, clients, and agents together when moving from 0.3.x.
 
 ## Compact admin interface
 
@@ -401,7 +401,7 @@ The kmesh CLI also passed two controlled relay-route tests using a local SSH stu
 Local formatting and all-target Clippy with warnings denied pass. `cargo test --locked --all-targets` passes 104 tests with 2 existing QAD route-acceptance tests ignored. The vendored `iroh-relay` library suite passes all 64 tests, including pending-handshake cancellation and a permanently blocked flush cancellation check. Root tests include the real self-hosted relay natural EOF test and the admin relay list/close test; this is local verification, not a live deployment acceptance run.
 
 
-### Current 0.4.1 local verification
+### Historical 0.4.1 local verification
 
 Formatting and all-target Clippy with warnings denied pass. The all-target test
 suite passes 152 tests, with 2 existing QAD route-acceptance tests ignored.
