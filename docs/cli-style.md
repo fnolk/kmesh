@@ -154,3 +154,25 @@ every view provides every field.
 These are kmesh CLI command verbs. Use them only with the meanings above.
 - Test help, aliases, completion, empty results, long labels, control characters,
   token expiry, secret exclusion, and existing invocation forms.
+
+
+## Group-change and diagnostic wording
+
+Use these terms for the new commands:
+
+| Term | Meaning |
+| --- | --- |
+| preview | The proposed groups and effective target access changes before a write. |
+| blocker | A condition that prevents target authorization. |
+| SSH identification | The protocol and software identification sent by an SSH service before authentication. |
+| next action | An instruction that helps the user resolve a failed check. |
+
+Use `passed`, `failed`, and `not_checked` as stable diagnostic state values.
+Do not call an untested stage successful. Keep agent availability separate from
+permission and SSH service health. A successful SSH identification check does not
+verify the host key or the SSH account. Never print token values in diagnostics.
+
+Use explicit group verbs: replace all groups, add the specified groups, or remove
+the specified groups. State the effect on existing SSH connections. Keep a JSON
+report separate from prompts and progress messages. Confirm removal of all groups
+only on a terminal; require `--yes` when a script makes this change.

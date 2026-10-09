@@ -4,6 +4,8 @@ mod agent;
 mod api;
 mod auth;
 mod cli;
+mod diagnostics;
+mod groups;
 mod output;
 mod profile;
 mod proxy;
@@ -112,6 +114,20 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     let config = load_config(&cli)?;
     match &cli.command {
+        cli::Command::Status { json } => {
+            let context = ClientContext::new(&config).await?;
+            diagnostics::status(&context, *json).await?;
+        }
+        cli::Command::Doctor { target, json } => {
+            let context = ClientContext::new(&config).await?;
+            diagnostics::doctor(&context, target, *json).await?;
+        }
+        cli::Command::Access {
+            command: cli::AccessCommand::Explain { user, target, json },
+        } => {
+            let context = ClientContext::new(&config).await?;
+            diagnostics::explain(&context, user, target, *json).await?;
+        }
         cli::Command::Server { command } => match command {
             cli::ServerCommand::Init(args) => {
                 let issuer = config.server_origin()?;

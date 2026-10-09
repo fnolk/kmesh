@@ -55,6 +55,23 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(about = "Show the current login and server status")]
+    Status {
+        #[arg(short = 'j', long, help = "Show the response as JSON")]
+        json: bool,
+    },
+    #[command(about = "Check access, the network path, and the SSH service")]
+    Doctor {
+        #[arg(help = "Target ID to check")]
+        target: String,
+        #[arg(short = 'j', long, help = "Show the response as JSON")]
+        json: bool,
+    },
+    #[command(about = "Explain access to a target")]
+    Access {
+        #[command(subcommand)]
+        command: AccessCommand,
+    },
     #[command(about = "Initialize or run the kmesh server")]
     Server {
         #[command(subcommand)]
@@ -89,6 +106,33 @@ pub enum Command {
         about = "Use user, role, group, target, token, key, and relay commands"
     )]
     Admin(AdminArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AccessCommand {
+    #[command(
+        about = "Show why a user can or cannot access a target. The admin platform role is required."
+    )]
+    Explain {
+        #[arg(help = "User ID")]
+        user: String,
+        #[arg(help = "Target ID")]
+        target: String,
+        #[arg(short = 'j', long, help = "Show the response as JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupChangeOptions {
+    #[arg(long, help = "Show the changes without applying them")]
+    pub dry_run: bool,
+    #[arg(
+        short = 'y',
+        long,
+        help = "Permit removal of all access groups without a prompt"
+    )]
+    pub yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -326,13 +370,33 @@ pub enum UserAction {
     },
     #[command(
         visible_alias = "set-groups",
-        about = "Set access groups for a user. To remove all groups, use an empty group ID list."
+        about = "Replace all access groups for a user. An empty list removes all groups."
     )]
     Groups {
         #[arg(help = "Username (user ID) to update")]
         user_id: String,
         #[arg(help = "Access group IDs to set")]
         group_ids: Vec<String>,
+        #[command(flatten)]
+        options: GroupChangeOptions,
+    },
+    #[command(about = "Add access groups without removing existing groups")]
+    AddGroups {
+        #[arg(help = "User ID")]
+        user_id: String,
+        #[arg(required = true, help = "Access group IDs to add")]
+        group_ids: Vec<String>,
+        #[command(flatten)]
+        options: GroupChangeOptions,
+    },
+    #[command(about = "Remove the specified access groups")]
+    RemoveGroups {
+        #[arg(help = "User ID")]
+        user_id: String,
+        #[arg(required = true, help = "Access group IDs to remove")]
+        group_ids: Vec<String>,
+        #[command(flatten)]
+        options: GroupChangeOptions,
     },
     #[command(about = "Show access groups for a user")]
     ShowGroups {

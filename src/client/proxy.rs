@@ -58,7 +58,10 @@ pub(super) fn server_setup_error(code: String, message: String) -> anyhow::Error
     }
 }
 
-pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
+async fn open_session(
+    context: &ClientContext,
+    target_id: String,
+) -> Result<(Uuid, attempt::OpenSshSession, WsStream, RouteMode)> {
     let target_id = target_id.trim().to_ascii_lowercase();
     let setup_deadline = tokio::time::Instant::now() + SSH_SETUP_TIMEOUT;
     let access_token = tokio::time::timeout_at(setup_deadline, auth::valid_access_token(context))
@@ -112,7 +115,7 @@ pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
         .await
         {
             Ok(session) => {
-                connected = Some((session_id, session, control));
+                connected = Some((session_id, session, control, route_mode));
                 break;
             }
             Err(error) => {
@@ -162,7 +165,7 @@ pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
             }
         }
     }
-    let (session_id, ssh_session, mut control) = match connected {
+    let connected = match connected {
         Some(connected) => connected,
         None => {
             if private_routes_unavailable {
@@ -180,11 +183,15 @@ pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
             ));
         }
     };
+    Ok(connected)
+}
+
+pub async fn run(context: &ClientContext, target_id: String) -> Result<()> {
+    let (session_id, ssh_session, mut control, _) = open_session(context, target_id).await?;
     let attempt::OpenSshSession {
         endpoint,
         mut stream,
     } = ssh_session;
-
     let transfer = stdio::copy_stdio(&mut stream).await;
     if transfer.is_err() {
         let _ = stream.reset();
@@ -243,5 +250,95 @@ async fn close_session(control: &mut WsStream, session_id: Uuid, reason: &str) -
 async fn close_session_best_effort(control: &mut WsStream, session_id: Uuid, reason: &str) {
     if let Err(error) = close_session(control, session_id, reason).await {
         tracing::debug!(session = %session_id, error = %error, "failed to close pending SSH session");
+    }
+}
+
+/// Open the same authorized route as ProxyCommand, but do not start an SSH login.
+pub(super) async fn probe(
+    context: &ClientContext,
+    target_id: String,
+) -> Result<(RouteMode, Result<()>)> {
+    let (session_id, session, mut control, mode) = open_session(context, target_id).await?;
+    let attempt::OpenSshSession {
+        endpoint,
+        mut stream,
+    } = session;
+    let result = tokio::time::timeout(
+        Duration::from_secs(12),
+        read_ssh_identification(&mut stream),
+    )
+    .await
+    .context("The SSH service did not respond within 12 seconds.")
+    .and_then(|result| result);
+    let _ = stream.reset();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        close_session_best_effort(&mut control, session_id, "doctor_complete"),
+    )
+    .await;
+    attempt::close_endpoint(&endpoint).await;
+    Ok((mode, result))
+}
+
+async fn read_ssh_identification(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    // RFC 4253 permits lines before the identification. Bound both memory and work.
+    let mut line = Vec::new();
+    for _ in 0..8192 {
+        let byte = stream
+            .read_u8()
+            .await
+            .context("The SSH service closed before its identification.")?;
+        line.push(byte);
+        if line.len() > 255 {
+            anyhow::bail!("The SSH service returned an invalid identification.");
+        }
+        if byte == b'\n' {
+            if line.starts_with(b"SSH-") {
+                let software = line
+                    .strip_prefix(b"SSH-2.0-")
+                    .or_else(|| line.strip_prefix(b"SSH-1.99-"));
+                let valid = software.is_some_and(|value| {
+                    value.first().is_some_and(|byte| (33..=126).contains(byte))
+                }) && line.ends_with(b"\r\n")
+                    && line[..line.len() - 2]
+                        .iter()
+                        .all(|byte| (32..=126).contains(byte));
+                anyhow::ensure!(valid, "The SSH service returned an invalid identification.");
+                return Ok(());
+            }
+            line.clear();
+        }
+    }
+    anyhow::bail!("The SSH service did not return an identification.")
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::read_ssh_identification;
+
+    #[tokio::test]
+    async fn identification_requires_ssh_and_bounds_untrusted_input() {
+        for banner in [
+            b"SSH-2.0-OpenSSH_9.0\r\n".as_slice(),
+            b"Notice\r\nSSH-2.0-test\r\n",
+        ] {
+            assert!(read_ssh_identification(&mut &banner[..]).await.is_ok());
+        }
+        for banner in [
+            b"HTTP/1.1 200 OK\r\n".as_slice(),
+            b"SSH-1.5-test\r\n",
+            b"SSH-2.0-\r\n",
+            b"SSH-1.99-\r\n",
+            b"SSH-2.0- \r\n",
+            b"SSH-2.0-test\x1b\r\n",
+        ] {
+            assert!(read_ssh_identification(&mut &banner[..]).await.is_err());
+        }
+        assert!(
+            read_ssh_identification(&mut &vec![b'x'; 8193][..])
+                .await
+                .is_err()
+        );
     }
 }

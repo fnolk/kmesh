@@ -117,9 +117,48 @@ pub struct GroupGrantView {
     pub permission: TargetPermission,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupChangeMode {
+    Replace,
+    Add,
+    Remove,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupChange {
+    pub user_id: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+    pub lost_target_ids: Vec<String>,
+    pub gained_target_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccessExplanation {
+    pub user_id: String,
+    pub target_id: String,
+    pub access_groups: Vec<String>,
+    pub granting_groups: Vec<String>,
+    pub blockers: Vec<String>,
+    pub authorized: bool,
+    pub online: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "data", rename_all = "snake_case")]
 pub enum AdminOperation {
+    ChangeUserAccessGroups {
+        user_id: String,
+        group_ids: Vec<String>,
+        mode: GroupChangeMode,
+        dry_run: bool,
+        expected: Option<GroupChange>,
+    },
+    ExplainAccess {
+        user_id: String,
+        target_id: String,
+    },
     ListUsers,
     ListRelayTraffic,
     CloseRelaySession {
@@ -266,6 +305,12 @@ pub struct RelayTrafficView {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum AdminResponse {
+    GroupChange {
+        change: GroupChange,
+        applied: bool,
+        access_groups: Vec<AccessGroupView>,
+    },
+    AccessExplanation(AccessExplanation),
     Ok,
     Users(Vec<UserView>),
     User(UserView),

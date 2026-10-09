@@ -139,8 +139,50 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
                 user_id,
                 system_role,
             },
-            UserAction::Groups { user_id, group_ids } => {
-                AdminOperation::SetUserAccessGroups { user_id, group_ids }
+            UserAction::Groups {
+                user_id,
+                group_ids,
+                options,
+            } => {
+                return super::groups::run(
+                    context,
+                    user_id,
+                    group_ids,
+                    crate::protocol::GroupChangeMode::Replace,
+                    options,
+                    json,
+                )
+                .await;
+            }
+            UserAction::AddGroups {
+                user_id,
+                group_ids,
+                options,
+            } => {
+                return super::groups::run(
+                    context,
+                    user_id,
+                    group_ids,
+                    crate::protocol::GroupChangeMode::Add,
+                    options,
+                    json,
+                )
+                .await;
+            }
+            UserAction::RemoveGroups {
+                user_id,
+                group_ids,
+                options,
+            } => {
+                return super::groups::run(
+                    context,
+                    user_id,
+                    group_ids,
+                    crate::protocol::GroupChangeMode::Remove,
+                    options,
+                    json,
+                )
+                .await;
             }
             UserAction::ShowGroups { user_id } => AdminOperation::ListUserAccessGroups { user_id },
         },
@@ -303,6 +345,12 @@ fn print_response(response: &AdminResponse, json: bool, server_origin: &str) -> 
 
 fn render_response(response: &AdminResponse, server_origin: &str) -> Result<String> {
     Ok(match response {
+        AdminResponse::GroupChange {
+            change, applied, ..
+        } => super::groups::render(change, *applied),
+        AdminResponse::AccessExplanation(explanation) => {
+            super::diagnostics::render_access(explanation)
+        }
         AdminResponse::Ok => "Operation complete.\n".to_owned(),
         AdminResponse::Users(users) => render_users(users),
         AdminResponse::RelayTraffic(traffic) => render_relay_traffic(traffic),
@@ -1020,6 +1068,10 @@ mod tests {
             ("", "tokens"),
             ("users ", "roles"),
             ("users ", "groups"),
+            ("u ", "add-groups"),
+            ("u ", "remove-groups"),
+            ("u groups alice --", "--dry-run"),
+            ("u remove-groups alice dev --", "--yes"),
             ("u ", "s"),
             ("tk ", "c"),
             ("tk c alice --", "--label"),

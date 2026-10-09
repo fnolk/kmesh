@@ -83,3 +83,36 @@ Local agent state is stored at `<data-dir>/agents/<target-id>/agent.json`. The s
 The counters measure Iroh relay datagram payloads. Ingress includes decoded datagrams even when forwarding later fails; egress includes payloads successfully written to the destination. They exclude relay control frames, WebSocket/TLS framing, and network headers, so they differ from NIC byte counters.
 
 `AdminOperation::CloseRelaySession { session_id }` accepts a live `PrivateRelay` session. The server commits the session as closed, disconnects all relay transports for its client and per-session target endpoints (including pending admissions), then sends `Close` over the control channels and removes runtime state. The database status check rejects subsequent relay handshakes. Direct sessions return a conflict.
+
+
+## Group changes and access diagnostics
+
+The additive `change_user_access_groups` admin operation accepts `user_id`,
+`group_ids`, `mode` (`replace`, `add`, or `remove`), `dry_run`, and `expected`.
+The response is `group_change`, with a `change` object, `applied`, and the current
+`access_groups`. The change contains `before`, `after`, `lost_target_ids`, and
+`gained_target_ids`, as well as `user_id`. A preview leaves assignments and audit
+records unchanged. Current group records describe the stored assignments; `after`
+describes the proposed assignments when `applied` is false.
+
+The CLI supplies the preview as `expected` for a write. A mismatch returns HTTP
+409 without a write. The server checks the actor's admin role, calculates the
+change, writes assignments, and records the audit event in one immediate SQLite
+transaction. Unknown groups fail before mutation. Incremental API writes without
+an expected preview compute their result inside that transaction. The original
+`set_user_access_groups` operation and its response remain unchanged.
+
+The additive `explain_access` admin operation accepts a user ID and target ID.
+It returns `access_explanation`: memberships, granting groups, permission blockers,
+`authorized`, and `online`. Account and grant data use one database snapshot.
+Agent online state is observed separately. The operation never issues credentials
+or changes grants. A nonexistent user returns HTTP 404. Missing or removed targets
+have a `target_unavailable` blocker. Ordinary users cannot call this admin operation.
+
+`status` uses the existing transport and identity endpoints. Ordinary-user `doctor`
+uses the existing authorized target list; it does not reveal hidden target state.
+The active doctor probe uses the same route setup and activation checks as the SSH
+proxy. It reads at most 8192 bytes, with lines limited to 255 bytes, to find a valid
+SSH 2.0 or 1.99 identification within 12 seconds. It resets the stream, sends a
+session close, and closes its endpoint on both successful and failed banner checks.
+It does not send SSH authentication data or verify the SSH host key.
