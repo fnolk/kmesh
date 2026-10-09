@@ -47,8 +47,8 @@ Version 0.4.1 uses the 0.4 API and schema version 6. It separates platform roles
 ## Compact admin interface
 
 Use the overview to inspect users, platform roles, access groups, targets, and credential counts
-in one command. Use a detail view to inspect each access path, API token metadata,
-and SSH public key fingerprints for the related users:
+in one command. Use `groups show` to list an access group's members and target grants.
+User and target details include related access paths and credential metadata:
 
 ```sh
 kmesh admin overview        # Short form: kmesh a ls
@@ -62,7 +62,7 @@ kmesh a ls -j               # Joined JSON view
 The overview separates user and target state from target availability. An enabled
 but offline target can remain authorized. The access path is user → access group →
 `ssh_connect` grant → target. The `admin` platform role gives no SSH access.
-Detail views show the selected access paths and their disabled-user or
+User and target detail views show the selected access paths and their disabled-user or
 disabled-target blockers. Relationship columns show each object's full assignments.
 Tokens and keys belong to users; they are not target-specific credentials.
 
@@ -76,10 +76,11 @@ Admin commands with `--json` return the 0.4 API response shape. The
 fingerprints only.
 
 Joined views use sequential reads of the existing API. They are not atomic
-snapshots. The view reports its collection time and fails if a required read or a
-relationship check fails. Run it again after concurrent administrative changes. Retained grants to targets
-missing from the target list appear as unavailable references with a warning;
-they never count as authorized access.
+snapshots. Overview, user, and target views show their collection time. The group
+view omits routine read details and focuses on members and targets. A view fails
+if a required read or relationship check fails. Run it again after concurrent
+administrative changes. Retained grants to targets missing from the target list
+appear as unavailable references with a warning; they never count as authorized access.
 The overview needs three resource-list requests, one per user for access groups,
 one per access group for grants, and two per relevant user for token and key metadata. Use the
 original resource-list commands when only a small list is needed.

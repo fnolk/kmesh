@@ -123,7 +123,12 @@ every view provides every field.
   token, change permissions, or revoke a credential.
 - Show a user's platform role and access groups in separate fields.
 - Show access group IDs in grant tables and access path columns.
+- Keep an access group detail focused on its members and targets. Show its
+  configured `ssh_connect` permission once.
 - State that platform roles control administration and access groups control SSH access.
+- Document that `groups show` uses sequential API reads and does not form an
+  atomic snapshot. Omit routine collection-time and consistency text from its
+  human-readable output.
 
 ## Aliases and compatibility
 

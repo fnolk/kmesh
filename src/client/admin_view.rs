@@ -645,6 +645,63 @@ struct Table {
 }
 
 fn tables(view: &JoinedView) -> Vec<Table> {
+    if matches!(view.selection, Selection::AccessGroup(_)) {
+        let show_user_names = view.users.iter().any(|user| user.user_id != user.username);
+        let show_target_names = view
+            .targets
+            .iter()
+            .any(|target| target.available_in_target_list && target.target_id != target.name);
+        return vec![
+            Table {
+                title: "Members",
+                headers: if show_user_names {
+                    &["USER ID", "STATE", "NAME"]
+                } else {
+                    &["USER ID", "STATE"]
+                },
+                rows: view
+                    .users
+                    .iter()
+                    .map(|user| {
+                        let mut row =
+                            vec![user.user_id.clone(), output::state(user.enabled).to_owned()];
+                        if show_user_names {
+                            row.push(user.username.clone());
+                        }
+                        row
+                    })
+                    .collect(),
+            },
+            Table {
+                title: "Targets",
+                headers: if show_target_names {
+                    &["TARGET ID", "STATE", "AVAILABILITY", "NAME"]
+                } else {
+                    &["TARGET ID", "STATE", "AVAILABILITY"]
+                },
+                rows: view
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        let mut row = vec![
+                            target.target_id.clone(),
+                            target_state(target.enabled).to_owned(),
+                            availability(target.online).to_owned(),
+                        ];
+                        if show_target_names {
+                            row.push(if target.available_in_target_list {
+                                target.name.clone()
+                            } else {
+                                "-".to_owned()
+                            });
+                        }
+                        row
+                    })
+                    .collect(),
+            },
+        ];
+    }
+
     let mut tables = vec![
         Table {
             title: "Users",
@@ -796,28 +853,43 @@ fn print_view(view: &JoinedView) {
     match &view.selection {
         Selection::Overview => println!("Admin overview"),
         Selection::User(id) => println!("User: {}", output::cell(id)),
-        Selection::AccessGroup(id) => println!("Access group: {}", output::cell(id)),
+        Selection::AccessGroup(id) => {
+            println!("Access group: {}", output::cell(id));
+            let group = &view.access_groups[0];
+            if group.name != group.group_id {
+                println!("Name: {}", output::cell(&group.name));
+            }
+            println!("SSH permission: ssh_connect");
+            println!();
+        }
         Selection::Target(id) => println!("Target: {}", output::cell(id)),
     }
-    println!(
-        "Read consistency: {}. Collected at {} (Unix seconds).",
-        view.consistency, view.collected_at_unix_secs
-    );
+    if !matches!(view.selection, Selection::AccessGroup(_)) {
+        println!(
+            "Read consistency: {}. Collected at {} (Unix seconds).",
+            view.consistency, view.collected_at_unix_secs
+        );
+    }
     for warning in &view.warnings {
         println!("Warning: {}", output::cell(warning));
     }
-    for table in tables(view) {
+    for (index, table) in tables(view).into_iter().enumerate() {
+        if index > 0 && matches!(view.selection, Selection::AccessGroup(_)) {
+            println!();
+        }
         output::print_table(table.title, table.headers, table.rows);
     }
-    println!(
-        "SSH access path: user -> access group -> ssh_connect grant -> target. Disabled users or targets block authorization. Online status reports availability."
-    );
-    println!(
-        "Platform roles control administration. Access groups control SSH access. Access paths are limited to this selection."
-    );
-    println!(
-        "Tokens A/T = active/total by expiry and revocation. Disabled users cannot authenticate. Tokens and keys belong to users, not individual targets."
-    );
+    if !matches!(view.selection, Selection::AccessGroup(_)) {
+        println!(
+            "SSH access path: user -> access group -> ssh_connect grant -> target. Disabled users or targets block authorization. Online status reports availability."
+        );
+        println!(
+            "Platform roles control administration. Access groups control SSH access. Access paths are limited to this selection."
+        );
+        println!(
+            "Tokens A/T = active/total by expiry and revocation. Disabled users cannot authenticate. Tokens and keys belong to users, not individual targets."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1140,7 +1212,16 @@ mod tests {
         assert!(access_group.targets.is_empty());
         assert!(access_group.tokens.is_empty());
         assert!(access_group.keys.is_empty());
-        assert_eq!(tables(&access_group).len(), 6);
+        let group_tables = tables(&access_group);
+        assert_eq!(
+            group_tables
+                .iter()
+                .map(|table| table.title)
+                .collect::<Vec<_>>(),
+            ["Members", "Targets"]
+        );
+        assert!(group_tables[0].rows.is_empty());
+        assert!(group_tables[1].rows.is_empty());
         for targets in snapshot.grants.values_mut() {
             targets.clear();
         }
@@ -1151,6 +1232,78 @@ mod tests {
         assert!(target.users.is_empty());
         assert!(target.access_groups.is_empty());
         assert!(target.access_paths.is_empty());
+    }
+
+    #[test]
+    fn access_group_tables_show_only_members_and_targets_with_distinct_names() {
+        let view = fixture()
+            .join(Selection::AccessGroup("ops".to_owned()), 100)
+            .unwrap();
+        let group_tables = tables(&view);
+        assert_eq!(group_tables[0].headers, ["USER ID", "STATE"]);
+        assert_eq!(
+            group_tables[1].headers,
+            ["TARGET ID", "STATE", "AVAILABILITY"]
+        );
+
+        let mut snapshot = fixture();
+        snapshot.users.get_mut("alice").unwrap().username = "Alice".to_owned();
+        snapshot.targets.get_mut("build").unwrap().name = "Build server".to_owned();
+        snapshot.access_groups.get_mut("ops").unwrap().name = "Operations".to_owned();
+
+        let view = snapshot
+            .join(Selection::AccessGroup("ops".to_owned()), 100)
+            .unwrap();
+        let group_tables = tables(&view);
+        assert_eq!(group_tables.len(), 2);
+        assert_eq!(group_tables[0].headers, ["USER ID", "STATE", "NAME"]);
+        assert_eq!(
+            group_tables[0].rows,
+            [
+                ["alice", "enabled", "Alice"].map(str::to_owned).to_vec(),
+                ["bob", "disabled", "bob"].map(str::to_owned).to_vec(),
+            ]
+        );
+        assert_eq!(
+            group_tables[1].headers,
+            ["TARGET ID", "STATE", "AVAILABILITY", "NAME"]
+        );
+        assert_eq!(
+            group_tables[1].rows,
+            [
+                ["build", "enabled", "offline", "Build server"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                ["prod", "disabled", "online", "prod"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ]
+        );
+        let rendered = group_tables
+            .into_iter()
+            .map(|table| output::render_table(table.title, table.headers, table.rows))
+            .collect::<String>();
+        assert!(!rendered.contains("GROUP ID"));
+        assert!(!rendered.contains("GROUP IDS"));
+        assert!(!rendered.contains("AUTHORIZED USERS"));
+        assert!(!rendered.contains("ssh_connect"));
+        assert_eq!(view.access_groups[0].name, "Operations");
+
+        let mut snapshot = fixture();
+        snapshot.targets.get_mut("build").unwrap().name = "Build server".to_owned();
+        snapshot.targets.remove("prod");
+        let view = snapshot
+            .join(Selection::AccessGroup("ops".to_owned()), 100)
+            .unwrap();
+        let group_tables = tables(&view);
+        let target_table = &group_tables[1];
+        assert_eq!(
+            target_table.rows[1],
+            ["prod", "unavailable", "unknown", "-"]
+                .map(str::to_owned)
+                .to_vec()
+        );
+        assert!(view.warnings.iter().any(|warning| warning.contains("prod")));
     }
 
     #[test]
