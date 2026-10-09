@@ -42,7 +42,7 @@ For a server deployment, set `data_dir` to its persistent state location. `serve
 
 The deployment used for the current acceptance work listens on TCP 9443 for HTTPS control and the self-hosted Iroh relay, and UDP 3478 for QAD. Direct peer paths also need outbound UDP between client and target. When UDP direct paths fail, the last route uses the private relay over the same HTTPS origin; HTTPS control remains required in every route. Official relay services provide QAD for `PublicDirect` and never carry its SSH stream. In public-direct-only mode, set `server.disable_private_relay = true` or pass `--disable-private-relay`; the server then omits its private relay URL from `GET /v1/transport`.
 
-Version 0.4.0 uses the 0.4 API and schema version 6. It separates platform roles from access groups. It requires a fresh data directory. It does not migrate earlier databases. Initialize it in a separate, empty `data_dir`. Version 0.3 clients cannot use a 0.4.0 server.
+Version 0.4.1 uses the 0.4 API and schema version 6. It separates platform roles from access groups. Upgrades from 0.3.x or earlier require a separate, empty `data_dir`; earlier schemas are not migrated. Existing 0.4.0 databases remain compatible. Version 0.3 clients cannot use a 0.4 server. Upgrade the server, clients, and agents together when moving from 0.3.x.
 
 ## Compact admin interface
 
@@ -380,7 +380,7 @@ Traffic values count Iroh relay datagram payloads: they include the QUIC packet 
 
 ### Historical live acceptance
 
-The following live acceptance results belong to source `eb359f76d09ab1d58c3d6ec7cd8f9d42aefcc12e`. They document that earlier deployment and do not verify the current 0.3.0 source.
+The following live acceptance results belong to source `eb359f76d09ab1d58c3d6ec7cd8f9d42aefcc12e`. They document that earlier deployment and do not verify the current source.
 
 The final candidate is source `eb359f76d09ab1d58c3d6ec7cd8f9d42aefcc12e`. Formatting and all-target Clippy passed; native all-target tests report 71 passed, 0 failed, and 2 ignored. The two explicit route-acceptance tests passed, and release binaries were built for Linux x86_64/aarch64 musl and macOS x86_64/arm64. The [final build and route evidence](docs/build-validation.md) records the source, checks, and artifact SHA-256 values.
 
@@ -388,6 +388,16 @@ On `target-1`, `PrivateDirect` and `PublicDirect` each passed three fresh SSH co
 
 The kmesh CLI also passed two controlled relay-route tests using a local SSH stub: direct-timeout fallback to the private relay, and private-relay denial with session cleanup. These controlled tests are distinct from a forced private-relay connection to the live `target-1` SSH service. One-hour idle and 1 GiB transfer tests were cancelled and are not part of the acceptance result. The final bounded PrivateDirect sample kept direct path `192.0.2.19:2123` selected while transferring two independent 4 MiB files concurrently in 1.462 seconds, with four interactive echo latencies of 58.943–517.340 ms and 24 proxy RSS samples of 21,568–22,976 KiB. This single run is not an SLO or capacity estimate; see the [sample report](</Users/example/.cache/kmesh-live/client/iroh-integrated-20261003/runs/perf-eb359f7-20261004/report.json>).
 
-### Current 0.3.0 local verification
+### Historical 0.3.0 local verification
 
 Local formatting and all-target Clippy with warnings denied pass. `cargo test --locked --all-targets` passes 104 tests with 2 existing QAD route-acceptance tests ignored. The vendored `iroh-relay` library suite passes all 64 tests, including pending-handshake cancellation and a permanently blocked flush cancellation check. Root tests include the real self-hosted relay natural EOF test and the admin relay list/close test; this is local verification, not a live deployment acceptance run.
+
+
+### Current 0.4.1 local verification
+
+Formatting and all-target Clippy with warnings denied pass. The all-target test
+suite passes 152 tests, with 2 existing QAD route-acceptance tests ignored.
+Tests cover atomic group changes, stale previews, audit rollback, diagnostic
+permission boundaries, and real server/agent checks against SSH and non-SSH stubs.
+This is local verification, not live deployment acceptance. See the
+[0.4.1 release notes](docs/releases/0.4.1.md) for changes and upgrade requirements.
