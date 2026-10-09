@@ -9,66 +9,121 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
-use crate::protocol::{
-    LoginTokens, PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest,
+use crate::{
+    config::AuthMethod,
+    protocol::{LoginTokens, PublicKeyChallengeRequest, PublicKeyLoginRequest, RefreshRequest},
 };
 
 use super::{
     ClientContext,
-    cli::{LoginArgs, LoginMethod},
-    profile::{SavedCredential, SavedLogin, normalize_username},
+    profile::{SavedSession, normalize_username},
 };
 
-pub async fn login(context: &ClientContext, args: &LoginArgs) -> Result<()> {
-    let method = args.method.or(context.config.auth.method).context(
-        "Login method is required. Use --method token or --method public-key, or set auth.method.",
-    )?;
-    match method {
-        LoginMethod::Token => {
-            let token = args
-                .token
-                .as_deref()
-                .or(context.config.auth.token.as_deref())
-                .context("API token is required. Use --token, KMESH_TOKEN, or auth.token.")?;
-            anyhow::ensure!(!token.trim().is_empty(), "API token is empty");
-            let username = context.api.me(token).await?.username;
-            let payload = token.split('.').nth(1).context("API token is not a JWT")?;
-            let claims: crate::protocol::ApiTokenClaims = serde_json::from_slice(
-                &URL_SAFE_NO_PAD
-                    .decode(payload)
-                    .context("decode API token claims")?,
-            )
-            .context("read API token expiration")?;
-            save_login(
-                context,
-                &normalize_username(&username),
-                SavedCredential::ApiToken {
-                    token: token.to_owned(),
-                    expires_at: claims.exp,
-                },
-            )
+pub async fn valid_access_token(context: &ClientContext) -> Result<String> {
+    match context
+        .config
+        .auth
+        .method
+        .context("Set [auth].method to token or public-key in the configuration.")?
+    {
+        AuthMethod::Token => configured_api_token(context),
+        AuthMethod::PublicKey => public_key_access_token(context).await,
+    }
+}
+
+fn configured_api_token(context: &ClientContext) -> Result<String> {
+    let environment_token = std::env::var_os("KMESH_TOKEN")
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow!("KMESH_TOKEN must contain valid UTF-8"))
+        })
+        .transpose()?;
+    let token = environment_token
+        .as_deref()
+        .or(context.config.auth.token.as_deref())
+        .context("Set KMESH_TOKEN or [auth].token in the configuration.")?;
+    anyhow::ensure!(!token.trim().is_empty(), "API token is empty");
+    Ok(token.to_owned())
+}
+
+async fn public_key_access_token(context: &ClientContext) -> Result<String> {
+    let username = context
+        .config
+        .auth
+        .username
+        .as_deref()
+        .context("Set [auth].username in the configuration.")?;
+    let username = normalize_username(username);
+    anyhow::ensure!(!username.is_empty(), "username is empty");
+    let key_path = context
+        .config
+        .auth
+        .key
+        .as_deref()
+        .context("Set [auth].key in the configuration.")?;
+    let public_key = public_key(key_path)?;
+    let fingerprint = public_key_fingerprint(&public_key)?;
+
+    let profiles = context.profiles.clone();
+    let _lock = tokio::task::spawn_blocking(move || profiles.lock_refresh())
+        .await
+        .context("session lock task failed")??;
+    let now = unix_now()?;
+    if let Some(saved) = context.profiles.load(&username)? {
+        if saved.public_key_fingerprint == fingerprint {
+            if saved.tokens.access_expires_at > now.saturating_add(30) {
+                return Ok(saved.tokens.access_token);
+            }
+            if saved.tokens.refresh_expires_at > now {
+                return refresh_public_key_session(context, &username, fingerprint, saved).await;
+            }
         }
-        LoginMethod::PublicKey => {
-            let username = args
-                .username
-                .as_deref()
-                .or(context.config.auth.username.as_deref())
-                .context("Username is required. Use --username or auth.username.")?;
-            let username = normalize_username(username);
-            anyhow::ensure!(!username.is_empty(), "username is empty");
-            let current_dir = std::env::current_dir().context("resolve current directory")?;
-            let key_path = args
-                .key
-                .as_deref()
-                .map(|path| crate::config::resolve_path(path, &current_dir))
-                .or(context.config.auth.key.clone())
-                .context("SSH key path is required. Use --key or auth.key.")?;
-            let tokens = public_key_login(context, &username, &key_path).await?;
-            save_login(
-                context,
-                &username,
-                SavedCredential::PublicKeySession { tokens },
+        context.profiles.delete(&username)?;
+    }
+
+    let tokens = public_key_login(context, &username, key_path, &public_key).await?;
+    let access_token = tokens.access_token.clone();
+    context.profiles.save(
+        &username,
+        &SavedSession {
+            public_key_fingerprint: fingerprint,
+            tokens,
+        },
+    )?;
+    Ok(access_token)
+}
+
+async fn refresh_public_key_session(
+    context: &ClientContext,
+    username: &str,
+    fingerprint: String,
+    saved: SavedSession,
+) -> Result<String> {
+    match context
+        .api
+        .refresh(&RefreshRequest {
+            refresh_token: saved.tokens.refresh_token,
+        })
+        .await
+    {
+        Ok(tokens) => {
+            let access_token = tokens.access_token.clone();
+            context.profiles.save(
+                username,
+                &SavedSession {
+                    public_key_fingerprint: fingerprint,
+                    tokens,
+                },
+            )?;
+            Ok(access_token)
+        }
+        Err(error) => {
+            context.profiles.delete(username)?;
+            Err(anyhow!(
+                "Could not refresh the public-key session. Run the command again to authenticate with the configured SSH key."
             )
+            .context(error))
         }
     }
 }
@@ -77,13 +132,13 @@ async fn public_key_login(
     context: &ClientContext,
     username: &str,
     key_path: &Path,
+    public_key: &str,
 ) -> Result<LoginTokens> {
-    let public_key = public_key(key_path)?;
     let challenge = context
         .api
         .public_key_challenge(&PublicKeyChallengeRequest {
             username: username.to_owned(),
-            public_key,
+            public_key: public_key.to_owned(),
         })
         .await?;
     anyhow::ensure!(
@@ -106,6 +161,12 @@ async fn public_key_login(
             signature,
         })
         .await
+}
+
+fn public_key_fingerprint(public_key: &str) -> Result<String> {
+    let public_key =
+        ssh_key::PublicKey::from_openssh(public_key).context("parse configured SSH public key")?;
+    Ok(public_key.fingerprint(ssh_key::HashAlg::Sha256).to_string())
 }
 
 fn public_key(key_path: &Path) -> Result<String> {
@@ -143,7 +204,7 @@ fn sign_sshsig(key_path: &Path, challenge: &[u8]) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("run ssh-keygen to sign the login challenge")?;
+        .context("run ssh-keygen to sign the authentication challenge")?;
     child
         .stdin
         .take()
@@ -156,114 +217,11 @@ fn sign_sshsig(key_path: &Path, challenge: &[u8]) -> Result<String> {
     if !output.status.success() {
         let reason = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "ssh-keygen could not sign the login challenge: {}",
+            "ssh-keygen could not sign the authentication challenge: {}",
             reason.trim()
         );
     }
     String::from_utf8(output.stdout).context("ssh-keygen returned a non-UTF-8 SSHSIG signature")
-}
-
-pub async fn valid_access_token(context: &ClientContext) -> Result<String> {
-    let username = context.profiles.active_user()?;
-    valid_access_token_for_user(context, &username).await
-}
-
-async fn valid_access_token_for_user(context: &ClientContext, username: &str) -> Result<String> {
-    let saved = context
-        .profiles
-        .load(username)?
-        .context("No saved login. Run kmesh login.")?;
-    let now = unix_now()?;
-    match &saved.credential {
-        SavedCredential::ApiToken { token, expires_at } => {
-            if expires_at.is_some_and(|expires_at| expires_at <= now) {
-                context.profiles.delete(username)?;
-                context.profiles.clear_active_user_if(username)?;
-                bail!("API token expired. Set a new token and run kmesh login.");
-            }
-            return Ok(token.clone());
-        }
-        SavedCredential::PublicKeySession { tokens }
-            if tokens.access_expires_at > now.saturating_add(30) =>
-        {
-            return Ok(tokens.access_token.clone());
-        }
-        SavedCredential::PublicKeySession { .. } => {}
-    }
-    let profiles = context.profiles.clone();
-    let _lock = tokio::task::spawn_blocking(move || profiles.lock_refresh())
-        .await
-        .context("refresh lock task failed")??;
-    let mut saved = context
-        .profiles
-        .load(username)?
-        .context("No saved login. Run kmesh login.")?;
-    let now = unix_now()?;
-    let refresh_token = match &saved.credential {
-        SavedCredential::ApiToken { token, expires_at } => {
-            if expires_at.is_some_and(|expires_at| expires_at <= now) {
-                context.profiles.delete(username)?;
-                context.profiles.clear_active_user_if(username)?;
-                bail!("API token expired. Set a new token and run kmesh login.");
-            }
-            return Ok(token.clone());
-        }
-        SavedCredential::PublicKeySession { tokens } => {
-            if tokens.access_expires_at > now.saturating_add(30) {
-                return Ok(tokens.access_token.clone());
-            }
-            if tokens.refresh_expires_at <= now {
-                context.profiles.delete(username)?;
-                context.profiles.clear_active_user_if(username)?;
-                bail!("Login expired. Run kmesh login.");
-            }
-            tokens.refresh_token.clone()
-        }
-    };
-
-    match context.api.refresh(&RefreshRequest { refresh_token }).await {
-        Ok(tokens) => {
-            let access_token = tokens.access_token.clone();
-            saved.credential = SavedCredential::PublicKeySession { tokens };
-            context.profiles.save(&saved)?;
-            Ok(access_token)
-        }
-        Err(error) => {
-            context.profiles.delete(username)?;
-            context.profiles.clear_active_user_if(username)?;
-            Err(
-                anyhow!("Cannot confirm the credential refresh. Run kmesh login again.")
-                    .context(error),
-            )
-        }
-    }
-}
-
-pub async fn logout(context: &ClientContext) -> Result<()> {
-    let username = context.profiles.active_user()?;
-    let saved = context
-        .profiles
-        .load(&username)?
-        .context("No saved login. Run kmesh login.")?;
-    if matches!(saved.credential, SavedCredential::PublicKeySession { .. }) {
-        let token = valid_access_token_for_user(context, &username).await?;
-        context.api.logout(&token).await?;
-    }
-    let _lock = context.profiles.lock_refresh()?;
-    context.profiles.delete(&username)?;
-    context.profiles.clear_active_user_if(&username)?;
-    Ok(())
-}
-
-fn save_login(context: &ClientContext, username: &str, credential: SavedCredential) -> Result<()> {
-    let _lock = context.profiles.lock_refresh()?;
-    context.profiles.save(&SavedLogin {
-        server_url: context.api.issuer().to_owned(),
-        profile: context.config.profile.trim().to_lowercase(),
-        username: username.to_owned(),
-        credential,
-    })?;
-    context.profiles.set_active_user(username)
 }
 
 fn unix_now() -> Result<u64> {

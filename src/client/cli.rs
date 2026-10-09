@@ -32,7 +32,7 @@ pub struct Cli {
         long,
         short = 'p',
         global = true,
-        help = "Set the credential profile for saved tokens. Default: default."
+        help = "Set the profile for cached public-key sessions. Default: default."
     )]
     pub profile: Option<String>,
     #[arg(
@@ -55,7 +55,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    #[command(about = "Show the current login and server status")]
+    #[command(about = "Show credential and server status")]
     Status {
         #[arg(short = 'j', long, help = "Show the response as JSON")]
         json: bool,
@@ -82,10 +82,6 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    #[command(about = "Sign in to a kmesh server")]
-    Login(LoginArgs),
-    #[command(about = "Sign out and remove the active credentials")]
-    Logout,
     #[command(about = "List targets available to the current user")]
     Targets {
         #[command(subcommand)]
@@ -205,35 +201,6 @@ pub struct AgentEnrollArgs {
 pub struct AgentRunArgs {
     #[arg(short = 't', long, help = "Set the target ID for this agent.")]
     pub target_id: String,
-}
-
-pub use crate::config::LoginMethod;
-
-#[derive(Debug, Args, Default)]
-pub struct LoginArgs {
-    #[arg(
-        short = 'm',
-        long,
-        value_enum,
-        help = "Authentication method: token or public-key"
-    )]
-    pub method: Option<LoginMethod>,
-    #[arg(short = 'u', long, help = "Account username for public-key login")]
-    pub username: Option<String>,
-    #[arg(
-        short = 'k',
-        long,
-        help = "Path to the SSH private key used for public-key login"
-    )]
-    pub key: Option<PathBuf>,
-    #[arg(
-        long,
-        short = 't',
-        env = "KMESH_TOKEN",
-        hide_env_values = true,
-        help = "API token value (also read from KMESH_TOKEN)"
-    )]
-    pub token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

@@ -30,7 +30,7 @@ impl Default for Config {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum LoginMethod {
+pub enum AuthMethod {
     Token,
     PublicKey,
 }
@@ -38,7 +38,7 @@ pub enum LoginMethod {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
-    pub method: Option<LoginMethod>,
+    pub method: Option<AuthMethod>,
     pub username: Option<String>,
     pub key: Option<PathBuf>,
     pub token: Option<String>,
@@ -173,13 +173,13 @@ mod tests {
             toml::from_str::<AuthConfig>("method = \"public-key\"")
                 .unwrap()
                 .method,
-            Some(LoginMethod::PublicKey)
+            Some(AuthMethod::PublicKey)
         );
         assert_eq!(
             toml::from_str::<AuthConfig>("method = \"token\"")
                 .unwrap()
                 .method,
-            Some(LoginMethod::Token)
+            Some(AuthMethod::Token)
         );
     }
 

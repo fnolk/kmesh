@@ -87,6 +87,7 @@ class Verification:
         self.env["KMESH_PROXY_COUNT_FILE"] = str(self.proxy_calls)
         self.env["KMESH_PROXY_PID_FILE"] = str(self.proxy_pids)
         self.env["KMESH_PATH_LOG_FILE"] = str(self.path_log)
+        self.user_env: dict[str, str] | None = None
         self.proxy_command: list[str] = []
         self.master: subprocess.Popen[bytes] | None = None
         self.master_log_handle: Any = None
@@ -94,7 +95,6 @@ class Verification:
         self.forward: str | None = None
         self.revocation_attempted = False
         self.target_disable_attempted = False
-        self.logout_restore: bytes | None = None
         self.cleanup_errors: list[str] = []
         self.host_key_alias = ""
         self.known_hosts = Path()
@@ -175,6 +175,21 @@ class Verification:
         if status == "failed":
             raise VerificationError(f"{label}: expected {expected} kmesh proxy starts, observed {observed}")
 
+    def configure_verification_user_auth(self) -> None:
+        token = self.verification_user_token().decode("utf-8")
+        self.user_env = self.env.copy()
+        self.user_env["KMESH_TOKEN"] = token
+        self.record(
+            "configure-verification-user-token",
+            "passed",
+            details={"source": "protected token file", "destination": "ssh process environment"},
+        )
+
+    def run_ssh(self, label: str, argv: list[str], **options: Any) -> subprocess.CompletedProcess[bytes]:
+        if self.user_env is None:
+            raise VerificationError("verification user credentials are not configured")
+        return self.run(label, argv, env=self.user_env, **options)
+
     def sample_proxy_rss(self) -> None:
         for raw_pid in self.proxy_pids.read_text().splitlines():
             if not raw_pid.isdigit():
@@ -226,7 +241,7 @@ class Verification:
             self.ssh_base(multiplex=True) + ["sh -c 'sleep 5; printf kmesh-idle-complete'"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=self.env,
+            env=self.user_env,
             start_new_session=True,
         )
         idle_result = self.wait_ssh_processes("five-second-idle-stream", [idle], 10)[0]
@@ -243,7 +258,7 @@ class Verification:
                 self.ssh_base(multiplex=True) + [command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=self.env,
+                env=self.user_env,
                 start_new_session=True,
             )
             for _, command in commands
@@ -266,7 +281,7 @@ class Verification:
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=self.env,
+            env=self.user_env,
             start_new_session=True,
         )
         if not select.select([cancelled.stdout], [], [], 5)[0]:
@@ -289,7 +304,7 @@ class Verification:
             raise VerificationError("cancel-test SSH client did not exit from direct kill")
         if b"kmesh-cancelled-command-complete" in cancel_stdout:
             raise VerificationError("cancelled SSH command unexpectedly completed")
-        after_cancel = self.run(
+        after_cancel = self.run_ssh(
             "control-master-survives-channel-cancel",
             self.ssh_base(multiplex=True) + ["hostname"],
             timeout=5,
@@ -383,7 +398,7 @@ class Verification:
             argv,
             stdout=self.master_log_handle,
             stderr=self.master_log_handle,
-            env=self.env,
+            env=self.user_env,
             start_new_session=True,
         )
         deadline = time.monotonic() + SSH_NEW_CONNECTION_TIMEOUT_SECONDS
@@ -403,7 +418,7 @@ class Verification:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=self.env,
+                env=self.user_env,
                 timeout=2,
                 check=False,
             )
@@ -428,7 +443,7 @@ class Verification:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=self.env,
+                env=self.user_env,
                 timeout=5,
                 check=False,
             )
@@ -505,7 +520,7 @@ class Verification:
         )
 
     def verify_basic_ssh(self) -> None:
-        result = self.run(
+        result = self.run_ssh(
             "hostname-and-exit-23",
             self.ssh_base(multiplex=False) + ["hostname; exit 23"],
             timeout=SSH_NEW_CONNECTION_TIMEOUT_SECONDS,
@@ -521,7 +536,7 @@ class Verification:
 
     def verify_path_probe(self) -> None:
         attempt = self.proxy_count() + 1
-        result = self.run(
+        result = self.run_ssh(
             "eight-second-path-observation",
             self.ssh_base(multiplex=False)
             + ["hostname; sleep 8; echo kmesh-path-probe-complete"],
@@ -545,10 +560,10 @@ class Verification:
 
     def verify_control_master(self) -> None:
         self.start_master()
-        hostname = self.run("control-master-hostname", self.ssh_base(multiplex=True) + ["hostname"])
+        hostname = self.run_ssh("control-master-hostname", self.ssh_base(multiplex=True) + ["hostname"])
         if not hostname.stdout.strip():
             raise VerificationError("ControlMaster hostname returned no output")
-        exit_23 = self.run(
+        exit_23 = self.run_ssh(
             "control-master-exit-23",
             self.ssh_base(multiplex=True) + ["sh -c 'exit 23'"],
             accepted=(23,),
@@ -579,11 +594,11 @@ class Verification:
             str(source),
             f"{self.args.alias}:{self.remote_file}",
         ]
-        self.run("scp-upload-1mib", scp)
+        self.run_ssh("scp-upload-1mib", scp)
         batch = self.run_dir / "sftp-get.batch"
         batch.write_text(f'get "{self.remote_file}" "{downloaded}"\n')
         os.chmod(batch, 0o600)
-        self.run(
+        self.run_ssh(
             "sftp-download-1mib",
             [
                 "sftp",
@@ -617,7 +632,7 @@ class Verification:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
         self.forward = f"127.0.0.1:{port}:127.0.0.1:22"
-        self.run(
+        self.run_ssh(
             "request-local-ssh-banner-forward",
             [
                 "ssh",
@@ -663,7 +678,7 @@ class Verification:
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=self.env,
+                env=self.user_env,
             timeout=5,
             check=False,
         )
@@ -729,7 +744,7 @@ class Verification:
             f"HostKeyAlias={self.host_key_alias}",
         ]
         command.append("true")
-        result = self.run(
+        result = self.run_ssh(
             "strict-host-key-rejects-wrong-key",
             command,
             timeout=SSH_NEW_CONNECTION_TIMEOUT_SECONDS,
@@ -761,14 +776,14 @@ class Verification:
             self.admin("revoke-target-grant", "grants", "remove", str(self.args.group_id), str(self.args.target_id))
             if self.grant_exists():
                 raise VerificationError("admin revoke command returned but the target grant remains")
-            existing = self.run("active-control-master-survives-revoke", self.ssh_base(multiplex=True) + ["hostname"])
+            existing = self.run_ssh("active-control-master-survives-revoke", self.ssh_base(multiplex=True) + ["hostname"])
             active_hostname = existing.stdout.decode("utf-8", "replace").strip()
             if not active_hostname:
                 raise VerificationError("active ControlMaster returned no hostname after revoke")
             self.report["active_after_revoke_hostname"] = active_hostname
             self.write_report()
             denied_command = self.ssh_base(multiplex=False) + ["true"]
-            denied = self.run("new-connection-after-revoke", denied_command, accepted=None)
+            denied = self.run_ssh("new-connection-after-revoke", denied_command, accepted=None)
             path_text = self.path_log.read_text(errors="replace")
             latest_attempt = path_text.rsplit("[proxy-start]", 1)[-1].lower()
             denied_text = (denied.stderr + denied.stdout).decode("utf-8", "replace").lower() + latest_attempt
@@ -836,14 +851,14 @@ class Verification:
             )
             if self.target_enabled():
                 raise VerificationError("admin disable command left the target enabled")
-            active = self.run(
+            active = self.run_ssh(
                 "active-control-master-survives-target-disable",
                 self.ssh_base(multiplex=True) + ["hostname"],
                 timeout=5,
             )
             if not active.stdout.strip():
                 raise VerificationError("active ControlMaster stopped responding after target disable")
-            denied = self.run(
+            denied = self.run_ssh(
                 "new-transport-after-target-disable",
                 self.ssh_base(multiplex=False) + ["true"],
                 accepted=None,
@@ -883,86 +898,7 @@ class Verification:
             raise VerificationError("verification user API token file is empty")
         return token
 
-    def verification_user_cli(self, *command: str) -> list[str]:
-        if (
-            len(self.proxy_command) < 3
-            or self.proxy_command[-2] != "proxy"
-            or self.proxy_command[-1] != str(self.args.target_id)
-        ):
-            raise VerificationError("ProxyCommand does not match the verification target")
-        return [
-            str(self.args.client_binary),
-            *self.proxy_command[1:-2],
-            *command,
-        ]
-
-    def restore_verification_login(self) -> None:
-        if self.logout_restore is None:
-            return
-        token = self.logout_restore.decode("utf-8")
-        self.run(
-            "restore-verification-user-login",
-            self.verification_user_cli(
-                "login",
-                "--method",
-                "token",
-            ),
-            env={"KMESH_TOKEN": token},
-            timeout=30,
-        )
-        self.logout_restore = None
-
-    def verify_logout_boundary(self) -> None:
-        token = self.verification_user_token()
-        self.logout_restore = token
-        self.run(
-            "verification-user-logout",
-            self.verification_user_cli("logout"),
-            timeout=30,
-        )
-        try:
-            active = self.run(
-                "active-control-master-survives-login-logout",
-                self.ssh_base(multiplex=True) + ["hostname"],
-                timeout=5,
-            )
-            if not active.stdout.strip():
-                raise VerificationError("active ControlMaster stopped responding after user logout")
-            denied = self.run(
-                "new-transport-after-login-logout",
-                self.ssh_base(multiplex=False) + ["true"],
-                accepted=None,
-            )
-            path_text = self.path_log.read_text(errors="replace")
-            latest_attempt = path_text.rsplit("[proxy-start]", 1)[-1].lower()
-            denial = (denied.stderr + denied.stdout).decode("utf-8", "replace").lower() + latest_attempt
-            if denied.returncode == 0 or not any(
-                phrase in denial for phrase in ("read active kmesh login", "please run kmesh login")
-            ):
-                raise VerificationError("new transport did not require login after logout")
-            self.report["logout_boundary"] = {
-                "active_control_master_continued": True,
-                "new_transport_denied": True,
-                "reason": "local login removed after server logout",
-            }
-            self.write_report()
-            self.record("assert-logout-boundary", "passed")
-        finally:
-            self.restore_verification_login()
-        restored = self.run(
-            "verify-login-restored-after-logout-test",
-            self.ssh_base(multiplex=False) + ["hostname"],
-            timeout=SSH_NEW_CONNECTION_TIMEOUT_SECONDS,
-        )
-        if not restored.stdout.strip():
-            raise VerificationError("verification user login was not restored after logout test")
-        self.record("verify-login-restored-after-logout-test", "passed")
-
     def cleanup(self) -> None:
-        try:
-            self.restore_verification_login()
-        except Exception as error:
-            self.cleanup_errors.append(f"verification login restoration failed: {error}")
         try:
             self.restore_target()
         except Exception as error:
@@ -975,7 +911,7 @@ class Verification:
             self.record("restore-original-target-grant", "failed")
         if self.remote_file and self.master is not None and self.master.poll() is None:
             try:
-                self.run(
+                self.run_ssh(
                     "remove-temporary-remote-transfer-file",
                     self.ssh_base(multiplex=True) + [f"rm -f -- {shlex.quote(self.remote_file)}"],
                     timeout=5,
@@ -1046,6 +982,7 @@ def main() -> int:
         verifier.prepare_proxy_shim()
         if not verifier.grant_exists():
             raise VerificationError("the supplied access group has no ssh_connect grant for the target")
+        verifier.configure_verification_user_auth()
         verifier.verify_basic_ssh()
         verifier.verify_path_probe()
         verifier.verify_control_master()
@@ -1055,7 +992,6 @@ def main() -> int:
         verifier.verify_host_key_rejection()
         verifier.verify_revoke_boundary()
         verifier.verify_target_disable_boundary()
-        verifier.verify_logout_boundary()
     except (OSError, subprocess.SubprocessError, VerificationError, json.JSONDecodeError) as error:
         failure = str(error)
         verifier.report["failure"] = failure

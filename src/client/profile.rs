@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -14,23 +14,9 @@ use uuid::Uuid;
 use crate::protocol::LoginTokens;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "credential", rename_all = "snake_case")]
-pub enum SavedCredential {
-    ApiToken {
-        token: String,
-        expires_at: Option<u64>,
-    },
-    PublicKeySession {
-        tokens: LoginTokens,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SavedLogin {
-    pub server_url: String,
-    pub profile: String,
-    pub username: String,
-    pub credential: SavedCredential,
+pub struct SavedSession {
+    pub public_key_fingerprint: String,
+    pub tokens: LoginTokens,
 }
 
 #[derive(Clone, Debug)]
@@ -50,53 +36,32 @@ impl ProfileStore {
         }
     }
 
-    pub fn login_path(&self, username: &str) -> PathBuf {
+    pub fn session_path(&self, username: &str) -> PathBuf {
         self.profile_dir.join(format!(
-            "{}.json",
+            "{}.session.json",
             component_hash(&normalize_username(username))
         ))
     }
 
-    pub fn active_user_path(&self) -> PathBuf {
-        self.profile_dir.join("active-user")
-    }
-
     pub fn lock_path(&self) -> PathBuf {
-        self.profile_dir.join("refresh.lock")
+        self.profile_dir.join("session.lock")
     }
 
-    pub fn load(&self, username: &str) -> Result<Option<SavedLogin>> {
-        read_json(&self.login_path(username))
+    pub fn load(&self, username: &str) -> Result<Option<SavedSession>> {
+        read_json(&self.session_path(username))
     }
 
-    pub fn save(&self, saved: &SavedLogin) -> Result<()> {
+    pub fn save(&self, username: &str, saved: &SavedSession) -> Result<()> {
         self.ensure_profile_dir()?;
-        write_json_atomic(&self.login_path(&saved.username), saved)
+        write_json_atomic(&self.session_path(username), saved)
     }
 
     pub fn delete(&self, username: &str) -> Result<()> {
-        match fs::remove_file(self.login_path(username)) {
+        match fs::remove_file(self.session_path(username)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("remove saved login"),
+            Err(error) => Err(error).context("remove public-key session"),
         }
-    }
-
-    pub fn set_active_user(&self, username: &str) -> Result<()> {
-        self.ensure_profile_dir()?;
-        write_bytes_atomic(
-            &self.active_user_path(),
-            normalize_username(username).as_bytes(),
-        )
-    }
-
-    pub fn active_user(&self) -> Result<String> {
-        let mut username = String::new();
-        File::open(self.active_user_path())
-            .context("read active kmesh login")?
-            .read_to_string(&mut username)
-            .context("read active username")?;
-        Ok(normalize_username(&username))
     }
 
     pub fn lock_refresh(&self) -> Result<File> {
@@ -117,24 +82,8 @@ impl ProfileStore {
             lock.set_permissions(fs::Permissions::from_mode(0o600))
                 .context("set refresh lock permissions")?;
         }
-        lock.lock_exclusive().context("lock saved login")?;
+        lock.lock_exclusive().context("lock public-key session")?;
         Ok(lock)
-    }
-
-    pub fn clear_active_user_if(&self, username: &str) -> Result<()> {
-        let active = match fs::read_to_string(self.active_user_path()) {
-            Ok(active) => normalize_username(&active),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error).context("read active kmesh login"),
-        };
-        if active != normalize_username(username) {
-            return Ok(());
-        }
-        match fs::remove_file(self.active_user_path()) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("remove active kmesh login"),
-        }
     }
 
     fn ensure_profile_dir(&self) -> Result<()> {
@@ -222,37 +171,44 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::LoginTokens;
 
     #[test]
-    fn saved_login_state_is_scoped_and_private() {
+    fn cached_public_key_sessions_are_scoped_and_private() {
         let root = std::env::temp_dir().join(format!("kmesh-profile-test-{}", Uuid::new_v4()));
         let alice = ProfileStore::new(&root, "https://one.example:9443", "work");
         let other_user = ProfileStore::new(&root, "https://one.example:9443", "work");
         let other_server = ProfileStore::new(&root, "https://two.example:9443", "work");
         let other_profile = ProfileStore::new(&root, "https://one.example:9443", "home");
-        assert_eq!(alice.login_path("alice"), other_user.login_path("ALICE"));
-        assert_ne!(alice.login_path("alice"), alice.login_path("bob"));
-        assert_ne!(alice.login_path("alice"), other_server.login_path("alice"));
-        assert_ne!(alice.login_path("alice"), other_profile.login_path("alice"));
+        assert_eq!(
+            alice.session_path("alice"),
+            other_user.session_path("ALICE")
+        );
+        assert_ne!(alice.session_path("alice"), alice.session_path("bob"));
+        assert_ne!(
+            alice.session_path("alice"),
+            other_server.session_path("alice")
+        );
+        assert_ne!(
+            alice.session_path("alice"),
+            other_profile.session_path("alice")
+        );
 
-        let saved = SavedLogin {
-            server_url: "https://one.example:9443".to_owned(),
-            profile: "work".to_owned(),
-            username: "Alice".to_owned(),
-            credential: SavedCredential::PublicKeySession {
-                tokens: LoginTokens {
-                    access_token: "access-test".to_owned(),
-                    refresh_token: "refresh-test".to_owned(),
-                    access_expires_at: 100,
-                    refresh_expires_at: 200,
-                },
+        let saved = SavedSession {
+            public_key_fingerprint: "SHA256:test".to_owned(),
+            tokens: LoginTokens {
+                access_token: "access-test".to_owned(),
+                refresh_token: "refresh-test".to_owned(),
+                access_expires_at: 100,
+                refresh_expires_at: 200,
             },
         };
-        alice.save(&saved).expect("save login atomically");
-        alice.set_active_user("Alice").expect("save active user");
-        assert_eq!(alice.load("alice").unwrap().unwrap().username, "Alice");
-        assert_eq!(alice.active_user().unwrap(), "alice");
+        alice
+            .save("Alice", &saved)
+            .expect("save session atomically");
+        assert_eq!(
+            alice.load("alice").unwrap().unwrap().public_key_fingerprint,
+            "SHA256:test"
+        );
 
         let lock = alice.lock_refresh().expect("open private refresh lock");
         drop(lock);
@@ -261,11 +217,10 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let file_mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(file_mode(&alice.login_path("alice")), 0o600);
-            assert_eq!(file_mode(&alice.active_user_path()), 0o600);
+            assert_eq!(file_mode(&alice.session_path("alice")), 0o600);
             assert_eq!(file_mode(&alice.lock_path()), 0o600);
             assert_eq!(
-                file_mode(alice.login_path("alice").parent().unwrap()),
+                file_mode(alice.session_path("alice").parent().unwrap()),
                 0o700
             );
         }

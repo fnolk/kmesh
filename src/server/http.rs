@@ -16,7 +16,6 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/auth/public-key", post(super::auth::public_key_login))
         .route("/v1/auth/refresh", post(super::auth::refresh))
-        .route("/v1/auth/logout", post(super::auth::logout))
         .route("/v1/me", get(super::admin::me))
         .route("/v1/targets", get(super::admin::targets))
         .route("/v1/admin", post(super::admin::operation))

@@ -22,7 +22,7 @@ impl Drop for TestDirectory {
 fn command_errors_use_english_and_leave_stdout_empty() {
     let directory = TestDirectory::new();
     let missing_config = directory.0.join("missing.toml");
-    for arguments in [vec!["logout"], vec!["proxy", "build-machine"]] {
+    for arguments in [vec!["status"], vec!["proxy", "build-machine"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_kmesh"))
             .arg("--config")
             .arg(&missing_config)
@@ -45,7 +45,7 @@ fn command_errors_escape_terminal_controls() {
     let output = Command::new(env!("CARGO_BIN_EXE_kmesh"))
         .arg("--config")
         .arg(missing_config)
-        .arg("logout")
+        .arg("status")
         .env_remove("RUST_LOG")
         .output()
         .expect("run command with control characters in its configuration path");
@@ -59,23 +59,25 @@ fn command_errors_escape_terminal_controls() {
 }
 
 #[test]
-fn login_validation_uses_english_and_leaves_stdout_empty() {
+fn configured_token_validation_uses_english_and_leaves_stdout_empty() {
     let directory = TestDirectory::new();
     let config = directory.0.join("config.toml");
-    fs::write(&config, "").expect("write default test configuration");
+    fs::write(&config, "[auth]\nmethod = \"token\"\ntoken = \"\"\n")
+        .expect("write test configuration with an empty token");
     let output = Command::new(env!("CARGO_BIN_EXE_kmesh"))
         .arg("--config")
         .arg(&config)
         .arg("--data-dir")
         .arg(directory.0.join("state"))
-        .args(["login", "--method", "token", "--token", ""])
+        .args(["targets", "list"])
+        .env_remove("KMESH_TOKEN")
         .env_remove("RUST_LOG")
         .output()
-        .expect("run login with an empty token");
+        .expect("run a command with an empty configured token");
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty(), "login errors must not use stdout");
+    assert!(output.stdout.is_empty(), "errors must not use stdout");
     assert_eq!(
-        String::from_utf8(output.stderr).expect("decode login error"),
+        String::from_utf8(output.stderr).expect("decode token error"),
         "Command failed: API token is empty\n"
     );
 }

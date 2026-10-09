@@ -6,18 +6,19 @@ server_port = 9443
 # relative paths resolve from the directory containing this config file.
 data_dir = "~/.cache/kmesh"
 
-# Local session namespace. Saved access and refresh tokens are scoped by server, profile, and username.
+# Local cache namespace for public-key sessions.
 profile = "default"
 
 [auth]
-# Choose one login method. Login fields may also be supplied on the CLI.
+# Choose token or public-key authentication.
 # method = "token"
 # token = "paste-an-api-token-here"
-# KMESH_TOKEN overrides auth.token; --token has the highest priority.
-# For SSH signature login, configure these instead:
+# KMESH_TOKEN overrides auth.token.
+# For SSH signature authentication, use these settings instead:
 # method = "public-key"
 # username = "your-account"
 # key = "~/.ssh/id_ed25519"
+# For an encrypted key held by ssh-agent, set key to its .pub file.
 
 [server]
 # Address used by the server's HTTPS and QAD listeners.

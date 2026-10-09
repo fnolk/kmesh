@@ -54,7 +54,7 @@ Use the same term for the same object in help, output, errors, and documentation
 | token value | The secret JWT returned when an API token is issued. |
 | data directory | The base path for local or server data. |
 | agent state | The saved server address, credentials, device identity, and SSH settings for a target agent. |
-| SSH public key | The public key registered for a user's public-key login. |
+| SSH public key | The public key registered for a user's public-key authentication. |
 | key fingerprint | A digest used to compare public keys. It is not the key ID. |
 | enrollment code | A one-time credential used to enroll a target agent. |
 | enroll | Verb: enrolls, enrolled, enrolled. Use a one-time enrollment code to create agent credentials for a target on a server. |
@@ -119,8 +119,9 @@ every view provides every field.
   responses. Long text must not erase the meaning of nearby rows.
 - Avoid one network request per displayed cell. Bound concurrency where used and
   document if a joined view is assembled from multiple, non-atomic reads.
-- Keep read-only views read-only. A short display command must never issue a
-  token, change permissions, or revoke a credential.
+- Keep read-only views read-only. A display command can obtain or refresh a
+  short-lived public-key session. It must never issue an API token, change
+  permissions, or revoke a credential.
 - Show a user's platform role and access groups in separate fields.
 - Show access group IDs in grant tables and access path columns.
 - Keep an access group detail focused on its members and targets. Show its

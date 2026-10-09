@@ -339,35 +339,6 @@ pub(crate) async fn refresh(
     Ok(Json(tokens))
 }
 
-pub(crate) async fn logout(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<axum::http::StatusCode, ApiError> {
-    let user = authenticate(&state, &headers).await?;
-    let AuthCredential::Session(session_id) = user.credential else {
-        return Err(ApiError::bad_request(
-            "API tokens are revoked through admin tokens revoke",
-        ));
-    };
-    let now = unix_time();
-    let mut tx = state.inner.db.pool.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, ?1) WHERE id = ?2 AND user_id = ?3")
-        .bind(now)
-        .bind(session_id.to_string())
-    .bind(&user.user_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "UPDATE refresh_tokens SET revoked_at = COALESCE(revoked_at, ?1) WHERE session_id = ?2",
-    )
-    .bind(now)
-    .bind(session_id.to_string())
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
-}
-
 pub(crate) async fn authenticate(
     state: &ServerState,
     headers: &HeaderMap,
