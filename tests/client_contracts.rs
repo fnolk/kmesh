@@ -19,7 +19,8 @@ fn cli_help_and_global_data_directory_parse_after_subcommand() {
     assert!(help.contains("--server-addr"));
     assert!(help.contains("--server-port"));
     assert!(help.contains("~/.kmesh/config.toml"));
-    assert!(help.contains("~/.cache/kmesh"));
+    assert!(help.contains("Set the base directory for local or server data."));
+    assert!(!help.contains("~/.cache/kmesh"));
     assert!(!help.contains("--server-url"));
 
     let server_help = Command::new(binary)
@@ -47,6 +48,91 @@ fn agent_enrollment_accepts_url_safe_tokens_starting_with_a_dash() {
         "-one-time-token",
     ];
     assert!(kmesh::client::Cli::try_parse_from(args).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_commands_use_data_dir_and_ignore_the_default_config_file() {
+    use std::fs;
+
+    let root = std::env::temp_dir().join(format!("kmesh-agent-cli-{}", Uuid::new_v4()));
+    let home = root.join("home");
+    let data_dir = root.join("agent state");
+    fs::create_dir_all(home.join(".kmesh")).unwrap();
+    fs::write(home.join(".kmesh/config.toml"), "invalid = [\n").unwrap();
+    let binary = env!("CARGO_BIN_EXE_kmesh");
+    let data_dir_text = data_dir.to_str().unwrap();
+
+    let run = Command::new(binary)
+        .env("HOME", &home)
+        .args([
+            "--data-dir",
+            data_dir_text,
+            "agent",
+            "run",
+            "--target-id",
+            "build-machine",
+        ])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    assert!(stderr.contains("Run `agent enroll`"), "{stderr}");
+    assert!(!stderr.contains("config.toml"), "{stderr}");
+    assert!(data_dir_text.contains("agent state"));
+
+    let enroll = Command::new(binary)
+        .env("HOME", &home)
+        .args([
+            "--data-dir",
+            data_dir_text,
+            "--server-addr",
+            "mesh.example.com",
+            "--server-port",
+            "0",
+            "agent",
+            "enroll",
+            "--target-id",
+            "build-machine",
+            "--enrollment-code",
+            "test-code",
+        ])
+        .output()
+        .unwrap();
+    assert!(!enroll.status.success());
+    let stderr = String::from_utf8(enroll.stderr).unwrap();
+    assert!(
+        stderr.contains("Use a server port from 1 to 65535."),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("config.toml"), "{stderr}");
+    assert!(data_dir.exists());
+
+    let config_path = home.join(".kmesh/config.toml");
+    let config_path_text = config_path.to_str().unwrap();
+    for (options, expected) in [
+        (&["--config", config_path_text][..], "Remove --config"),
+        (&["--profile", "work"][..], "Remove --profile"),
+        (
+            &["--server-addr", "mesh.example.com", "--server-port", "9555"][..],
+            "saved server settings",
+        ),
+    ] {
+        let mut args = vec!["--data-dir", data_dir_text];
+        args.extend_from_slice(options);
+        args.extend_from_slice(&["agent", "run", "--target-id", "build-machine"]);
+        let output = Command::new(binary)
+            .env("HOME", &home)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!stderr.contains("parse configuration"), "{stderr}");
+    }
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

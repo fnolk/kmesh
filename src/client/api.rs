@@ -39,8 +39,12 @@ pub struct Api {
 
 impl Api {
     pub async fn new(config: &Config) -> Result<Self> {
+        Self::new_for_server(&config.server_addr, config.server_port).await
+    }
+
+    pub async fn new_for_server(server_addr: &str, server_port: u16) -> Result<Self> {
+        let base_url = crate::config::server_origin(server_addr, server_port)?;
         let http = http_client().map_err(|error| anyhow!("build HTTP client: {error}"))?;
-        let base_url = config.server_origin()?;
         Ok(Self { base_url, http })
     }
 
@@ -228,7 +232,7 @@ impl Api {
 
     fn websocket_url(&self, path: &str) -> Result<Url> {
         let mut url = Url::parse(&format!("{}/v1/{path}", self.base_url))?;
-        anyhow::ensure!(url.scheme() == "https", "server URL must use HTTPS");
+        anyhow::ensure!(url.scheme() == "https", "Use HTTPS in the server URL.");
         url.set_scheme("wss")
             .map_err(|_| anyhow!("invalid WebSocket URL scheme"))?;
         Ok(url)

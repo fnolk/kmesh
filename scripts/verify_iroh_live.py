@@ -419,7 +419,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={REMOTE_ROOT}/bin/kmesh --config {REMOTE_ROOT}/agent-data/config.toml agent run --target-id %i
+ExecStart={REMOTE_ROOT}/bin/kmesh --data-dir {REMOTE_ROOT}/agent-data agent run --target-id %i
 Restart=always
 RestartSec=2
 TimeoutStopSec=20
@@ -680,22 +680,6 @@ def stage(harness: Harness) -> None:
         args.target_ssh,
         ["python3", "-c", REMOTE_WRITE, f"/etc/systemd/system/{AGENT_UNIT}", "0644"],
         stdin=agent_unit().encode(),
-    )
-    agent_config = (
-        f"server_addr = {json.dumps(args.server_addr)}\n"
-        f"server_port = {args.server_port}\n"
-        f"data_dir = {json.dumps(REMOTE_ROOT + '/agent-data')}\n"
-        "profile = \"verification\"\n\n"
-        "[ssh]\n"
-        "address = \"127.0.0.1:22\"\n"
-        "connect_timeout_secs = 10\n"
-    )
-    harness.remote(
-        "stage",
-        "write-agent-config",
-        args.target_ssh,
-        ["python3", "-c", REMOTE_WRITE, f"{REMOTE_ROOT}/agent-data/config.toml", "0600"],
-        stdin=agent_config.encode(),
     )
     harness.ssh_raw("stage", "server-systemd-reload", args.server_ssh, "systemctl daemon-reload")
     harness.ssh_raw("stage", "target-systemd-reload", args.target_ssh, "systemctl daemon-reload")
@@ -1292,8 +1276,12 @@ def deploy(harness: Harness) -> None:
 
     enroll_args = [
         f"{REMOTE_ROOT}/bin/kmesh",
-        "--config",
-        f"{REMOTE_ROOT}/agent-data/config.toml",
+        "--data-dir",
+        f"{REMOTE_ROOT}/agent-data",
+        "--server-addr",
+        args.server_addr,
+        "--server-port",
+        str(args.server_port),
         "agent",
         "enroll",
         "--target-id",

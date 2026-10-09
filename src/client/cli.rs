@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -18,35 +18,35 @@ pub struct Cli {
         long,
         short = 'c',
         global = true,
-        help = "Path to the configuration file (default ~/.kmesh/config.toml)"
+        help = "Set the configuration file path. Default: ~/.kmesh/config.toml."
     )]
     pub config: Option<PathBuf>,
     #[arg(
         long,
         short = 'd',
         global = true,
-        help = "Directory for local or server data (default ~/.cache/kmesh)"
+        help = "Set the base directory for local or server data."
     )]
     pub data_dir: Option<PathBuf>,
     #[arg(
         long,
         short = 'p',
         global = true,
-        help = "Credential profile for saved tokens (default: default)"
+        help = "Set the credential profile for saved tokens. Default: default."
     )]
     pub profile: Option<String>,
     #[arg(
         long,
         short = 's',
         global = true,
-        help = "IP address or hostname of the kmesh server (default localhost)"
+        help = "Set the IP address or host name of the kmesh server. Default: localhost."
     )]
     pub server_addr: Option<String>,
     #[arg(
         long,
         short = 'P',
         global = true,
-        help = "HTTPS port of the kmesh server (default 9443)"
+        help = "Set the HTTPS port of the kmesh server. Default: 9443."
     )]
     pub server_port: Option<u16>,
     #[command(subcommand)]
@@ -134,7 +134,7 @@ pub enum AgentCommand {
 
 #[derive(Debug, Args)]
 pub struct AgentEnrollArgs {
-    #[arg(short = 't', long, help = "Target ID to enroll")]
+    #[arg(short = 't', long, help = "Set the target ID for this agent.")]
     pub target_id: String,
     #[arg(
         short = 'e',
@@ -143,11 +143,23 @@ pub struct AgentEnrollArgs {
         help = "One-time enrollment code"
     )]
     pub enrollment_code: String,
+    #[arg(
+        long,
+        default_value = "127.0.0.1:22",
+        help = "Set the local SSH address. Default: 127.0.0.1:22."
+    )]
+    pub ssh_address: SocketAddr,
+    #[arg(
+        long,
+        default_value_t = 10,
+        help = "Set the time limit for the local SSH connection in seconds. Default: 10."
+    )]
+    pub ssh_connect_timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]
 pub struct AgentRunArgs {
-    #[arg(short = 't', long, help = "Target ID of the enrolled agent")]
+    #[arg(short = 't', long, help = "Set the target ID for this agent.")]
     pub target_id: String,
 }
 

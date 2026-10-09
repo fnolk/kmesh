@@ -1,7 +1,4 @@
-use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
 use reqwest::Url;
@@ -15,7 +12,6 @@ pub struct Config {
     pub server_addr: String,
     pub server_port: u16,
     pub data_dir: PathBuf,
-    pub ssh: SshConfig,
     pub server: ServerConfig,
 }
 
@@ -27,7 +23,6 @@ impl Default for Config {
             server_addr: "localhost".to_owned(),
             server_port: 9443,
             data_dir: default_data_dir(),
-            ssh: SshConfig::default(),
             server: ServerConfig::default(),
         }
     }
@@ -63,7 +58,7 @@ impl Config {
 }
 
 pub fn server_origin(server_addr: &str, server_port: u16) -> anyhow::Result<String> {
-    ensure!(server_port != 0, "server port must be between 1 and 65535");
+    ensure!(server_port != 0, "Use a server port from 1 to 65535.");
     ensure!(
         !server_addr.is_empty()
             && server_addr == server_addr.trim()
@@ -71,7 +66,7 @@ pub fn server_origin(server_addr: &str, server_port: u16) -> anyhow::Result<Stri
             && !server_addr
                 .chars()
                 .any(|character| matches!(character, '/' | '?' | '#' | '@')),
-        "server address must be an IP address or hostname without a scheme or path"
+        "Enter an IP address or host name for the server. Leave out the scheme and path."
     );
 
     let unbracketed = server_addr
@@ -86,7 +81,7 @@ pub fn server_origin(server_addr: &str, server_port: u16) -> anyhow::Result<Stri
                 !server_addr.contains(':')
                     && !server_addr.contains('[')
                     && !server_addr.contains(']'),
-                "server address must be an IP address or hostname without a scheme or path"
+                "Enter an IP address or host name for the server. Leave out the scheme and path."
             );
             server_addr.to_owned()
         }
@@ -98,12 +93,12 @@ pub fn canonical_origin(server_url: &str) -> anyhow::Result<String> {
     let url = Url::parse(server_url).context("parse server URL")?;
     ensure!(
         url.path() == "/" && url.query().is_none() && url.fragment().is_none(),
-        "server URL must be an origin without a path, query, or fragment"
+        "Use a server URL without a path, query, or fragment."
     );
-    ensure!(url.scheme() == "https", "server URL must use HTTPS");
+    ensure!(url.scheme() == "https", "Use HTTPS in the server URL.");
     ensure!(
         url.username().is_empty() && url.password().is_none(),
-        "server URL cannot include credentials"
+        "Remove credentials from the server URL."
     );
     Ok(url.origin().ascii_serialization())
 }
@@ -122,22 +117,6 @@ pub(crate) fn resolve_path(path: &Path, base_dir: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         base_dir.join(path)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SshConfig {
-    pub address: SocketAddr,
-    pub connect_timeout_secs: u64,
-}
-
-impl Default for SshConfig {
-    fn default() -> Self {
-        Self {
-            address: SocketAddr::from(([127, 0, 0, 1], 22)),
-            connect_timeout_secs: 10,
-        }
     }
 }
 

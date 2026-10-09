@@ -6,7 +6,7 @@ use super::{
     server_session_error,
     session::handle_dial_offer,
 };
-use crate::client::{ClientContext, api::Api, profile, proxy::read_ticket};
+use crate::client::{api::Api, proxy::read_ticket};
 use crate::{
     protocol::{ControlMessage, RouteMode, TransportInfo},
     transport::{IrohByteStream, RelayChoice, TransportError, accept_peer, connect_peer},
@@ -122,23 +122,18 @@ async fn closed_mailbox_before_done_keeps_sibling_session_routable() {
     assert!(sessions.contains_key(&sibling_session_id));
 }
 
-async fn context(server_url: &str) -> ClientContext {
+async fn context(server_url: &str) -> super::AgentContext {
     let origin = reqwest::Url::parse(server_url).expect("valid test server URL");
-    let config = crate::config::Config {
-        server_addr: origin.host_str().expect("test server host").to_owned(),
-        server_port: origin.port_or_known_default().expect("test server port"),
-        ..crate::config::Config::default()
-    };
-    let api = Api::new(&config).await.expect("build test API client");
-    let profiles = profile::ProfileStore::new(
-        &config.data_dir,
-        &config.server_origin().expect("test server origin"),
-        &config.profile,
-    );
-    ClientContext {
-        config,
+    let api = Api::new_for_server(
+        origin.host_str().expect("test server host"),
+        origin.port_or_known_default().expect("test server port"),
+    )
+    .await
+    .expect("build test API client");
+    super::AgentContext {
         api,
-        profiles,
+        ssh_address: "127.0.0.1:22".parse().unwrap(),
+        ssh_connect_timeout_secs: 10,
     }
 }
 

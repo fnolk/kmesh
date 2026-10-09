@@ -5,6 +5,7 @@ pub mod identity;
 shadow_rs::shadow!(build);
 
 pub mod protocol;
+mod target_id;
 pub mod version;
 
 // Owned by the server, transport, and client implementation workstreams.

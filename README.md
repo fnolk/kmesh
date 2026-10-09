@@ -126,7 +126,9 @@ identifiers, and dependency diagnostics retain their original meanings.
 
 On an administrator workstation, log in and create the target, user, access group, and grant. New users have the `member` platform role and no access groups. The fixed platform roles are `member` and `admin`. Access group IDs are the trimmed names with ASCII letters lowercased. Target names at creation and rename use a 1–64 character ASCII slug (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`; the first character is alphanumeric). On creation, the lowercase name becomes the fixed target ID while its casing remains the display name. Rename changes the name and OpenSSH alias while preserving the ID. Admin commands refer to users, access groups, and targets by ID. Platform roles use the fixed values `member` and `admin`.
 
-`ssh-config` scopes `HostKeyAlias` by the canonical server origin and target ID. Agent credentials use the same server-origin scope, so equal target IDs on different servers keep separate known-host entries and credentials.
+Target creation and enrollment issue commands show a complete enrollment command. The command includes `--server-port` only when the server uses a port other than `9443`.
+
+`ssh-config` scopes `HostKeyAlias` by the canonical server origin and target ID. Agent state uses the selected data directory and target ID. Use a separate data directory for each server when target IDs are equal.
 
 ```sh
 kmesh login --method token
@@ -189,19 +191,21 @@ key = "~/.ssh/id_ed25519"
 
 Login settings from CLI options override TOML. Choose an explicit login method: `token` or `public-key`.
 
-On the target machine, enroll its persistent device identity and start the agent:
+On the target machine, enroll the target agent and start it:
 
 ```sh
-kmesh agent enroll \
-  --target-id <target-id> --enrollment-code <one-time-code>
+kmesh --server-addr mesh.example.com agent enroll \
+  --target-id <target-id> --enrollment-code <enrollment-code>
 kmesh agent run --target-id <target-id>
 ```
 
-The enrolled device key signs each session's freshly generated target data-plane identity; active SSH sessions use independent Iroh endpoints. The agent reads `ssh.address` from `~/.kmesh/config.toml`, which defaults to `127.0.0.1:22`.
+The agent stores its server address, credentials, device identity, and SSH settings under `<data-dir>/agents/<target-id>`. On Linux, root uses `/var/lib/kmesh`. Other Linux users use `$XDG_STATE_HOME/kmesh`, or `~/.local/state/kmesh` when `XDG_STATE_HOME` is empty. On macOS, the default is `~/Library/Application Support/kmesh`. On Windows, the default is `%LOCALAPPDATA%/kmesh`.
+
+The default local SSH address is `127.0.0.1:22`, and the default time limit is 10 seconds. Use `--ssh-address` and `--ssh-connect-timeout-secs` during enrollment to change these values. The `agent run` command reads its run settings from the agent state in this data directory. If you set `--data-dir` during enrollment, use the same value with `agent run`. The enrollment result prints the full run command.
 
 `profile` selects a separate local credential namespace. For example, `kmesh --profile work login ...` saves tokens separately from the `default` profile, so the same server and username can have independent sign-ins. Saved credentials are scoped by server, profile, and normalized username; the profile does not affect routing or server-side access permissions.
 
-The client and agent config contains the server address plus local SSH settings. There are no client-side STUN server or UDP bind overrides. The proxy and agent discover the private relay URL and QAD port from the server's authenticated `/v1/transport` response. `PrivateDirect` observes B's QAD at the configured server UDP port and an official reflector; `PublicDirect` observes official Iroh QAD reflectors only.
+Client config contains the server address. Enrollment stores the target's local SSH address and time limit in agent state. Remove the old `[ssh]` section from existing `config.toml` files. Set the target's SSH values during agent enrollment. There are no client-side STUN server or UDP bind overrides. The proxy and agent discover the private relay URL and QAD port from the server's authenticated `/v1/transport` response. `PrivateDirect` observes B's QAD at the configured server UDP port and an official reflector; `PublicDirect` observes official Iroh QAD reflectors only.
 
 ## Connect with OpenSSH
 
@@ -215,7 +219,7 @@ ssh build-machine
 
 The generated block sets `ProxyCommand`, a stable `HostKeyAlias`, and OpenSSH `ControlMaster` reuse. The first SSH connection establishes its path; subsequent SSH/SCP/SFTP commands can reuse the OpenSSH control connection. Each underlying transport has one session ID and fresh client/target data EndpointIds. The server checks current RBAC when opening the session and again during activation, after both peers report the selected route and the target reports Iroh readiness. Once activated, the stream runs to completion after permission changes or control-plane disconnection; kmesh does not retry or switch routes mid-SSH. Standard SSH host-key checks remain active. Add the target's verified SSH host key to the client's `known_hosts` before connecting.
 
-The kmesh client state is separated by server origin, profile, and normalized username. Credential and agent identity files use mode `0600`, their directories use mode `0700`, and public-key session refresh tokens rotate under a cross-process file lock. A refresh with an uncertain network result clears the local login and asks the user to sign in again.
+The kmesh login state is separated by server origin, profile, and normalized username. Login credentials and agent state files use mode `0600`; their directories use mode `0700`. Public-key session refresh tokens rotate under a cross-process file lock. A refresh with an uncertain network result clears the local login and asks the user to sign in again. Enroll each existing agent again to create state in the new directory layout.
 
 ## Build-time mTLS certificates
 
@@ -244,11 +248,17 @@ To rotate these identities, create a fresh certificate set, export its five path
 
 Example systemd units for a server and one target agent are in [`deploy/systemd`](deploy/systemd). A per-user macOS LaunchAgent template is in [`deploy/launchd`](deploy/launchd). Review paths, user IDs, and origins before enabling them.
 
-For systemd, create the service account and protect its state/config files before enabling the units. Keep each directory at `0700` and each secret file at `0600`.
+For systemd, create the service account and protect its state and configuration files before enabling the units. Keep each private directory at `0700` and each secret file at `0600`.
 
 ```sh
 sudo useradd --system --home-dir /var/lib/kmesh --shell /usr/sbin/nologin kmesh
-sudo install -d -o kmesh -g kmesh -m 0700 /var/lib/kmesh /etc/kmesh
+sudo install -d -o kmesh -g kmesh -m 0700 /var/lib/kmesh
+```
+
+For a server, create its config directory and copy the example file:
+
+```sh
+sudo install -d -o root -g kmesh -m 0750 /etc/kmesh
 sudo install -o root -g kmesh -m 0640 config.example.toml /etc/kmesh/config.toml
 ```
 
@@ -259,14 +269,17 @@ sudo -u kmesh /usr/local/bin/kmesh --config /etc/kmesh/config.toml server init -
 sudo systemctl enable --now kmesh-server.service
 ```
 
-For a target agent, provide `/etc/kmesh/agent.toml` with the server address and `data_dir = "/var/lib/kmesh"` before starting its unit. The LaunchAgent uses the default `~/.kmesh/config.toml`.
-
-After enrolling a target into `/var/lib/kmesh`, set its readable target ID and start the instance:
+For a target agent, enroll as the service user. The command stores its credentials under `/var/lib/kmesh/agents/<target-id>`:
 
 ```sh
 TARGET_ID=build-machine
+sudo -u kmesh /usr/local/bin/kmesh \
+  --data-dir /var/lib/kmesh --server-addr mesh.example.com \
+  agent enroll --target-id "$TARGET_ID" --enrollment-code '<enrollment-code>'
 sudo systemctl enable --now "kmesh-agent@${TARGET_ID}.service"
 ```
+
+The service reads agent state from `/var/lib/kmesh`. A user without root access can enroll in the default per-user state directory and run the agent as that user. On macOS, enroll with `--data-dir "$HOME/Library/Application Support/kmesh"`. Use the same path in the LaunchAgent file. Enroll each existing agent again after this change to create state in the new directory layout.
 
 ## Inspect private relay traffic
 

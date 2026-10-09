@@ -106,6 +106,10 @@ fn load_config_at(cli: &Cli, default_config_path: &Path) -> Result<Config> {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    if let cli::Command::Agent { command } = &cli.command {
+        return run_agent(&cli, command).await;
+    }
+
     let config = load_config(&cli)?;
     match &cli.command {
         cli::Command::Server { command } => match command {
@@ -136,19 +140,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .await?;
             }
         },
-        cli::Command::Agent { command } => {
-            let context = ClientContext::new(&config).await?;
-            match command {
-                cli::AgentCommand::Enroll(args) => {
-                    let target_id = args.target_id.trim().to_ascii_lowercase();
-                    agent::enroll(&context, target_id.clone(), &args.enrollment_code).await?;
-                    println!("Target {} enrolled.", output::cell(&target_id));
-                }
-                cli::AgentCommand::Run(args) => {
-                    agent::run(&context, args.target_id.trim().to_ascii_lowercase()).await?;
-                }
-            }
-        }
+        cli::Command::Agent { .. } => unreachable!("agent commands run before config loading"),
         cli::Command::Login(args) => {
             let context = ClientContext::new(&config).await?;
             auth::login(&context, args).await?;
@@ -210,6 +202,53 @@ pub async fn run(cli: Cli) -> Result<()> {
         cli::Command::Admin(args) => {
             let context = ClientContext::new(&config).await?;
             admin::run(&context, args).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_agent(cli: &Cli, command: &cli::AgentCommand) -> Result<()> {
+    anyhow::ensure!(
+        cli.config.is_none(),
+        "Remove --config from the agent command."
+    );
+    anyhow::ensure!(
+        cli.profile.is_none(),
+        "Remove --profile from the agent command."
+    );
+    let data_dir = agent::data_dir(cli.data_dir.as_deref())?;
+    match command {
+        cli::AgentCommand::Enroll(args) => {
+            let data_dir = agent::prepare_data_dir(&data_dir)?;
+            let server_addr = cli.server_addr.as_deref().unwrap_or("localhost");
+            let server_port = cli.server_port.unwrap_or(9443);
+            let target_id = agent::enroll(
+                server_addr,
+                server_port,
+                &data_dir,
+                args.target_id.clone(),
+                &args.enrollment_code,
+                args.ssh_address,
+                args.ssh_connect_timeout_secs,
+            )
+            .await?;
+            let data_dir = data_dir.to_str().expect("prepared data path is UTF-8");
+            let target_id = shlex::try_quote(&target_id)?;
+            println!("Target ID: {}", output::cell(&target_id));
+            println!("Data directory: {}", output::cell(data_dir));
+            println!("Start the agent:");
+            println!(
+                "  kmesh --data-dir {} agent run --target-id {}",
+                shlex::try_quote(data_dir)?,
+                target_id
+            );
+        }
+        cli::AgentCommand::Run(args) => {
+            anyhow::ensure!(
+                cli.server_addr.is_none() && cli.server_port.is_none(),
+                "Use the saved server settings with `agent run`."
+            );
+            agent::run(&data_dir, args.target_id.clone()).await?;
         }
     }
     Ok(())

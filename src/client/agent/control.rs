@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use super::{
-    AgentRuntime, AgentVersionIncompatibility, CONTROL_CONNECT_TIMEOUT, ClientContext,
+    AgentContext, AgentRuntime, AgentVersionIncompatibility, CONTROL_CONNECT_TIMEOUT,
     ServerAuthenticationFailure, ensure_auth, is_authentication_error, server_session_error,
     session,
 };
@@ -100,7 +100,7 @@ pub(super) fn agent_session_error_code(error: &anyhow::Error) -> &'static str {
 }
 
 pub(super) async fn control_session(
-    context: &ClientContext,
+    context: &AgentContext,
     credentials: &AgentCredentials,
     runtime: &mut AgentRuntime,
 ) -> Result<()> {

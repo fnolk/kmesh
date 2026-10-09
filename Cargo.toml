@@ -64,5 +64,8 @@ shadow-rs = "2.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["user"] }
+
 [patch.crates-io]
 iroh-relay = { path = "vendor/iroh-relay" }

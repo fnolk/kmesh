@@ -14,6 +14,7 @@ use crate::protocol::{
     MeView, RelayConnectionMetadata, RelayConnectionView, RelayEndpointSide, RelaySessionPhase,
     RelayTrafficView, SystemRole, TargetPermission, TargetView, UserKeyView, UserView,
 };
+use crate::target_id::is_target_slug;
 
 use super::auth::{authenticate, canonical_ssh_key, ssh_fingerprint};
 use super::db::{row_uuid, unix_time};
@@ -1464,16 +1465,7 @@ pub(super) fn normalize_target_id(value: &str) -> Result<String, ApiError> {
 
 fn normalize_target_name(value: &str) -> Result<String, ApiError> {
     let value = normalize_name(value, "target")?;
-    let valid = value.len() <= 64
-        && value.is_ascii()
-        && value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-    if !valid {
+    if !is_target_slug(&value) {
         return Err(ApiError::bad_request(
             "target name must be a 1 to 64 character ASCII slug",
         ));

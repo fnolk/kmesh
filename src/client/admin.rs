@@ -279,7 +279,7 @@ async fn execute(context: &ClientContext, command: AdminCommand, json: bool) -> 
         .api
         .admin(&token, &AdminRequest { operation })
         .await?;
-    print_response(&response, json)
+    print_response(&response, json, context.api.issuer())
 }
 
 fn is_forbidden(error: &anyhow::Error) -> bool {
@@ -292,17 +292,17 @@ fn is_forbidden(error: &anyhow::Error) -> bool {
     })
 }
 
-fn print_response(response: &AdminResponse, json: bool) -> Result<()> {
+fn print_response(response: &AdminResponse, json: bool, server_origin: &str) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(response)?);
     } else {
-        print!("{}", render_response(response));
+        print!("{}", render_response(response, server_origin)?);
     }
     Ok(())
 }
 
-fn render_response(response: &AdminResponse) -> String {
-    match response {
+fn render_response(response: &AdminResponse, server_origin: &str) -> Result<String> {
+    Ok(match response {
         AdminResponse::Ok => "Operation complete.\n".to_owned(),
         AdminResponse::Users(users) => render_users(users),
         AdminResponse::RelayTraffic(traffic) => render_relay_traffic(traffic),
@@ -334,20 +334,49 @@ fn render_response(response: &AdminResponse) -> String {
             target,
             enrollment_token,
         } => format!(
-            "{}One-time enrollment code: {}\n",
+            "{}{}",
             render_targets(std::slice::from_ref(target)),
-            cell(enrollment_token)
+            render_enrollment(&target.target_id, enrollment_token, server_origin)?
         ),
         AdminResponse::Targets(targets) => render_targets(targets),
         AdminResponse::EnrollmentIssued {
             target_id,
             enrollment_token,
         } => format!(
-            "Target: {}\nOne-time enrollment code: {}\n",
+            "Target ID: {}\n{}",
             cell(target_id),
-            cell(enrollment_token)
+            render_enrollment(target_id, enrollment_token, server_origin)?
         ),
+    })
+}
+
+fn render_enrollment(
+    target_id: &str,
+    enrollment_code: &str,
+    server_origin: &str,
+) -> Result<String> {
+    let url = reqwest::Url::parse(server_origin).expect("API server origin is valid");
+    let server_addr = url.host_str().expect("API server origin has a host");
+    let quote = |argument: &str| {
+        shlex::try_quote(argument)
+            .map(|value| value.into_owned())
+            .map_err(|_| anyhow::anyhow!("The enrollment code contains a null byte."))
+    };
+    let mut command = format!("kmesh --server-addr {}", quote(server_addr)?);
+    let server_port = url
+        .port_or_known_default()
+        .expect("HTTPS server origin has a port");
+    if server_port != 9443 {
+        command.push_str(&format!(" --server-port {server_port}"));
     }
+    command.push_str(&format!(
+        " agent enroll --target-id {} --enrollment-code {}",
+        quote(target_id)?,
+        quote(enrollment_code)?
+    ));
+    Ok(format!(
+        "Run this command on the target machine:\n  {command}\n"
+    ))
 }
 
 fn render_users(users: &[UserView]) -> String {
@@ -724,10 +753,96 @@ mod tests {
             AdminResponse::ApiTokens(vec![]),
             AdminResponse::Grants(vec![]),
         ] {
-            let output = render_response(&response);
+            let output = render_response(&response, "https://mesh.example:9443").unwrap();
             assert!(output.contains("(0)\nNo records.\n"));
             assert!(!output.contains('\t'));
         }
+    }
+
+    #[test]
+    fn enrollment_output_uses_default_port_and_quotes_command_arguments() {
+        let output = render_enrollment(
+            "build-machine",
+            "code with $special'chars",
+            "https://mesh.example:9443",
+        )
+        .unwrap();
+        assert!(output.contains("Run this command on the target machine:"));
+        let command = output.lines().nth(1).unwrap().trim();
+        assert_eq!(
+            shlex::split(command).unwrap(),
+            [
+                "kmesh",
+                "--server-addr",
+                "mesh.example",
+                "agent",
+                "enroll",
+                "--target-id",
+                "build-machine",
+                "--enrollment-code",
+                "code with $special'chars",
+            ]
+        );
+        assert!(!command.contains("--server-port"));
+    }
+
+    #[test]
+    fn enrollment_output_includes_non_default_port() {
+        let output =
+            render_enrollment("build-machine", "code", "https://[2001:db8::1]:9444").unwrap();
+        let command = output.lines().nth(1).unwrap().trim();
+        assert_eq!(
+            shlex::split(command).unwrap(),
+            [
+                "kmesh",
+                "--server-addr",
+                "[2001:db8::1]",
+                "--server-port",
+                "9444",
+                "agent",
+                "enroll",
+                "--target-id",
+                "build-machine",
+                "--enrollment-code",
+                "code",
+            ]
+        );
+    }
+
+    #[test]
+    fn enrollment_output_preserves_explicit_https_default_port() {
+        let output = render_enrollment("build-machine", "code", "https://mesh.example").unwrap();
+        let command = output.lines().nth(1).unwrap().trim();
+        assert_eq!(
+            shlex::split(command).unwrap(),
+            [
+                "kmesh",
+                "--server-addr",
+                "mesh.example",
+                "--server-port",
+                "443",
+                "agent",
+                "enroll",
+                "--target-id",
+                "build-machine",
+                "--enrollment-code",
+                "code",
+            ]
+        );
+    }
+
+    #[test]
+    fn enrollment_issue_output_starts_with_the_target_id() {
+        let output = render_response(
+            &AdminResponse::EnrollmentIssued {
+                target_id: "build-machine".into(),
+                enrollment_token: "code".into(),
+            },
+            "https://mesh.example:9443",
+        )
+        .unwrap();
+        assert!(output.starts_with("Target ID: build-machine\n"));
+        assert!(output.contains("--enrollment-code code"));
     }
 
     #[test]

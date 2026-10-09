@@ -6,10 +6,10 @@ use crate::{
     transport::{HandoffOptions, IrohEndpointOptions},
 };
 
-use super::ClientContext;
+use super::AgentContext;
 
 pub(super) fn endpoint_options(
-    context: &ClientContext,
+    context: &AgentContext,
     info: &TransportInfo,
     route_mode: RouteMode,
     handoff: Option<HandoffOptions>,
