@@ -1,28 +1,31 @@
 name: Rust CI
+run-name: >-
+  ${{ github.event_name == 'release' && format('Release {0}', github.event.release.tag_name) || format('PR #{0} / {1}', inputs.pr_number, inputs.sha) }}
 
 on:
   release:
     types: [published]
-  issue_comment:
-    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number supplied by the /ci dispatcher
+        type: string
+        required: true
+      sha:
+        description: PR head commit supplied by the /ci dispatcher
+        type: string
+        required: true
 
 permissions:
   contents: read
 
 jobs:
   verify:
-    if: >-
-      github.event_name == 'release' ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       github.event.issue.state == 'open' &&
-       github.event.comment.body == '/ci' &&
-       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'release' && github.sha || format('refs/pull/{0}/head', github.event.issue.number) }}
+          ref: ${{ github.event_name == 'release' && github.sha || inputs.sha }}
           persist-credentials: false
       - name: Set mTLS input paths
         shell: bash
@@ -45,13 +48,6 @@ jobs:
         run: cargo test --locked --all-targets
 
   build:
-    if: >-
-      github.event_name == 'release' ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       github.event.issue.state == 'open' &&
-       github.event.comment.body == '/ci' &&
-       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     strategy:
       fail-fast: false
       matrix:
@@ -76,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'release' && github.sha || format('refs/pull/{0}/head', github.event.issue.number) }}
+          ref: ${{ github.event_name == 'release' && github.sha || inputs.sha }}
           persist-credentials: false
       - name: Set mTLS input paths
         shell: bash
@@ -87,7 +83,7 @@ jobs:
           printf 'KMESH_CLIENT_CERT_PATH=%s/kmesh-mtls/client-cert.pem\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'KMESH_CLIENT_KEY_PATH=%s/kmesh-mtls/client-key.pem\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Generate test mTLS certificates for pull requests
-        if: github.event_name == 'issue_comment'
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           certificate_dir="$RUNNER_TEMP/kmesh-mtls"
