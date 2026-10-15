@@ -1,23 +1,95 @@
 name: Rust CI
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-  release:
-    types:
-      - published
   workflow_dispatch:
+    inputs:
+      mode:
+        description: What to build
+        type: choice
+        options:
+          - pull_request
+          - release
+        required: true
+      pr_number:
+        description: Open PR number (pull_request mode only)
+        type: string
+      release_tag:
+        description: Published release tag (release mode only)
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  resolve:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.target.outputs.sha }}
+      mode: ${{ steps.target.outputs.mode }}
+      release_tag: ${{ steps.target.outputs.release_tag }}
+    steps:
+      - name: Resolve and validate the requested source
+        id: target
+        uses: actions/github-script@v7
+        env:
+          MODE: ${{ inputs.mode }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const mode = process.env.MODE;
+            const prNumber = process.env.PR_NUMBER.trim();
+            const tag = process.env.RELEASE_TAG.trim();
+            let sha;
+            if (mode === 'pull_request') {
+              if (!/^[1-9][0-9]*$/.test(prNumber) || tag) {
+                throw new Error('Provide only an open PR number for pull_request mode.');
+              }
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: Number(prNumber)
+              });
+              if (pr.state !== 'open') throw new Error('The PR must be open.');
+              sha = pr.head.sha;
+            } else if (mode === 'release') {
+              if (!tag || prNumber) {
+                throw new Error('Provide only a published release tag for release mode.');
+              }
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner, repo, tag
+              });
+              if (release.draft || !release.published_at) {
+                throw new Error('The release must be published.');
+              }
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner, repo, ref: `refs/tags/${tag}`
+              });
+              sha = commit.sha;
+              const { data: comparison } = await github.rest.repos.compareCommits({
+                owner, repo, base: sha, head: 'main'
+              });
+              if (!['ahead', 'identical'].includes(comparison.status)) {
+                throw new Error('The release commit must belong to main history.');
+              }
+              core.setOutput('release_tag', tag);
+            } else {
+              throw new Error('Unsupported build mode.');
+            }
+            core.setOutput('sha', sha);
+            core.setOutput('mode', mode);
+
   verify:
+    needs: resolve
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
       - name: Set mTLS input paths
         shell: bash
         run: |
@@ -39,6 +111,7 @@ jobs:
         run: cargo test --locked --all-targets
 
   build:
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +135,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
       - name: Set mTLS input paths
         shell: bash
         run: |
@@ -70,14 +146,8 @@ jobs:
           printf 'KMESH_SERVER_KEY_PATH=%s/kmesh-mtls/server-key.pem\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'KMESH_CLIENT_CERT_PATH=%s/kmesh-mtls/client-cert.pem\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'KMESH_CLIENT_KEY_PATH=%s/kmesh-mtls/client-key.pem\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - name: Reject an untrusted manual build ref
-        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
-        shell: bash
-        run: |
-          echo 'workflow_dispatch builds must run from main.' >&2
-          exit 1
       - name: Generate test mTLS certificates for pull requests
-        if: github.event_name == 'pull_request'
+        if: needs.resolve.outputs.mode == 'pull_request'
         shell: bash
         run: |
           certificate_dir="$RUNNER_TEMP/kmesh-mtls"
@@ -86,7 +156,7 @@ jobs:
           fi
           scripts/generate-mtls-certs.sh "$certificate_dir"
       - name: Load trusted mTLS certificates
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+        if: needs.resolve.outputs.mode == 'release'
         env:
           KMESH_MTLS_CA_CERT: ${{ secrets.KMESH_MTLS_CA_CERT }}
           KMESH_MTLS_SERVER_CERT: ${{ secrets.KMESH_MTLS_SERVER_CERT }}
@@ -133,19 +203,22 @@ jobs:
           retention-days: 14
 
   publish-release:
-    if: github.event_name == 'release' && github.event.action == 'published'
-    needs: [verify, build]
+    if: needs.resolve.outputs.mode == 'release'
+    needs: [resolve, verify, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           path: release-artifacts
       - name: Verify release tag matches the package version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: |
           package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "kmesh") | .version')"
           test "$RELEASE_TAG" = "v$package_version" || {
@@ -176,5 +249,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: gh release upload "$RELEASE_TAG" release-assets/* --repo "$GH_REPO" --clobber
