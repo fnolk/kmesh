@@ -1,6 +1,8 @@
 name: Rust CI
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       mode:
@@ -22,7 +24,7 @@ permissions:
 
 jobs:
   resolve:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -36,9 +38,9 @@ jobs:
         id: target
         uses: actions/github-script@v7
         env:
-          MODE: ${{ inputs.mode }}
+          MODE: ${{ github.event_name == 'release' && 'release' || inputs.mode }}
           PR_NUMBER: ${{ inputs.pr_number }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
         with:
           script: |
             const { owner, repo } = context.repo;
